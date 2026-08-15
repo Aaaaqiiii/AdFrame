@@ -47,7 +47,8 @@
 - Create: `backend/app/services/product_assets.py`
 - Modify: `backend/app/api/routes/projects.py`
 - Modify: `backend/app/services/final_prompt.py`
-- Test: `backend/tests/test_dual_product_workflows.py`
+- Modify: `backend/tests/test_projects_api.py`
+- Test: `backend/tests/test_dual_product_workflows.py`, `backend/tests/test_projects_api.py`
 
 **Interfaces:**
 - Consumes: `Session`, `Project`, physical `Asset.kind`.
@@ -55,7 +56,7 @@
 
 - [ ] **Step 1: Write strict-role failing tests**
 
-First remove `STRICT_MODE_DEFECT` from the three tests carried by plan 1 so they fail normally. Then add tests proving all three rules:
+First remove `STRICT_MODE_DEFECT` from all four tests carried by plan 1 so they fail normally: `test_page_two_rejects_incompatible_actions_with_chinese_shot_details`, `test_page_two_applies_target_product_to_every_product_shot`, `test_preserve_product_mode_rejects_replacement_during_prompt_creation`, and `test_prompt_save_cannot_bypass_product_lock`. Then add tests proving all three rules:
 
 ```python
 def test_preserve_mode_rejects_replace_product_even_with_legacy_target_asset() -> None:
@@ -111,7 +112,7 @@ The second test must create a `product_reference_image` whose latest `profile_js
 
 ```powershell
 Set-Location E:\工具-商用\backend
-python -m pytest tests/test_dual_product_workflows.py -k "legacy_target or forces_replacement" -q
+python -m pytest tests/test_dual_product_workflows.py tests/test_projects_api.py -k "legacy_target or forces_replacement or prompt_save_cannot_bypass_product_lock" -q
 ```
 
 Expected: FAIL because preserve mode currently accepts `payload.replace_product`.
@@ -162,7 +163,7 @@ In `execute_final_prompt_job`, load `Project`, call `confirmed_target_product_as
 - [ ] **Step 5: Run dual-mode and prompt tests**
 
 ```powershell
-python -m pytest tests/test_dual_product_workflows.py tests/test_prompting.py tests/test_simplified_prompt_workflow.py -q
+python -m pytest tests/test_dual_product_workflows.py tests/test_prompting.py tests/test_simplified_prompt_workflow.py tests/test_projects_api.py -q
 ```
 
 Expected: PASS.
@@ -170,7 +171,7 @@ Expected: PASS.
 - [ ] **Step 6: Commit strict mode rules**
 
 ```powershell
-git add backend/app/services/product_rules.py backend/app/api/routes/projects.py backend/app/services/final_prompt.py backend/tests/test_dual_product_workflows.py
+git add backend/app/services/product_rules.py backend/app/api/routes/projects.py backend/app/services/final_prompt.py backend/tests/test_dual_product_workflows.py backend/tests/test_projects_api.py
 git commit -m "fix: enforce immutable product modes"
 ```
 
