@@ -5,7 +5,7 @@ from fastapi.testclient import TestClient
 from sqlalchemy import select
 
 from app.core.config import Settings
-from app.db.models import Asset, Job, PromptRevision, Shot, ShotEdit, TimelineRevision
+from app.db.models import Asset, Generation, Job, PromptRevision, Shot, ShotEdit, TimelineRevision
 from app.db.session import SessionLocal
 from app.main import create_app
 from app.services.final_prompt import execute_final_prompt_job, execute_prompt_refinement_job
@@ -391,15 +391,16 @@ def test_refinement_worker_rejects_replacement_output_in_preserve_mode() -> None
                 assert "保留产品模式" in str(error)
             else:
                 assert False, "preserve-mode worker must reject replacement output"
-        assert revision.text == ""
+        assert revision.text == "00:00.00–00:03.00\n原提示词"
         assert revision.status == "queued"
         assert job.status == "queued"
 
 
 def test_run_once_discards_unsafe_final_prompt_before_retry_commit() -> None:
     with SessionLocal() as session:
-        for job in session.scalars(select(Job).where(Job.status.in_(["queued", "uploaded", "processing", "retryable"]))):
-            job.status = "failed"
+        for model in (Job, Generation):
+            for record in session.scalars(select(model).where(model.status.in_(["queued", "uploaded", "processing", "retryable"]))):
+                record.status = "failed"
         session.commit()
     client = _client()
     project = _project(client, "preserve_product")

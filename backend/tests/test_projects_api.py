@@ -4,7 +4,7 @@ from sqlalchemy import select
 from unittest.mock import patch
 from uuid import UUID, uuid4
 
-from app.db.models import Asset, PromptRevision
+from app.db.models import Asset, Job, PromptRevision
 from app.db.session import SessionLocal
 from app.main import create_app
 from app.services.media import VideoMetadata
@@ -296,6 +296,94 @@ def test_prompt_history_missing_project_returns_not_found() -> None:
     response = client.get(f"/api/projects/{uuid4()}/prompts")
 
     assert response.status_code == 404
+
+
+def test_refinement_queues_selected_completed_version_snapshot() -> None:
+    client = TestClient(create_app())
+    project = client.post("/api/projects", json={"name": "refinement snapshot"}).json()
+    with SessionLocal() as session:
+        session.add_all([
+            PromptRevision(
+                project_id=UUID(project["id"]), version=1,
+                text="00:00.00–00:03.00\nfirst source",
+                visual_direction="first", status="completed",
+            ),
+            PromptRevision(
+                project_id=UUID(project["id"]), version=2,
+                text="00:00.00–00:03.00\nsecond source",
+                visual_direction="second", status="completed",
+            ),
+        ])
+        session.commit()
+
+    selected = client.post(
+        f"/api/projects/{project['id']}/prompts/refine",
+        json={"instruction": "只修改第一版", "source_version": 1},
+    )
+
+    assert selected.status_code == 202
+    assert selected.json()["status"] == "queued"
+    assert selected.json()["text"] == ""
+    with SessionLocal() as session:
+        queued = session.scalar(select(PromptRevision).where(
+            PromptRevision.project_id == UUID(project["id"]),
+            PromptRevision.version == selected.json()["version"],
+        ))
+        assert queued is not None
+        assert queued.text == "00:00.00–00:03.00\nfirst source"
+
+    latest = client.post(
+        f"/api/projects/{project['id']}/prompts/refine",
+        json={"instruction": "修改最新版本"},
+    )
+
+    assert latest.status_code == 202
+    with SessionLocal() as session:
+        queued = session.scalar(select(PromptRevision).where(
+            PromptRevision.project_id == UUID(project["id"]),
+            PromptRevision.version == latest.json()["version"],
+        ))
+        assert queued is not None
+        assert queued.text == "00:00.00–00:03.00\nsecond source"
+        for job in session.scalars(select(Job).where(
+            Job.project_id == UUID(project["id"]),
+            Job.kind == "prompt_refinement",
+        )):
+            job.status = "failed"
+        session.commit()
+
+
+@pytest.mark.parametrize("source_version", [0, 2, 3, 4, 999])
+def test_refinement_rejects_unknown_or_unfinished_source_version(source_version: int) -> None:
+    client = TestClient(create_app())
+    project = client.post("/api/projects", json={"name": "invalid refinement source"}).json()
+    with SessionLocal() as session:
+        session.add_all([
+            PromptRevision(
+                project_id=UUID(project["id"]), version=1, text="complete source",
+                visual_direction="complete", status="completed",
+            ),
+            PromptRevision(
+                project_id=UUID(project["id"]), version=2, text="queued source",
+                visual_direction="queued", status="queued",
+            ),
+            PromptRevision(
+                project_id=UUID(project["id"]), version=3, text="failed source",
+                visual_direction="failed", status="failed",
+            ),
+            PromptRevision(
+                project_id=UUID(project["id"]), version=4, text="",
+                visual_direction="empty", status="completed",
+            ),
+        ])
+        session.commit()
+
+    response = client.post(
+        f"/api/projects/{project['id']}/prompts/refine",
+        json={"instruction": "修改", "source_version": source_version},
+    )
+
+    assert response.status_code == 422
 
 
 def test_page_one_rejects_product_replacement() -> None:

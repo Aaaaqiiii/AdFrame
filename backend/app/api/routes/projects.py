@@ -188,6 +188,7 @@ class CreatePromptRequest(BaseModel):
 
 class RefinePromptRequest(BaseModel):
     instruction: str = Field(min_length=1, max_length=8000)
+    source_version: int | None = Field(default=None, ge=1)
 
 
 class ShotEditRequest(BaseModel):
@@ -837,20 +838,25 @@ def refine_prompt_revision(
     payload: RefinePromptRequest,
     session: Session = Depends(get_session),
 ) -> PromptResponse:
-    """基于最新完整提示词创建一个新的 GPT 修改版本，旧版本保持不变。"""
+    """基于选定的完整提示词创建一个新的 GPT 修改版本，旧版本保持不变。"""
     project = session.get(Project, project_id)
     if project is None:
         raise HTTPException(status_code=404, detail="项目不存在")
-    source = session.scalar(select(PromptRevision).where(
+    source_query = select(PromptRevision).where(
         PromptRevision.project_id == project_id,
         PromptRevision.status == "completed",
         PromptRevision.text != "",
-    ).order_by(PromptRevision.version.desc()))
+    )
+    if payload.source_version is not None:
+        source_query = source_query.where(PromptRevision.version == payload.source_version)
+    else:
+        source_query = source_query.order_by(PromptRevision.version.desc())
+    source = session.scalar(source_query)
     if source is None:
         raise HTTPException(status_code=422, detail="请先生成或保存一份完整提示词")
     version = (session.scalar(select(func.max(PromptRevision.version)).where(PromptRevision.project_id == project_id)) or 0) + 1
     revision = PromptRevision(
-        project_id=project_id, version=version, text="",
+        project_id=project_id, version=version, text=source.text,
         visual_direction=payload.instruction.strip(), audio_mode=source.audio_mode,
         audio_style=source.audio_style, replace_product=project.mode == "replace_product",
         replace_person=source.replace_person, source_timeline_revision_id=source.source_timeline_revision_id,

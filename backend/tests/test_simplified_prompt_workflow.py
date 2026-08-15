@@ -12,7 +12,7 @@ from app.db.session import SessionLocal
 from app.main import create_app
 from app.api.routes.analysis import request_shot_vision_analysis
 from app.services.vision_jobs import execute_vision_job
-from app.services.final_prompt import execute_final_prompt_job
+from app.services.final_prompt import execute_final_prompt_job, execute_prompt_refinement_job
 from app.services.volcengine_vision import VisionTaskResult
 
 
@@ -184,3 +184,45 @@ def test_final_prompt_uses_only_confirmed_edit_and_can_be_saved_manually() -> No
     assert manual.status_code == 201
     assert manual.json()["text"] == "人工修改后的最终正文"
     assert manual.json()["status"] == "completed"
+
+
+def test_prompt_refinement_worker_uses_queued_source_snapshot() -> None:
+    source_text = "00:00.00–00:03.00\nfirst source"
+    refined_text = "00:00.00–00:03.00\nrevised v1"
+    with SessionLocal() as session:
+        project = Project(name="refinement worker snapshot")
+        session.add(project)
+        session.flush()
+        session.add(PromptRevision(
+            project_id=project.id, version=1, text=source_text,
+            visual_direction="first", status="completed",
+        ))
+        queued = PromptRevision(
+            project_id=project.id, version=3, text=source_text,
+            visual_direction="修改第一版", status="queued",
+        )
+        session.add(queued)
+        session.flush()
+        job = Job(
+            project_id=project.id, kind="prompt_refinement", status="queued",
+            provider_input_id=str(queued.id),
+        )
+        session.add_all([
+            job,
+            PromptRevision(
+                project_id=project.id, version=2,
+                text="00:00.00–00:03.00\nsecond source",
+                visual_direction="second", status="completed",
+            ),
+        ])
+        session.commit()
+
+        with patch("app.services.final_prompt.refine_prompt", return_value=refined_text) as refine:
+            execute_prompt_refinement_job(session, job, Settings(comfly_api_key="test-key"))
+
+        assert refine.call_args.args[0] == source_text
+        session.refresh(queued)
+        session.refresh(job)
+        assert queued.text == refined_text
+        assert queued.status == "completed"
+        assert job.status == "completed"

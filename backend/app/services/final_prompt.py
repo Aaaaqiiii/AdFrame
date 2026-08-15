@@ -185,15 +185,10 @@ def execute_prompt_refinement_job(session: Session, job: Job, settings: Settings
     project = session.get(Project, job.project_id)
     if project is None:
         raise ValueError("项目不存在")
-    source = session.scalar(select(PromptRevision).where(
-        PromptRevision.project_id == job.project_id,
-        PromptRevision.version < revision.version,
-        PromptRevision.status == "completed",
-        PromptRevision.text != "",
-    ).order_by(PromptRevision.version.desc()))
-    if source is None:
-        raise ValueError("没有可供修改的完整提示词")
-    refined_text = refine_prompt(source.text, revision.visual_direction, settings)
+    source_text = revision.text.strip()
+    if not source_text:
+        raise ValueError("没有可供修改的完整提示词快照")
+    refined_text = refine_prompt(source_text, revision.visual_direction, settings)
     revision.replace_product = project.mode == "replace_product"
     if project.mode == "preserve_product" and contains_product_replacement(refined_text):
         raise ValueError("保留产品模式的模型输出不能替换产品")
