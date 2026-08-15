@@ -171,8 +171,10 @@ def test_final_prompt_uses_only_confirmed_edit_and_can_be_saved_manually() -> No
         with patch("app.services.final_prompt.generate_final_prompt", return_value="00:00.00–00:03.20\n人工确认动作") as generate:
             execute_final_prompt_job(session, job, Settings())
         session.refresh(revision)
+        session.refresh(job)
         assert revision.status == "completed"
         assert revision.text == "00:00.00–00:03.20\n人工确认动作"
+        assert job.status == "completed"
         assert generate.call_args.kwargs["shots"][0]["facts"]["people"] == "人工确认人物"
 
     manual = client.post(
@@ -181,3 +183,4 @@ def test_final_prompt_uses_only_confirmed_edit_and_can_be_saved_manually() -> No
     )
     assert manual.status_code == 201
     assert manual.json()["text"] == "人工修改后的最终正文"
+    assert manual.json()["status"] == "completed"
