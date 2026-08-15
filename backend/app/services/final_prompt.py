@@ -11,6 +11,7 @@ from sqlalchemy.orm import Session
 from app.core.config import Settings
 from app.services.volcengine_vision import VisionConfigurationError
 from app.db.models import Asset, Job, Project, PromptRevision, Shot, ShotEdit
+from app.services.product_rules import confirmed_target_product_assets, contains_product_replacement
 from app.services.reference_profiles import load_structure
 
 
@@ -151,19 +152,23 @@ def execute_final_prompt_job(session: Session, job: Job, settings: Settings | No
         shots.append({"start_sec": shot.start_sec, "end_sec": shot.end_sec, "facts": {"people": edit.people, "action": edit.action, "product": edit.product, "product_interaction": edit.product_interaction, "background": edit.background, "camera": edit.camera, "lighting": edit.lighting, "visual_style": edit.visual_style, "visible_text": edit.visible_text, "uncertainties": edit.uncertainties}, "changes": {}, "keep": edit.keep_unchanged.splitlines() if edit.keep_unchanged else []})
     def profile(kind: str) -> str:
         assets = session.scalars(select(Asset).where(Asset.project_id == job.project_id, Asset.kind == kind).order_by(Asset.id)).all()
-        # 产品只使用人工确认后的统一事实，单图分析原文不进入最终提示词。
-        if kind in {"product_reference_image", "target_product_reference_image"} and assets and load_structure(assets[-1]).get("summary_confirmed"):
-            return assets[-1].profile_text.strip() if assets[-1].profile_text else ""
         profiles = [asset.profile_text.strip() for asset in assets if asset.profile_text and asset.profile_text.strip()]
         return "\n\n".join(f"参考图 {index + 1}：\n{value}" for index, value in enumerate(profiles))
     project = session.get(Project, job.project_id)
-    product_kind = "product_reference_image" if project and project.mode == "replace_product" else "target_product_reference_image"
+    if project is None:
+        raise ValueError("项目不存在")
+    product_assets = confirmed_target_product_assets(session, project)
+    product_profile = product_assets[-1].profile_text.strip() if product_assets and load_structure(product_assets[-1]).get("summary_confirmed") and product_assets[-1].profile_text else ""
+    replace_product = project.mode == "replace_product"
+    revision.replace_product = replace_product
     revision.text = generate_final_prompt(
         shots=shots, user_direction=revision.visual_direction,
-        product_profile=profile(product_kind), person_profile=profile("person_reference_image"),
-        replace_product=revision.replace_product, replace_person=revision.replace_person,
+        product_profile=product_profile, person_profile=profile("person_reference_image"),
+        replace_product=replace_product, replace_person=revision.replace_person,
         audio_mode=revision.audio_mode, audio_style=revision.audio_style, settings=settings,
     )
+    if project.mode == "preserve_product" and contains_product_replacement(revision.text):
+        raise ValueError("保留产品模式的模型输出不能替换产品")
     revision.status, revision.error_message = "completed", None
     job.status, job.error_message = "completed", None
     session.commit()
@@ -176,6 +181,9 @@ def execute_prompt_refinement_job(session: Session, job: Job, settings: Settings
         job.status, job.error_message = "failed", "待修改的提示词版本不存在"
         session.commit()
         return job
+    project = session.get(Project, job.project_id)
+    if project is None:
+        raise ValueError("项目不存在")
     source = session.scalar(select(PromptRevision).where(
         PromptRevision.project_id == job.project_id,
         PromptRevision.version < revision.version,
@@ -185,6 +193,9 @@ def execute_prompt_refinement_job(session: Session, job: Job, settings: Settings
     if source is None:
         raise ValueError("没有可供修改的完整提示词")
     revision.text = refine_prompt(source.text, revision.visual_direction, settings)
+    revision.replace_product = project.mode == "replace_product"
+    if project.mode == "preserve_product" and contains_product_replacement(revision.text):
+        raise ValueError("保留产品模式的模型输出不能替换产品")
     revision.status, revision.error_message = "completed", None
     job.status, job.error_message = "completed", None
     session.commit()

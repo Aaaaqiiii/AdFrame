@@ -1,5 +1,4 @@
 import shutil
-import re
 import mimetypes
 import json
 from pathlib import Path
@@ -18,6 +17,7 @@ from app.services.media import MediaToolUnavailableError, probe_video
 from app.services.tempfile_publisher import TempfilePublisher
 from app.services.reference_profiles import load_structure, queue_profile_job
 from app.services.product_compatibility import check_product_compatibility
+from app.services.product_rules import confirmed_target_product_assets, contains_product_replacement
 
 router = APIRouter(prefix="/api/projects", tags=["projects"])
 VIDEO_EXTENSIONS = {".mp4", ".mov", ".webm"}
@@ -663,30 +663,8 @@ def validate_locked_product(
     project = session.get(Project, project_id)
     if project is None:
         raise HTTPException(status_code=404, detail="项目不存在")
-    if project.mode == "preserve_product" and _contains_product_replacement(payload.text):
+    if project.mode == "preserve_product" and contains_product_replacement(payload.text):
         raise HTTPException(status_code=422, detail="页面一固定保留原商品，不能在提示词中替换产品。")
-
-
-def _contains_product_replacement(text: str) -> bool:
-    normalized = re.sub(
-        r"(?:不得|不能|禁止|不要|不可|不允许).{0,30}?(?:替换|更换|换成|换为|改成|改为|变成|变为|删除|移除)",
-        "",
-        text,
-    )
-    lowered = re.sub(
-        r"\b(?:do not|don't|must not|never|cannot|can't)\s+(?:replace|swap|change|turn|convert|remove)\b",
-        "",
-        normalized.lower(),
-    )
-    english = re.search(
-        r"(?:\b(?:replace|swap|change|turn|convert)\b.{0,120}\b(?:product|item|package|packaging|bottle|box|tube|with|for|to|into)\b|\bremove\b.{0,120}\b(?:product|item|package|packaging|bottle|box|tube)\b)",
-        lowered,
-    )
-    chinese = re.search(
-        r"(?:把|将)?(?:原有?|当前|这个|视频中(?:的)?)?(?:产品|商品|包装|瓶子|瓶身|盒子|软管).{0,20}(?:替换(?:成|为)?|更换(?:成|为)?|换成|换为|改成|改为|变成|变为|删除|移除)",
-        normalized,
-    )
-    return bool(english or chinese)
 
 
 def _shot_edit_response(session: Session, project_id: UUID, shot_id: UUID) -> ShotEditResponse | None:
@@ -709,7 +687,7 @@ def save_shot_edit(project_id: UUID, shot_id: UUID, payload: ShotEditRequest, se
         raise HTTPException(status_code=404, detail="Shot does not exist")
     project = session.get(Project, project_id)
     edited_text = "\n".join((payload.people, payload.action, payload.product, payload.product_interaction, payload.background, payload.camera, payload.lighting, payload.visual_style, payload.visible_text, payload.uncertainties, *payload.keep_unchanged))
-    if project and project.mode == "preserve_product" and _contains_product_replacement(edited_text):
+    if project and project.mode == "preserve_product" and contains_product_replacement(edited_text):
         raise HTTPException(status_code=422, detail="页面一固定保留原商品，镜头修改不能替换产品。")
     edit = session.scalar(select(ShotEdit).where(ShotEdit.project_id == project_id, ShotEdit.shot_id == shot_id))
     if edit is None:
@@ -753,28 +731,38 @@ def create_prompt_revision(
     project = session.get(Project, project_id)
     if project is None:
         raise HTTPException(status_code=404, detail="项目不存在")
-    # 原产品辅助图只用于核对原片；替换开关只能读取独立的目标产品档案。
-    product_kind = "target_product_reference_image" if project.mode == "preserve_product" else "product_reference_image"
-    product_assets = _reference_images(session, project_id, product_kind)
+    if project.mode == "preserve_product" and payload.replace_product:
+        raise HTTPException(status_code=422, detail="保留产品模式不能开启产品替换。")
+    if project.mode == "preserve_product" and contains_product_replacement(payload.visual_direction):
+        raise HTTPException(status_code=422, detail="保留产品模式的提示词不能替换产品。")
+    replace_product = project.mode == "replace_product"
+    product_assets = confirmed_target_product_assets(session, project)
     product_profile = _combined_reference_profile(product_assets)
-    # 页面二的业务定义就是替换产品，不能被前端旧状态或遗漏字段关闭。
-    replace_product = project.mode == "replace_product" or payload.replace_product
     person_asset = _reference_image(session, project_id, "person_reference_image")
-    if replace_product and (not product_profile or _combined_analysis_status(product_assets) != "succeeded" or not _product_profile_confirmed(product_assets)):
-        raise HTTPException(status_code=422, detail="选择替换产品前，请先上传并确认产品图片档案")
     if payload.replace_person and (person_asset is None or not person_asset.profile_text or _api_analysis_status(person_asset.analysis_status) != "succeeded"):
         raise HTTPException(status_code=422, detail="选择替换人物前，请先上传并确认人物图片档案")
     if payload.audio_mode not in {"keep_original", "add_style"}:
         raise HTTPException(status_code=422, detail="未知的音频选项")
     if payload.audio_mode == "add_style" and not payload.audio_style.strip():
         raise HTTPException(status_code=422, detail="请选择音频风格")
+    revision = session.scalar(select(TimelineRevision).where(TimelineRevision.project_id == project_id).order_by(TimelineRevision.version.desc()))
+    current_shots = list(session.scalars(select(Shot).where(Shot.timeline_revision_id == revision.id).order_by(Shot.position))) if revision else []
+    if replace_product:
+        _, conflicts = check_product_compatibility(product_profile or "", current_shots)
+        if conflicts:
+            raise HTTPException(status_code=422, detail={
+                "message": "目标产品形态与部分原镜头动作不兼容，请先修正这些镜头",
+                "shot_ids": [conflict["shot_id"] for conflict in conflicts],
+                "conflicts": conflicts,
+            })
+    if replace_product and (not product_profile or _combined_analysis_status(product_assets) != "succeeded" or not _product_profile_confirmed(product_assets)):
+        raise HTTPException(status_code=422, detail="选择替换产品前，请先上传并确认产品图片档案")
     version = (session.scalar(
         select(func.max(PromptRevision.version)).where(PromptRevision.project_id == project_id)
     ) or 0) + 1
-    revision = session.scalar(select(TimelineRevision).where(TimelineRevision.project_id == project_id).order_by(TimelineRevision.version.desc()))
     shot_instructions = []
     if revision:
-        for shot in session.scalars(select(Shot).where(Shot.timeline_revision_id == revision.id).order_by(Shot.position)):
+        for shot in current_shots:
             edit = session.scalar(select(ShotEdit).where(ShotEdit.project_id == project_id, ShotEdit.shot_id == shot.id))
             # 最终提示词只使用用户确认版本，不读取模型中间结果。
             if edit is None or not edit.confirmed:
@@ -824,7 +812,7 @@ def refine_prompt_revision(
     revision = PromptRevision(
         project_id=project_id, version=version, text="",
         visual_direction=payload.instruction.strip(), audio_mode=source.audio_mode,
-        audio_style=source.audio_style, replace_product=source.replace_product,
+        audio_style=source.audio_style, replace_product=project.mode == "replace_product",
         replace_person=source.replace_person, source_timeline_revision_id=source.source_timeline_revision_id,
         status="queued",
     )

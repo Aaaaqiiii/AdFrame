@@ -10,11 +10,6 @@ from app.main import create_app
 from app.services.media import VideoMetadata
 
 
-STRICT_MODE_DEFECT = pytest.mark.xfail(
-    strict=True,
-    reason="strict product rule is implemented in plan 02",
-)
-
 
 def _accepted_video_upload(client: TestClient, project_id: str, name: str = "reference.mp4", content: bytes = b"video-bytes"):
     with patch("app.api.routes.projects.probe_video", return_value=VideoMetadata(8, 1280, 720, 30)):
@@ -240,7 +235,6 @@ def test_shot_edits_are_saved_against_the_current_project() -> None:
     assert response.json()["keep_unchanged"] == ["product shape"]
 
 
-@STRICT_MODE_DEFECT
 def test_prompt_save_cannot_bypass_product_lock() -> None:
     client = TestClient(create_app())
     project = client.post("/api/projects", json={"name": "prompt lock"}).json()

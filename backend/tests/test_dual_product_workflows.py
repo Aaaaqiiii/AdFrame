@@ -1,7 +1,6 @@
 from unittest.mock import patch
 from uuid import UUID
 
-import pytest
 from fastapi.testclient import TestClient
 from sqlalchemy import select
 
@@ -9,13 +8,7 @@ from app.core.config import Settings
 from app.db.models import Asset, Job, PromptRevision, Shot, ShotEdit, TimelineRevision
 from app.db.session import SessionLocal
 from app.main import create_app
-from app.services.final_prompt import execute_final_prompt_job
-
-
-STRICT_MODE_DEFECT = pytest.mark.xfail(
-    strict=True,
-    reason="strict product rule is implemented in plan 02",
-)
+from app.services.final_prompt import execute_final_prompt_job, execute_prompt_refinement_job
 
 
 def _client() -> TestClient:
@@ -119,7 +112,6 @@ def test_page_two_requires_target_product_before_prompt_or_generation() -> None:
     assert "替换产品" in str(response.json()["detail"])
 
 
-@STRICT_MODE_DEFECT
 def test_page_two_rejects_incompatible_actions_with_chinese_shot_details() -> None:
     client = _client()
     project = _project(client, "replace_product")
@@ -239,7 +231,6 @@ def test_product_compatibility_can_be_checked_before_prompt_save() -> None:
     assert compatibility["conflicts"][0]["suggestion"]
 
 
-@STRICT_MODE_DEFECT
 def test_preserve_product_mode_rejects_replacement_during_prompt_creation() -> None:
     client = _client()
     project = _project(client, "preserve_product")
@@ -248,6 +239,158 @@ def test_preserve_product_mode_rejects_replacement_during_prompt_creation() -> N
         json={"product_profile": "原产品", "visual_direction": "把原产品替换为牛奶盒"},
     )
     assert response.status_code == 422
+
+
+def test_preserve_mode_rejects_replace_product_even_with_legacy_target_asset() -> None:
+    client = _client()
+    project = _project(client, "preserve_product")
+    with SessionLocal() as session:
+        session.add(Asset(
+            project_id=UUID(project["id"]),
+            kind="target_product_reference_image",
+            original_path="C:/legacy.png",
+            profile_text="旧目标产品",
+            profile_json='{"summary_confirmed": true}',
+            analysis_status="succeeded",
+        ))
+        session.commit()
+
+    response = client.post(
+        f"/api/projects/{project['id']}/prompts",
+        json={"visual_direction": "保持节奏", "replace_product": True, "use_ai": False},
+    )
+
+    assert response.status_code == 422
+
+
+def test_replace_mode_forces_replacement_when_client_sends_false() -> None:
+    client = _client()
+    project = _project(client, "replace_product")
+    _upload_product(client, project["id"])
+    client.put(
+        f"/api/projects/{project['id']}/product-profile",
+        json={"profile": "已确认盒装产品", "structure": {"summary_confirmed": True}},
+    )
+    timeline = client.put(
+        f"/api/projects/{project['id']}/timeline",
+        json={"shots": [{"start_sec": 0, "end_sec": 3}]},
+    ).json()
+    client.put(
+        f"/api/projects/{project['id']}/shots/{timeline['shots'][0]['id']}/edit",
+        json={"product": "原产品", "confirmed": True},
+    )
+
+    response = client.post(
+        f"/api/projects/{project['id']}/prompts",
+        json={"visual_direction": "保持节奏", "replace_product": False, "use_ai": False},
+    )
+
+    assert response.status_code == 201
+    with SessionLocal() as session:
+        revision = session.scalar(select(PromptRevision).where(
+            PromptRevision.project_id == UUID(project["id"])
+        ))
+        assert revision is not None
+        assert revision.replace_product is True
+
+
+def test_refinement_uses_project_mode_not_source_revision() -> None:
+    client = _client()
+    project = _project(client, "preserve_product")
+    with SessionLocal() as session:
+        session.add(PromptRevision(
+            project_id=UUID(project["id"]), version=1, text="原提示词",
+            visual_direction="保持节奏", replace_product=True, status="completed",
+        ))
+        session.commit()
+
+    response = client.post(
+        f"/api/projects/{project['id']}/prompts/refine",
+        json={"instruction": "增强光线"},
+    )
+
+    assert response.status_code == 202
+    with SessionLocal() as session:
+        revision = session.scalar(select(PromptRevision).where(
+            PromptRevision.project_id == UUID(project["id"]),
+            PromptRevision.version == 2,
+        ))
+        assert revision is not None
+        assert revision.replace_product is False
+
+
+def test_final_prompt_worker_rejects_replacement_output_in_preserve_mode() -> None:
+    client = _client()
+    project = _project(client, "preserve_product")
+    timeline = client.put(
+        f"/api/projects/{project['id']}/timeline",
+        json={"shots": [{"start_sec": 0, "end_sec": 3}]},
+    ).json()
+    client.put(
+        f"/api/projects/{project['id']}/shots/{timeline['shots'][0]['id']}/edit",
+        json={"product": "原产品", "confirmed": True},
+    )
+    client.post(
+        f"/api/projects/{project['id']}/prompts",
+        json={"visual_direction": "保持节奏", "use_ai": True},
+    )
+
+    with SessionLocal() as session:
+        revision = session.scalar(select(PromptRevision).where(
+            PromptRevision.project_id == UUID(project["id"]),
+            PromptRevision.version == 1,
+        ))
+        job = session.scalar(select(Job).where(
+            Job.project_id == UUID(project["id"]),
+            Job.kind == "final_prompt_generation",
+        ))
+        assert revision is not None
+        assert job is not None
+        with patch("app.services.final_prompt._chat", return_value="00:00.00–00:03.00\nreplace the bottle with shampoo"):
+            try:
+                execute_final_prompt_job(session, job, Settings(comfly_api_key="test-comfly-api-key"))
+            except ValueError as error:
+                assert "保留产品模式" in str(error)
+            else:
+                assert False, "preserve-mode worker must reject replacement output"
+        assert revision.status == "queued"
+        assert job.status == "queued"
+
+
+def test_refinement_worker_rejects_replacement_output_in_preserve_mode() -> None:
+    client = _client()
+    project = _project(client, "preserve_product")
+    with SessionLocal() as session:
+        session.add(PromptRevision(
+            project_id=UUID(project["id"]), version=1, text="00:00.00–00:03.00\n原提示词",
+            visual_direction="保持节奏", status="completed",
+        ))
+        session.commit()
+    client.post(
+        f"/api/projects/{project['id']}/prompts/refine",
+        json={"instruction": "调整画面"},
+    )
+
+    with SessionLocal() as session:
+        revision = session.scalar(select(PromptRevision).where(
+            PromptRevision.project_id == UUID(project["id"]),
+            PromptRevision.version == 2,
+        ))
+        job = session.scalar(select(Job).where(
+            Job.project_id == UUID(project["id"]),
+            Job.kind == "prompt_refinement",
+        ))
+        assert revision is not None
+        assert job is not None
+        with patch("app.services.final_prompt._chat", return_value="00:00.00–00:03.00\nreplace the bottle with shampoo"):
+            try:
+                execute_prompt_refinement_job(session, job, Settings(comfly_api_key="test-comfly-api-key"))
+            except ValueError as error:
+                assert "保留产品模式" in str(error)
+            else:
+                assert False, "preserve-mode worker must reject replacement output"
+        assert revision.status == "queued"
+        assert job.status == "queued"
 
 
 def test_human_timeline_preserves_overlapping_facts_without_starting_models() -> None:
