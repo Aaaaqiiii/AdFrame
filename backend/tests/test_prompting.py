@@ -62,9 +62,13 @@ def test_prompt_revisions_are_saved_with_audio_choice() -> None:
             "visual_direction": "清晨窗边的产品特写",
             "audio_mode": "add_style",
             "audio_style": "轻盈钢琴",
+            "use_ai": False,
         },
     )
 
     assert response.status_code == 201
-    assert response.json()["version"] == 1
-    assert "轻盈钢琴" in response.json()["text"]
+    assert response.json() == {
+        "version": 1,
+        "text": "清晨窗边的产品特写",
+        "status": "completed",
+    }

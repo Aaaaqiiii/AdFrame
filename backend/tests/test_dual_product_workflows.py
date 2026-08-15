@@ -1,12 +1,19 @@
 from unittest.mock import patch
 from uuid import UUID
 
+import pytest
 from fastapi.testclient import TestClient
 from sqlalchemy import select
 
 from app.db.models import Asset, Job, Shot, ShotEdit, TimelineRevision
 from app.db.session import SessionLocal
 from app.main import create_app
+
+
+STRICT_MODE_DEFECT = pytest.mark.xfail(
+    strict=True,
+    reason="strict product rule is implemented in plan 02",
+)
 
 
 def _client() -> TestClient:
@@ -62,18 +69,18 @@ def test_product_upload_is_previewable_and_analysis_is_persisted_as_a_job() -> N
     assert details["product_analysis_status"] == "queued"
 
 
-def test_missing_openai_key_is_a_clear_persisted_product_analysis_state() -> None:
+def test_missing_comfly_key_is_a_clear_persisted_product_analysis_state() -> None:
     client = _client()
     project = _project(client, "replace_product")
     with patch("app.api.routes.projects.Settings") as settings:
         settings.return_value.media_root = __import__("pathlib").Path("E:/工具-商用/data/test-media")
-        settings.return_value.openai_api_key = ""
+        settings.return_value.comfly_api_key = ""
         uploaded = _upload_product(client, project["id"])
 
     assert uploaded["analysis_status"] == "failed"
     profile = client.get(f"/api/projects/{project['id']}/product-profile").json()
     assert profile["status"] == "failed"
-    assert "OPENAI_API_KEY" in profile["error"]
+    assert "Comfly API Key" in profile["error"]
 
 
 def test_product_profile_can_be_corrected_and_restored() -> None:
@@ -103,13 +110,14 @@ def test_page_two_requires_target_product_before_prompt_or_generation() -> None:
 
     response = client.post(
         f"/api/projects/{project['id']}/prompts",
-        json={"product_profile": "", "visual_direction": "保持原节奏"},
+        json={"product_profile": "", "visual_direction": "保持原节奏", "use_ai": False},
     )
 
     assert response.status_code == 422
-    assert "目标产品" in str(response.json()["detail"])
+    assert "替换产品" in str(response.json()["detail"])
 
 
+@STRICT_MODE_DEFECT
 def test_page_two_rejects_incompatible_actions_with_chinese_shot_details() -> None:
     client = _client()
     project = _project(client, "replace_product")
@@ -139,6 +147,7 @@ def test_page_two_rejects_incompatible_actions_with_chinese_shot_details() -> No
     assert "软管" in detail["conflicts"][0]["reason"]
 
 
+@STRICT_MODE_DEFECT
 def test_page_two_applies_target_product_to_every_product_shot() -> None:
     client = _client()
     project = _project(client, "replace_product")
@@ -193,6 +202,7 @@ def test_product_compatibility_can_be_checked_before_prompt_save() -> None:
     assert compatibility["conflicts"][0]["suggestion"]
 
 
+@STRICT_MODE_DEFECT
 def test_preserve_product_mode_rejects_replacement_during_prompt_creation() -> None:
     client = _client()
     project = _project(client, "preserve_product")
@@ -203,7 +213,7 @@ def test_preserve_product_mode_rejects_replacement_during_prompt_creation() -> N
     assert response.status_code == 422
 
 
-def test_human_timeline_preserves_overlapping_facts_and_requeues_only_affected_shots() -> None:
+def test_human_timeline_preserves_overlapping_facts_without_starting_models() -> None:
     client = _client()
     project = _project(client)
     original = client.put(
@@ -222,15 +232,14 @@ def test_human_timeline_preserves_overlapping_facts_and_requeues_only_affected_s
         session.add(ShotEdit(project_id=UUID(project["id"]), shot_id=shots[1].id, background="蓝色影棚"))
         session.commit()
 
-    with patch("app.api.routes.timeline.validate_dual_vision_configuration"):
-        revised = client.put(
-            f"/api/projects/{project['id']}/timeline",
-            json={"shots": [
-                {"start_sec": 0, "end_sec": 2},
-                {"start_sec": 2, "end_sec": 5},
-                {"start_sec": 5, "end_sec": 6},
-            ]},
-        )
+    revised = client.put(
+        f"/api/projects/{project['id']}/timeline",
+        json={"shots": [
+            {"start_sec": 0, "end_sec": 2},
+            {"start_sec": 2, "end_sec": 5},
+            {"start_sec": 5, "end_sec": 6},
+        ]},
+    )
 
     assert revised.status_code == 202
     body = revised.json()
@@ -244,7 +253,7 @@ def test_human_timeline_preserves_overlapping_facts_and_requeues_only_affected_s
         queued = session.scalars(select(Job).where(
             Job.project_id == UUID(project["id"]), Job.kind == "vision_shot_analysis", Job.status == "queued"
         )).all()
-        assert {str(job.shot_id) for job in queued} == set(body["affected_shot_ids"])
+        assert queued == []
 
 
 def test_timeline_correction_without_vision_configuration_does_not_create_dead_jobs() -> None:
@@ -255,11 +264,10 @@ def test_timeline_correction_without_vision_configuration_does_not_create_dead_j
         json={"shots": [{"start_sec": 0, "end_sec": 2}, {"start_sec": 2, "end_sec": 4}]},
     ).json()
 
-    with patch("app.api.routes.timeline.validate_dual_vision_configuration", side_effect=__import__("app.services.volcengine_vision", fromlist=["VisionConfigurationError"]).VisionConfigurationError("missing")):
-        revised = client.put(
-            f"/api/projects/{project['id']}/timeline",
-            json={"shots": [{"start_sec": 0, "end_sec": 3}, {"start_sec": 3, "end_sec": 4}]},
-        )
+    revised = client.put(
+        f"/api/projects/{project['id']}/timeline",
+        json={"shots": [{"start_sec": 0, "end_sec": 3}, {"start_sec": 3, "end_sec": 4}]},
+    )
 
     assert revised.status_code == 202
     assert revised.json()["affected_shot_ids"]

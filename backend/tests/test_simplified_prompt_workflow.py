@@ -6,11 +6,13 @@ from uuid import UUID
 from fastapi.testclient import TestClient
 from sqlalchemy import select
 
-from app.db.models import Asset, Job, Project, Shot, ShotEdit, TimelineRevision, VideoAnalysis
+from app.core.config import Settings
+from app.db.models import Asset, Job, Project, PromptRevision, Shot, ShotEdit, TimelineRevision, VideoAnalysis
 from app.db.session import SessionLocal
 from app.main import create_app
 from app.api.routes.analysis import request_shot_vision_analysis
 from app.services.vision_jobs import execute_vision_job
+from app.services.final_prompt import execute_final_prompt_job
 from app.services.volcengine_vision import VisionTaskResult
 
 
@@ -148,13 +150,30 @@ def test_final_prompt_uses_only_confirmed_edit_and_can_be_saved_manually() -> No
     )
     assert edited.status_code == 200
 
-    with patch("app.api.routes.projects.generate_final_prompt", return_value="00:00.00–00:03.20\n人工确认动作") as generate:
-        response = client.post(
-            f"/api/projects/{project['id']}/prompts",
-            json={"visual_direction": "保持原节奏", "replace_product": False, "replace_person": False, "use_ai": True},
-        )
+    response = client.post(
+        f"/api/projects/{project['id']}/prompts",
+        json={"visual_direction": "保持原节奏", "replace_product": False, "replace_person": False, "use_ai": True},
+    )
     assert response.status_code == 201
-    assert generate.call_args.kwargs["shots"][0]["facts"]["people"] == "人工确认人物"
+    assert response.json()["status"] == "queued"
+    with SessionLocal() as session:
+        revision = session.scalar(select(PromptRevision).where(
+            PromptRevision.project_id == UUID(project["id"]),
+            PromptRevision.version == response.json()["version"],
+        ))
+        job = session.scalar(select(Job).where(
+            Job.project_id == UUID(project["id"]),
+            Job.kind == "final_prompt_generation",
+        ))
+        assert revision is not None
+        assert job is not None
+        assert job.status == "queued"
+        with patch("app.services.final_prompt.generate_final_prompt", return_value="00:00.00–00:03.20\n人工确认动作") as generate:
+            execute_final_prompt_job(session, job, Settings())
+        session.refresh(revision)
+        assert revision.status == "completed"
+        assert revision.text == "00:00.00–00:03.20\n人工确认动作"
+        assert generate.call_args.kwargs["shots"][0]["facts"]["people"] == "人工确认人物"
 
     manual = client.post(
         f"/api/projects/{project['id']}/prompts",
