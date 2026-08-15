@@ -1,6 +1,6 @@
 # AdFlow 本地生成闭环设计规格
 
-**状态：** 待用户审阅
+**状态：** 已确认
 
 **日期：** 2026-08-15
 
@@ -49,6 +49,7 @@
 
 - 始终保留参考视频中的原产品。
 - 产品图只用于辅助核对包装、Logo、颜色和结构。
+- 原产品辅助图不作为 Seedance 的额外替换参考图发送；原产品以参考视频和确定性提示词约束为准。
 - 镜头编辑、提示词和生成请求都不得表达产品替换。
 - 页面中不再显示“替换产品”开关和目标产品上传入口。
 - 服务端拒绝任何试图绕过前端开启产品替换的请求。
@@ -59,6 +60,7 @@
 - 目标产品档案必须分析成功并由用户确认。
 - 所有出现原产品的镜头统一使用同一份目标产品档案。
 - 最终提示词必须确定性包含完整目标产品锁定档案。
+- Seedance 提交时自动携带本项目所有已确认目标产品图片，不允许在第六步取消。
 - 产品形态和镜头动作发生明确冲突时阻止生成提示词。
 
 人物替换是两个模式都可使用的独立能力。人物档案必须成功并被用户确认后，才能开启人物替换。
@@ -257,7 +259,30 @@ PostgreSQL   本地 media 目录
 
 ## 7. API设计
 
-### 7.1 生成列表
+### 7.1 可选提示词版本
+
+```http
+GET /api/projects/{project_id}/prompts?current_timeline_only=true&status=completed
+```
+
+第六步通过该接口读取可选版本，不从 `ProjectDetails.latest_prompt_*` 猜测历史。默认按版本倒序返回；`current_timeline_only=true` 时只返回 `source_timeline_revision_id` 等于项目当前时间轴的版本。每项包含：
+
+```json
+{
+  "id": "uuid",
+  "version": 4,
+  "text": "完整提示词",
+  "status": "completed",
+  "source_timeline_revision_id": "uuid",
+  "replace_product": false,
+  "replace_person": true,
+  "created_at": "2026-08-15T11:10:00Z"
+}
+```
+
+服务端只接受 `status=completed` 或不传 `status`；本地第六步固定请求 `current_timeline_only=true&status=completed`。没有匹配版本时返回空数组，不回退到旧时间轴提示词。
+
+### 7.2 生成列表
 
 ```http
 GET /api/projects/{project_id}/generations
@@ -282,7 +307,7 @@ GET /api/projects/{project_id}/generations
 }
 ```
 
-### 7.2 创建生成
+### 7.3 创建生成
 
 ```http
 POST /api/projects/{project_id}/generations
@@ -318,12 +343,14 @@ POST /api/projects/{project_id}/generations
 - 严格双模式规则成立。
 - 参考视频存在、可读且不超过30秒。
 - 被选择的参考图片存在并已确认。
+- `replace_product` 项目自动把所有已确认 `product_reference_image` 加入 `reference_asset_ids`；`preserve_product` 项目不把历史 `target_product_reference_image` 或原产品辅助图作为替换参考发送。
+- `include_person_reference` 必须与所选提示词版本的 `replace_person` 快照一致；开启时人物档案必须成功且经过人工保存确认。
 - 供应商API Key已经配置。
 - 同一 `submission_fingerprint` 没有活跃任务。
 
 API只创建数据库记录并返回 `202`，不在HTTP请求内调用生成供应商。
 
-### 7.3 获取详情
+### 7.4 获取详情
 
 ```http
 GET /api/projects/{project_id}/generations/{generation_id}
@@ -331,7 +358,7 @@ GET /api/projects/{project_id}/generations/{generation_id}
 
 必须正确计算 `local_video_url`。当前实现直接返回ORM对象时不会填充该字段，本阶段必须统一使用响应构造函数。
 
-### 7.4 失败后再次生成
+### 7.5 失败后再次生成
 
 ```http
 POST /api/projects/{project_id}/generations/{generation_id}/retry
@@ -341,7 +368,7 @@ POST /api/projects/{project_id}/generations/{generation_id}/retry
 
 技术性 `retryable` 由Worker自动处理，不显示人工重试按钮。
 
-### 7.5 处理不明确提交
+### 7.6 处理不明确提交
 
 ```http
 POST /api/projects/{project_id}/generations/{generation_id}/resolve
@@ -361,7 +388,7 @@ POST /api/projects/{project_id}/generations/{generation_id}/resolve
 
 只有 `submission_uncertain` 可以调用。附加任务ID后进入 `processing`；确认供应商未创建后进入 `failed`，用户随后可以创建新版本。
 
-### 7.6 本地结果
+### 7.7 本地结果
 
 ```http
 GET /api/projects/{project_id}/generations/{generation_id}/content
@@ -448,6 +475,7 @@ submission_uncertain -> failed
 
 - 用户点击“确认并生成视频”表示同意本次上传清单中的文件被临时发布。
 - 参考视频始终需要公网可读地址。
+- `replace_product` 项目的已确认目标产品图始终发布并列入上传清单。
 - 人物图和背景图只有勾选后才发布。
 - 临时URL约24小时有效。
 - URL过期后，Worker根据本地素材ID自动重新发布。
@@ -578,6 +606,8 @@ python -m alembic -c alembic.ini upgrade head
 - GPT修改创建新版本且旧版本不变。
 - 旧时间轴提示词不能提交生成。
 - 只有 `completed` 提示词可选。
+- 提示词列表按版本倒序返回。
+- 当前时间轴过滤不会返回旧时间轴提示词。
 
 ### 14.4 生成API测试
 
