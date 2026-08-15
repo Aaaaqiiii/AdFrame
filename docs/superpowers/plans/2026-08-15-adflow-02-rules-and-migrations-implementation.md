@@ -44,7 +44,7 @@
 ### Task 1: Centralize product asset roles
 
 **Files:**
-- Create: `backend/app/services/product_assets.py`
+- Create: `backend/app/services/product_rules.py`
 - Modify: `backend/app/api/routes/projects.py`
 - Modify: `backend/app/services/final_prompt.py`
 - Modify: `backend/tests/test_dual_product_workflows.py`
