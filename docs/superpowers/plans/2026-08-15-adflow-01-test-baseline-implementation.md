@@ -16,7 +16,7 @@
 - SQLAlchemy UUID 列只能与 `UUID` 对象比较。
 - FFmpeg/FFprobe 缺失或不可执行时明确跳过；完整本机验收要求跳过数为 0。
 - 不修改业务代码来迁就过期断言。
-- 本计划允许且只允许 4 个严格模式缺陷使用 `pytest.mark.xfail(strict=True)`；计划 2 必须移除标记并修复。
+- 本计划允许且只允许 3 个严格模式缺陷使用 `pytest.mark.xfail(strict=True)`；计划 2 必须移除标记并修复。
 
 ---
 
@@ -40,7 +40,7 @@
 
 **Interfaces:**
 - Consumes: `DATABASE_URL` and `MEDIA_ROOT` environment variables read by `Settings`.
-- Produces: `media_tools_available` pytest marker and one fresh SQLite schema per test session.
+- Produces: `media_tools` pytest marker and one fresh SQLite schema per test session.
 
 - [ ] **Step 1: Run the complete backend suite and preserve the exact failure list**
 
@@ -254,7 +254,7 @@ STRICT_MODE_DEFECT = pytest.mark.xfail(
 )
 ```
 
-Place `@STRICT_MODE_DEFECT` immediately above the existing definitions of `test_page_two_rejects_incompatible_actions_with_chinese_shot_details`, `test_page_two_applies_target_product_to_every_product_shot`, `test_preserve_product_mode_rejects_replacement_during_prompt_creation`, and `test_prompt_save_cannot_bypass_product_lock`; their complete bodies remain unchanged. Do not mark missing-product, timeline, UUID, media, queueing, or database tests.
+Place `@STRICT_MODE_DEFECT` immediately above the existing definitions of `test_page_two_rejects_incompatible_actions_with_chinese_shot_details`, `test_preserve_product_mode_rejects_replacement_during_prompt_creation`, and `test_prompt_save_cannot_bypass_product_lock`; their complete bodies remain unchanged. Do not mark missing-product, timeline, UUID, media, queueing, database tests, or `test_page_two_applies_target_product_to_every_product_shot`.
 
 - [ ] **Step 5: Run the prompt and dual-mode modules**
 
@@ -262,7 +262,7 @@ Place `@STRICT_MODE_DEFECT` immediately above the existing definitions of `test_
 python -m pytest tests/test_prompting.py tests/test_simplified_prompt_workflow.py tests/test_dual_product_workflows.py tests/test_projects_api.py -q
 ```
 
-Expected: no unexpected failures; exactly the four named strict-mode tests are XFAIL, with no synchronous provider patch on the HTTP route.
+Expected: no unexpected failures; exactly the three named strict-mode tests are XFAIL, with no synchronous provider patch on the HTTP route.
 
 - [ ] **Step 6: Commit the asynchronous test contract**
 
@@ -287,7 +287,7 @@ Set-Location E:\工具-商用\backend
 python -m pytest -q
 ```
 
-Expected: exit code 0, unexpected failures 0, exactly 4 XFAIL, and on the real workstation skipped count 0.
+Expected: exit code 0, `101 passed, 3 xfailed, 0 failed/errors/skipped`, and on the real workstation skipped count 0.
 
 - [ ] **Step 2: Run the existing frontend gate to prove no cross-stack regression**
 
@@ -302,4 +302,4 @@ Expected: all three commands exit 0.
 
 - [ ] **Step 3: Record the exact counts in the implementation task notes**
 
-Record `passed`, `xfailed`, `failed`, `errors`, and `skipped` from pytest plus the Vitest test count. Confirm `xfailed == 4`, `failed == 0`, `errors == 0`, and `skipped == 0`. Do not create a code commit when this step changes no files.
+Record `passed`, `xfailed`, `failed`, `errors`, and `skipped` from pytest plus the Vitest test count. Confirm `passed == 101`, `xfailed == 3`, `failed == 0`, `errors == 0`, and `skipped == 0`. Do not create a code commit when this step changes no files.

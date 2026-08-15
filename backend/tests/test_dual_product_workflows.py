@@ -5,9 +5,11 @@ import pytest
 from fastapi.testclient import TestClient
 from sqlalchemy import select
 
-from app.db.models import Asset, Job, Shot, ShotEdit, TimelineRevision
+from app.core.config import Settings
+from app.db.models import Asset, Job, PromptRevision, Shot, ShotEdit, TimelineRevision
 from app.db.session import SessionLocal
 from app.main import create_app
+from app.services.final_prompt import execute_final_prompt_job
 
 
 STRICT_MODE_DEFECT = pytest.mark.xfail(
@@ -147,32 +149,67 @@ def test_page_two_rejects_incompatible_actions_with_chinese_shot_details() -> No
     assert "软管" in detail["conflicts"][0]["reason"]
 
 
-@STRICT_MODE_DEFECT
 def test_page_two_applies_target_product_to_every_product_shot() -> None:
     client = _client()
     project = _project(client, "replace_product")
     _upload_product(client, project["id"])
     profile = "纸盒装牛奶，顶部吸管口，拿起后饮用"
-    client.put(f"/api/projects/{project['id']}/product-profile", json={"profile": profile})
+    profile_response = client.put(
+        f"/api/projects/{project['id']}/product-profile",
+        json={"profile": profile, "structure": {"summary_confirmed": True}},
+    )
+    assert profile_response.status_code == 200
+    assert profile_response.json()["status"] == "succeeded"
     timeline = client.put(
         f"/api/projects/{project['id']}/timeline",
         json={"shots": [{"start_sec": 0, "end_sec": 2}, {"start_sec": 2, "end_sec": 4}]},
     ).json()
-    with SessionLocal() as session:
-        shots = [session.get(Shot, UUID(item["id"])) for item in timeline["shots"]]
-        shots[0].product_interaction = "桌面产品特写"
-        shots[1].product_interaction = "拿起盒子饮用"
-        session.commit()
+    for shot, product_interaction in zip(timeline["shots"], ("桌面产品特写", "拿起盒子饮用")):
+        edit = client.put(
+            f"/api/projects/{project['id']}/shots/{shot['id']}/edit",
+            json={
+                "product": "纸盒装牛奶",
+                "product_interaction": product_interaction,
+                "confirmed": True,
+            },
+        )
+        assert edit.status_code == 200
+        assert edit.json()["confirmed"] is True
 
     response = client.post(
         f"/api/projects/{project['id']}/prompts",
-        json={"product_profile": profile, "visual_direction": "背景改为厨房"},
+        json={"product_profile": profile, "visual_direction": "背景改为厨房", "use_ai": True},
     )
 
     assert response.status_code == 201
-    text = response.json()["text"]
-    assert "将原视频中的产品统一替换为目标产品" in text
-    assert text.count("目标产品：纸盒装牛奶") >= 2
+    assert response.json()["status"] == "queued"
+    assert response.json()["text"] == ""
+    with SessionLocal() as session:
+        revision = session.scalar(select(PromptRevision).where(
+            PromptRevision.project_id == UUID(project["id"]),
+            PromptRevision.version == response.json()["version"],
+        ))
+        assert revision is not None
+        job = session.scalar(select(Job).where(
+            Job.project_id == UUID(project["id"]),
+            Job.kind == "final_prompt_generation",
+            Job.provider_input_id == str(revision.id),
+        ))
+        assert job is not None
+        assert job.status == "queued"
+        with patch(
+            "app.services.final_prompt._chat",
+            return_value="00:00.00–00:02.00\n桌面产品特写\n00:02.00–00:04.00\n拿起盒子饮用",
+        ):
+            execute_final_prompt_job(session, job, Settings(comfly_api_key="test-comfly-api-key"))
+        session.refresh(revision)
+        session.refresh(job)
+        assert revision.status == "completed"
+        assert job.status == "completed"
+        assert "00:00.00–00:02.00" in revision.text
+        assert "00:02.00–00:04.00" in revision.text
+        assert revision.text.startswith("目标产品锁定档案（应用于所有含产品镜头）：\n")
+        assert profile in revision.text
 
 
 def test_product_compatibility_can_be_checked_before_prompt_save() -> None:

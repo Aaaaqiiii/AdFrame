@@ -47,6 +47,7 @@
 - Create: `backend/app/services/product_assets.py`
 - Modify: `backend/app/api/routes/projects.py`
 - Modify: `backend/app/services/final_prompt.py`
+- Modify: `backend/tests/test_dual_product_workflows.py`
 - Modify: `backend/tests/test_projects_api.py`
 - Test: `backend/tests/test_dual_product_workflows.py`, `backend/tests/test_projects_api.py`
 
@@ -56,7 +57,7 @@
 
 - [ ] **Step 1: Write strict-role failing tests**
 
-First remove `STRICT_MODE_DEFECT` from all four tests carried by plan 1 so they fail normally: `test_page_two_rejects_incompatible_actions_with_chinese_shot_details`, `test_page_two_applies_target_product_to_every_product_shot`, `test_preserve_product_mode_rejects_replacement_during_prompt_creation`, and `test_prompt_save_cannot_bypass_product_lock`. Then add tests proving all three rules:
+First remove `STRICT_MODE_DEFECT` from the three tests carried by plan 1 so they fail normally: `test_page_two_rejects_incompatible_actions_with_chinese_shot_details`, `test_preserve_product_mode_rejects_replacement_during_prompt_creation`, and `test_prompt_save_cannot_bypass_product_lock`. `test_page_two_applies_target_product_to_every_product_shot` is already green asynchronous coverage; retain it in the full dual-product module regression command without changing its status. Then add tests proving all three rules:
 
 ```python
 def test_preserve_mode_rejects_replace_product_even_with_legacy_target_asset() -> None:
