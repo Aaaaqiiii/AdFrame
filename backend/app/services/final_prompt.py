@@ -161,14 +161,15 @@ def execute_final_prompt_job(session: Session, job: Job, settings: Settings | No
     product_profile = product_assets[-1].profile_text.strip() if product_assets and load_structure(product_assets[-1]).get("summary_confirmed") and product_assets[-1].profile_text else ""
     replace_product = project.mode == "replace_product"
     revision.replace_product = replace_product
-    revision.text = generate_final_prompt(
+    generated_text = generate_final_prompt(
         shots=shots, user_direction=revision.visual_direction,
         product_profile=product_profile, person_profile=profile("person_reference_image"),
         replace_product=replace_product, replace_person=revision.replace_person,
         audio_mode=revision.audio_mode, audio_style=revision.audio_style, settings=settings,
     )
-    if project.mode == "preserve_product" and contains_product_replacement(revision.text):
+    if project.mode == "preserve_product" and contains_product_replacement(generated_text):
         raise ValueError("保留产品模式的模型输出不能替换产品")
+    revision.text = generated_text
     revision.status, revision.error_message = "completed", None
     job.status, job.error_message = "completed", None
     session.commit()
@@ -192,10 +193,11 @@ def execute_prompt_refinement_job(session: Session, job: Job, settings: Settings
     ).order_by(PromptRevision.version.desc()))
     if source is None:
         raise ValueError("没有可供修改的完整提示词")
-    revision.text = refine_prompt(source.text, revision.visual_direction, settings)
+    refined_text = refine_prompt(source.text, revision.visual_direction, settings)
     revision.replace_product = project.mode == "replace_product"
-    if project.mode == "preserve_product" and contains_product_replacement(revision.text):
+    if project.mode == "preserve_product" and contains_product_replacement(refined_text):
         raise ValueError("保留产品模式的模型输出不能替换产品")
+    revision.text = refined_text
     revision.status, revision.error_message = "completed", None
     job.status, job.error_message = "completed", None
     session.commit()

@@ -9,6 +9,7 @@ from app.db.models import Asset, Job, PromptRevision, Shot, ShotEdit, TimelineRe
 from app.db.session import SessionLocal
 from app.main import create_app
 from app.services.final_prompt import execute_final_prompt_job, execute_prompt_refinement_job
+from app import worker
 
 
 def _client() -> TestClient:
@@ -353,6 +354,7 @@ def test_final_prompt_worker_rejects_replacement_output_in_preserve_mode() -> No
                 assert "保留产品模式" in str(error)
             else:
                 assert False, "preserve-mode worker must reject replacement output"
+        assert revision.text == ""
         assert revision.status == "queued"
         assert job.status == "queued"
 
@@ -389,8 +391,48 @@ def test_refinement_worker_rejects_replacement_output_in_preserve_mode() -> None
                 assert "保留产品模式" in str(error)
             else:
                 assert False, "preserve-mode worker must reject replacement output"
+        assert revision.text == ""
         assert revision.status == "queued"
         assert job.status == "queued"
+
+
+def test_run_once_discards_unsafe_final_prompt_before_retry_commit() -> None:
+    with SessionLocal() as session:
+        for job in session.scalars(select(Job).where(Job.status.in_(["queued", "uploaded", "processing", "retryable"]))):
+            job.status = "failed"
+        session.commit()
+    client = _client()
+    project = _project(client, "preserve_product")
+    timeline = client.put(
+        f"/api/projects/{project['id']}/timeline",
+        json={"shots": [{"start_sec": 0, "end_sec": 3}]},
+    ).json()
+    client.put(
+        f"/api/projects/{project['id']}/shots/{timeline['shots'][0]['id']}/edit",
+        json={"product": "原产品", "confirmed": True},
+    )
+    client.post(
+        f"/api/projects/{project['id']}/prompts",
+        json={"visual_direction": "保持节奏", "use_ai": True},
+    )
+
+    with patch("app.worker.Settings", return_value=Settings(comfly_api_key="test-comfly-api-key")), patch(
+        "app.services.final_prompt._chat", return_value="00:00.00–00:03.00\nreplace the bottle with shampoo",
+    ):
+        assert worker.run_once() == 1
+
+    with SessionLocal() as session:
+        revision = session.scalar(select(PromptRevision).where(PromptRevision.project_id == UUID(project["id"])))
+        job = session.scalar(select(Job).where(
+            Job.project_id == UUID(project["id"]),
+            Job.kind == "final_prompt_generation",
+        ))
+        assert revision is not None
+        assert job is not None
+        assert revision.text == ""
+        assert revision.status != "completed"
+        assert revision.status in {"retryable", "failed"}
+        assert job.status == revision.status
 
 
 def test_human_timeline_preserves_overlapping_facts_without_starting_models() -> None:
