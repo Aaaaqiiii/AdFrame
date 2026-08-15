@@ -43,16 +43,19 @@ def video_with_cut(tmp_path: Path) -> Path:
     return target
 
 
+@pytest.mark.media_tools
 def test_reference_duration_over_30_blocks_submission_only(video_31_seconds: Path) -> None:
     metadata = probe_video(video_31_seconds)
 
     assert validate_reference_duration(metadata)[0].code == "reference_video_too_long"
 
 
+@pytest.mark.media_tools
 def test_candidate_cuts_are_real_timestamps(video_with_cut: Path) -> None:
     assert any(4.8 < cut < 5.2 for cut in detect_candidate_cuts(video_with_cut))
 
 
+@pytest.mark.media_tools
 def test_clip_video_exports_only_the_requested_shot(video_with_cut: Path, tmp_path: Path) -> None:
     clip = clip_video(video_with_cut, tmp_path / "shot.mp4", 5, 8)
 

@@ -2,6 +2,8 @@ from fastapi.testclient import TestClient
 from pathlib import Path
 import subprocess
 
+import pytest
+
 from app.main import create_app
 
 
@@ -60,6 +62,7 @@ def test_human_timeline_rejects_gaps_and_overlaps() -> None:
     assert overlap.status_code == 422
 
 
+@pytest.mark.media_tools
 def test_analysis_start_creates_ai_timeline_from_real_candidate_cuts(tmp_path: Path) -> None:
     video = tmp_path / "reference.mp4"
     _cut_video(video)
