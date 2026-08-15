@@ -308,7 +308,7 @@ def test_expired_reference_video_link_is_republished_before_generation() -> None
         from app.db.models import Asset
         from app.db.session import SessionLocal
         with SessionLocal() as session:
-            asset = session.query(Asset).filter_by(project_id=project["id"], kind="reference_video").first()
+            asset = session.query(Asset).filter_by(project_id=UUID(project["id"]), kind="reference_video").first()
             asset.public_url, asset.public_url_expires_at = "https://tempfile.org/old/download", "2020-01-01T00:00:00+00:00"
             session.commit()
         response = client.post(f"/api/projects/{project['id']}/generations", json={"provider": "volcengine", "prompt_version": 1})
@@ -336,7 +336,7 @@ def test_generation_api_queues_work_without_calling_provider() -> None:
         from app.db.session import SessionLocal
         from app.db.models import Asset
         with SessionLocal() as session:
-            asset = session.query(Asset).filter_by(project_id=project["id"], kind="reference_video").first()
+            asset = session.query(Asset).filter_by(project_id=UUID(project["id"]), kind="reference_video").first()
             asset.public_url = "https://tempfile.org/test/download"
             session.commit()
         response = client.post(
@@ -348,8 +348,9 @@ def test_generation_api_queues_work_without_calling_provider() -> None:
     assert response.json()["status"] == "queued"
     from app.db.models import Generation
     from app.db.session import SessionLocal
+    generation_id = UUID(response.json()["id"])
     with SessionLocal() as session:
-        generation = session.get(Generation, response.json()["id"])
+        generation = session.get(Generation, generation_id)
         assert generation is not None
         assert (generation.ratio, generation.duration, generation.generate_audio) == ("adaptive", -1, True)
 
@@ -390,12 +391,13 @@ def test_generation_saves_reference_image_urls_only_when_requested() -> None:
         from app.db.models import Asset
         from app.db.session import SessionLocal
         with SessionLocal() as session:
-            video = session.query(Asset).filter_by(project_id=project["id"], kind="reference_video").first()
+            video = session.query(Asset).filter_by(project_id=UUID(project["id"]), kind="reference_video").first()
             video.public_url = "https://tempfile.org/video/download"
-            session.add(Asset(project_id=project["id"], kind="person_reference_image", original_path="C:/person.jpg", original_filename="person.jpg", content_type="image/jpeg"))
+            session.add(Asset(project_id=UUID(project["id"]), kind="person_reference_image", original_path="C:/person.jpg", original_filename="person.jpg", content_type="image/jpeg"))
             session.commit()
         response = client.post(f"/api/projects/{project['id']}/generations", json={"provider": "volcengine", "prompt_version": 1, "include_person_reference": False})
 
     from app.db.models import Generation
     with SessionLocal() as session:
-        assert session.get(Generation, response.json()["id"]).reference_image_urls == "[]"
+        generation = session.get(Generation, UUID(response.json()["id"]))
+        assert generation.reference_image_urls == "[]"
