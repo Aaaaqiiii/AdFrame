@@ -1,0 +1,22 @@
+[project]
+name = "adflow-backend"
+version = "0.1.0"
+requires-python = ">=3.11"
+dependencies = [
+  "cryptography>=48,<49",
+  "fastapi>=0.115,<1",
+  "pydantic-settings>=2.7,<3",
+  "sqlalchemy>=2.0,<3",
+  "psycopg[binary]>=3.2,<4",
+  "python-multipart>=0.0.20,<1",
+  "uvicorn[standard]>=0.34,<1",
+  "volcengine>=1.0.227,<2",
+  "requests>=2.32,<3",
+]
+
+[project.optional-dependencies]
+dev = ["alembic>=1.14,<2", "httpx>=0.28,<1", "pytest>=8.3,<9"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["."]

@@ -1,0 +1,8 @@
+.vision-setup { max-width: 1372px; margin: 0 auto 80px; padding: 26px 30px; display: grid; grid-template-columns: 1fr 1fr; gap: 34px; border: 1px solid #f1c5ae; border-radius: 14px; background: #fff8f4; }
+.vision-setup h2 { margin: 7px 0 10px; }
+.vision-setup p { color: #6f756d; font-size: 13px; line-height: 1.65; }
+.vision-fields { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; }
+.vision-fields label { font-size: 11px; color: #676d65; }
+.vision-fields label:last-of-type, .vision-fields button { grid-column: 1 / -1; }
+.vision-fields input { width: 100%; box-sizing: border-box; margin-top: 5px; padding: 10px; border: 1px solid #d9dcd5; border-radius: 7px; background: white; }
+@media (max-width: 760px) { .vision-setup { grid-template-columns: 1fr; margin-inline: 20px; } .vision-fields { grid-template-columns: 1fr; } .vision-fields label:last-of-type { grid-column: auto; } }

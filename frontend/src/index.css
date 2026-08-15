@@ -1,0 +1,5 @@
+:root { font-family: "Segoe UI Variable", "Microsoft YaHei", system-ui, sans-serif; color: #20241f; background: #f3f4f0; font-synthesis: none; text-rendering: optimizeLegibility; }
+* { box-sizing: border-box; }
+body { margin: 0; min-width: 320px; }
+button, input, textarea { font: inherit; }
+button { cursor: pointer; }

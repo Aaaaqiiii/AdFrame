@@ -1,0 +1,14 @@
+backend/.env
+data/
+frontend/node_modules/
+frontend/dist/
+backend/__pycache__/
+backend/**/__pycache__/
+backend/.pytest_cache/
+backend/*.egg-info/
+.pytest_cache/
+*.part
+.superpowers/
+.worktrees/
+backend/tests/.adflow-test.sqlite3
+backend/tests/.test-media/
