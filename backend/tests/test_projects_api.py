@@ -2,9 +2,9 @@ from fastapi.testclient import TestClient
 import pytest
 from sqlalchemy import select
 from unittest.mock import patch
-from uuid import UUID
+from uuid import UUID, uuid4
 
-from app.db.models import Asset
+from app.db.models import Asset, PromptRevision
 from app.db.session import SessionLocal
 from app.main import create_app
 from app.services.media import VideoMetadata
@@ -179,6 +179,123 @@ def test_project_details_restore_latest_human_timeline() -> None:
     assert response.json()["timeline"]["revision_id"] == saved["revision_id"]
     assert len(response.json()["timeline"]["shots"]) == 2
     assert response.json()["timeline"]["shots"][0]["observations"] is None
+
+
+def test_prompt_history_filters_to_completed_current_timeline() -> None:
+    client = TestClient(create_app())
+    project = client.post("/api/projects", json={"name": "prompt history"}).json()
+    timeline_v1 = client.put(
+        f"/api/projects/{project['id']}/timeline",
+        json={"shots": [{"start_sec": 0, "end_sec": 2}]},
+    ).json()
+    with SessionLocal() as session:
+        session.add(PromptRevision(
+            project_id=UUID(project["id"]), version=1, text="v1 completed",
+            visual_direction="v1", source_timeline_revision_id=UUID(timeline_v1["revision_id"]),
+            status="completed",
+        ))
+        session.commit()
+    timeline_v2 = client.put(
+        f"/api/projects/{project['id']}/timeline",
+        json={"shots": [{"start_sec": 0, "end_sec": 3}]},
+    ).json()
+    with SessionLocal() as session:
+        session.add_all([
+            PromptRevision(
+                project_id=UUID(project["id"]), version=2, text="source snapshot",
+                visual_direction="queued", source_timeline_revision_id=UUID(timeline_v2["revision_id"]),
+                status="queued",
+            ),
+            PromptRevision(
+                project_id=UUID(project["id"]), version=3, text="v3 completed",
+                visual_direction="v3", source_timeline_revision_id=UUID(timeline_v2["revision_id"]),
+                status="completed",
+            ),
+            PromptRevision(
+                project_id=UUID(project["id"]), version=4, text="",
+                visual_direction="empty", source_timeline_revision_id=UUID(timeline_v2["revision_id"]),
+                status="completed",
+            ),
+        ])
+        session.commit()
+
+    response = client.get(
+        f"/api/projects/{project['id']}/prompts?current_timeline_only=true&status=completed"
+    )
+    assert response.status_code == 200
+    assert [item["version"] for item in response.json()] == [3]
+    assert response.json()[0]["source_timeline_revision_id"] == timeline_v2["revision_id"]
+    assert set(response.json()[0]) == {
+        "id", "version", "text", "status", "source_timeline_revision_id",
+        "replace_product", "replace_person", "created_at",
+    }
+
+    all_revisions = client.get(f"/api/projects/{project['id']}/prompts")
+    assert all_revisions.status_code == 200
+    assert [item["version"] for item in all_revisions.json()] == [4, 3, 2, 1]
+
+
+def test_project_details_ignore_newer_unfinished_prompt_revision() -> None:
+    client = TestClient(create_app())
+    project = client.post("/api/projects", json={"name": "prompt recovery"}).json()
+    timeline = client.put(
+        f"/api/projects/{project['id']}/timeline",
+        json={"shots": [{"start_sec": 0, "end_sec": 2}]},
+    ).json()
+    with SessionLocal() as session:
+        session.add_all([
+            PromptRevision(
+                project_id=UUID(project["id"]), version=1, text="stable completed text",
+                visual_direction="stable direction", audio_mode="add_style",
+                audio_style="stable audio", replace_product=True, replace_person=True,
+                source_timeline_revision_id=UUID(timeline["revision_id"]), status="completed",
+            ),
+            PromptRevision(
+                project_id=UUID(project["id"]), version=2, text="",
+                visual_direction="queued direction", audio_mode="keep_original",
+                audio_style="queued audio", replace_product=False, replace_person=False,
+                source_timeline_revision_id=UUID(timeline["revision_id"]), status="queued",
+            ),
+        ])
+        session.commit()
+
+    details = client.get(f"/api/projects/{project['id']}")
+    assert details.status_code == 200
+    assert details.json()["latest_prompt_version"] == 1
+    assert details.json()["latest_prompt_text"] == "stable completed text"
+    assert details.json()["prompt_visual_direction"] == "stable direction"
+    assert details.json()["prompt_audio_mode"] == "add_style"
+    assert details.json()["prompt_audio_style"] == "stable audio"
+    assert details.json()["prompt_replace_product"] is True
+    assert details.json()["prompt_replace_person"] is True
+
+
+def test_prompt_history_rejects_unknown_status_filter() -> None:
+    client = TestClient(create_app())
+    project = client.post("/api/projects", json={"name": "prompt status"}).json()
+
+    response = client.get(f"/api/projects/{project['id']}/prompts?status=queued")
+
+    assert response.status_code == 422
+    assert "completed" in str(response.json()["detail"])
+
+
+def test_prompt_history_current_timeline_without_timeline_is_empty() -> None:
+    client = TestClient(create_app())
+    project = client.post("/api/projects", json={"name": "prompt no timeline"}).json()
+
+    response = client.get(f"/api/projects/{project['id']}/prompts?current_timeline_only=true")
+
+    assert response.status_code == 200
+    assert response.json() == []
+
+
+def test_prompt_history_missing_project_returns_not_found() -> None:
+    client = TestClient(create_app())
+
+    response = client.get(f"/api/projects/{uuid4()}/prompts")
+
+    assert response.status_code == 404
 
 
 def test_page_one_rejects_product_replacement() -> None:

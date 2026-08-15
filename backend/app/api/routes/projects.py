@@ -1,10 +1,11 @@
 import shutil
 import mimetypes
 import json
+from datetime import datetime
 from pathlib import Path
 from uuid import UUID, uuid4
 
-from fastapi import APIRouter, Depends, File, Form, HTTPException, UploadFile, status
+from fastapi import APIRouter, Depends, File, Form, HTTPException, Query, UploadFile, status
 from fastapi.responses import FileResponse
 from pydantic import BaseModel, Field
 from sqlalchemy import func, select
@@ -216,6 +217,17 @@ class PromptResponse(BaseModel):
     status: str = "completed"
 
 
+class PromptRevisionSummary(BaseModel):
+    id: UUID
+    version: int
+    text: str
+    status: str
+    source_timeline_revision_id: UUID | None
+    replace_product: bool
+    replace_person: bool
+    created_at: datetime
+
+
 class AdoptAISummaryResponse(BaseModel):
     version: int
     content: dict
@@ -289,7 +301,11 @@ def get_project(project_id: UUID, session: Session = Depends(get_session)) -> Pr
     product_asset = product_assets[-1] if product_assets else None
     target_product_assets = _reference_images(session, project_id, "target_product_reference_image")
     target_product_asset = target_product_assets[-1] if target_product_assets else None
-    latest_prompt = session.scalar(select(PromptRevision).where(PromptRevision.project_id == project_id).order_by(PromptRevision.version.desc()))
+    latest_prompt = session.scalar(select(PromptRevision).where(
+        PromptRevision.project_id == project_id,
+        PromptRevision.status == "completed",
+        PromptRevision.text != "",
+    ).order_by(PromptRevision.version.desc()))
     return ProjectDetailsResponse(
         id=project.id,
         name=project.name,
@@ -339,6 +355,30 @@ def get_project(project_id: UUID, session: Session = Depends(get_session)) -> Pr
         timeline=timeline,
         generations=[GenerationDetails(id=item.id, version=item.version, status=item.status, provider=item.provider, result_url=item.result_url, local_video_url=f"/api/projects/{project.id}/generations/{item.id}/content" if item.result_path else None) for item in sorted(project.generations, key=lambda item: item.version, reverse=True)],
     )
+
+
+@router.get("/{project_id}/prompts", response_model=list[PromptRevisionSummary])
+def list_prompt_revisions(
+    project_id: UUID,
+    current_timeline_only: bool = False,
+    status_filter: str | None = Query(default=None, alias="status"),
+    session: Session = Depends(get_session),
+) -> list[PromptRevision]:
+    if session.get(Project, project_id) is None:
+        raise HTTPException(status_code=404, detail="项目不存在")
+    if status_filter not in {None, "completed"}:
+        raise HTTPException(status_code=422, detail="提示词状态筛选只支持 completed")
+    query = select(PromptRevision).where(PromptRevision.project_id == project_id)
+    if status_filter == "completed":
+        query = query.where(PromptRevision.status == "completed", PromptRevision.text != "")
+    if current_timeline_only:
+        current = session.scalar(select(TimelineRevision).where(
+            TimelineRevision.project_id == project_id
+        ).order_by(TimelineRevision.version.desc()))
+        if current is None:
+            return []
+        query = query.where(PromptRevision.source_timeline_revision_id == current.id)
+    return list(session.scalars(query.order_by(PromptRevision.version.desc())))
 
 
 def _reference_image_name(session: Session, project_id: UUID, kind: str) -> str | None:
