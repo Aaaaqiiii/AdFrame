@@ -1,4 +1,26 @@
-from app.services.seedance import JsonTaskGateway, build_seedance_request, parse_generation_result
+import re
+
+import pytest
+import requests
+
+from app.services.seedance import JsonTaskGateway, SubmissionUncertainError, build_seedance_request, parse_generation_result, sanitize_provider_summary
+
+
+def test_submit_timeout_is_classified_as_uncertain() -> None:
+    class Http:
+        def post(self, *_args, **_kwargs):
+            raise requests.Timeout("read timed out")
+    gateway = JsonTaskGateway("https://provider", "secret", http=Http())
+    with pytest.raises(SubmissionUncertainError):
+        gateway.submit({"model": "seedance"})
+
+
+def test_sanitize_provider_summary_redacts_secrets() -> None:
+    summary = sanitize_provider_summary({"model": "seedance", "Authorization": "Bearer secret-key", "api_key": "sk-123456"})
+    assert "secret-key" not in summary
+    assert "sk-123456" not in summary
+    assert "***" in summary
+    assert len(summary) <= 4000
 
 
 def test_official_request_uses_public_reference_video_and_audio_switch() -> None:

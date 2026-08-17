@@ -6,7 +6,7 @@ from sqlalchemy.orm import Session
 
 from app.core.config import Settings
 from app.db.models import Generation
-from app.services.seedance import GenerationGateway, GenerationResult
+from app.services.seedance import GenerationGateway, GenerationResult, SubmissionUncertainError, sanitize_provider_summary
 from app.services.worker_state import MAX_ATTEMPTS, retry_at
 
 MAX_GENERATED_VIDEO_BYTES = 1024 * 1024 * 1024
@@ -42,8 +42,18 @@ def _download_result(source_url: str, destination: Path) -> None:
 def execute_generation_job(session: Session, generation: Generation, gateway: GenerationGateway, payload: dict) -> Generation:
     try:
         if not generation.external_task_id:
-            generation.external_task_id = gateway.submit(payload)
+            try:
+                generation.external_task_id = gateway.submit(payload)
+            except SubmissionUncertainError as exc:
+                generation.attempts += 1
+                generation.status = "submission_uncertain"
+                generation.error_message = str(exc)
+                generation.next_attempt_at = None
+                session.commit()
+                return generation
             generation.status = "processing"
+            generation.provider_response_summary = sanitize_provider_summary(payload)
+            # 立即持久化任务 ID，避免轮询前崩溃导致状态丢失。
             session.commit()
         result: GenerationResult = gateway.get_result(generation.external_task_id)
         generation.status = result.status

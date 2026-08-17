@@ -1,9 +1,23 @@
 from __future__ import annotations
 
+import json
+import re
 from dataclasses import dataclass
 from typing import Any, Protocol
 
 import requests
+
+
+class SubmissionUncertainError(RuntimeError):
+    """Provider submission outcome is unknown; never automatically resubmit."""
+
+
+def sanitize_provider_summary(value: object) -> str:
+    text = json.dumps(value, ensure_ascii=False, default=str)
+    # 完整吞掉授权头的值（含 "Bearer ..."），其余 key 值只保留首段脱敏。
+    text = re.sub(r"(?i)(authorization)(\"?\s*[:=]\s*\"?)[^\"]*\"?", r"\1\2***", text)
+    text = re.sub(r"(?i)(api[_-]?key|token)(\"?\s*[:=]\s*\"?)[^\",\s]+", r"\1\2***", text)
+    return text[:4000]
 
 
 @dataclass(frozen=True)
@@ -70,7 +84,10 @@ class JsonTaskGateway:
         self._base_url, self._task_path, self._api_key, self._http = base_url.rstrip("/"), task_path.rstrip("/"), api_key, http or requests.Session()
 
     def submit(self, payload: dict[str, Any]) -> str:
-        response = self._http.post(f"{self._base_url}{self._task_path}", headers={"Authorization": f"Bearer {self._api_key}"}, json=payload, timeout=(10, 60))
+        try:
+            response = self._http.post(f"{self._base_url}{self._task_path}", headers={"Authorization": f"Bearer {self._api_key}"}, json=payload, timeout=(10, 60))
+        except (requests.Timeout, requests.ConnectionError) as exc:
+            raise SubmissionUncertainError(f"供应商提交结果不明确：{exc}") from exc
         response.raise_for_status()
         body = response.json()
         task_id = _first_string(body.get("id"), body.get("task_id"), _dict(body.get("data")).get("id"), _dict(body.get("data")).get("task_id"))
