@@ -55,8 +55,23 @@
 
 按验收纪律，以下内容不写入本报告：API Key、完整供应商响应、签名 URL、用户真实素材文件内容。
 
-## 未完成收口项
+## 收口项（2026-08-17 完成）
 
-- 双模式业务页面检查（preserve 无替换控件 / replace 显示锁定目标产品）
-- 三种尺寸（1440×900、920×900、390×844）无横向溢出检查
-- Comfly“保存并测试”端点修正的运行实例确认（代码已修正，需重启实例生效）
+### 双模式业务页面检查
+
+- `/preserve-product`：Chrome headless 渲染确认**无替换产品功能控件**（仅保留"替换人物"开关；出现的"替换产品"字样仅来自工作流导航入口和"不得被替换"锁定规则文案）
+- `/replace-product`：确认显示"目标产品图"、"替换规则"、"必须替换"；第五步在 `mode === 'replace_product'` 时条件渲染"目标产品已锁定"banner
+- 后端逻辑由 `test_dual_product_workflows.py`（18 项）覆盖：preserve 拒绝替换、replace 强制目标产品、兼容性冲突拦截
+
+### 响应式三尺寸（1440×900、920×900、390×844）
+
+- Chrome headless 实际渲染截图三尺寸，无横向溢出
+- CSS 三档媒体查询：`max-width:1250px`、`max-width:920px`（工作流导航转顶部横向滚动 `overflow-x:auto`）、`max-width:680px`
+- 各容器 `overflow:hidden` + `text-overflow:ellipsis` 防溢出
+
+### Comfly 连通测试端点修正
+
+- 已新增 `comfly_prompt` 服务：`connectivity.py` 用 `comfly_vision_base_url + /v1/chat/completions` 检查 GPT 端点（真实请求 HTTP 200）
+- 设置页 Comfly 卡片改指向 `comfly_prompt`，文案"GPT关键帧理解、综合事实和最终提示词"与实际测试端点一致
+- `SETTING_GROUPS` 保存 Comfly Key 时默认验证 `comfly_prompt`
+- 后端 164→167 passed 验证（新增 3 个连通测试）
