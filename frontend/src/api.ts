@@ -101,6 +101,16 @@ export type AnalysisJob = {
   error_message?: string | null
   attempts?: number
 }
+export type PromptRevisionSummary = {
+  id: string
+  version: number
+  text: string
+  status: AnalysisState
+  source_timeline_revision_id: string | null
+  replace_product: boolean
+  replace_person: boolean
+  created_at: string
+}
 export type CompatibilityConflict = { shot_id: string; start_sec: number; end_sec: number; reason: string; suggestion: string }
 export type ProductCompatibility = {
   status: 'pending' | 'compatible' | 'warning' | 'blocked'
@@ -196,7 +206,8 @@ export function restoreAiTimeline(projectId: string, revisionId: string) { retur
 export function saveShotEdit(projectId: string, shotId: string, payload: ShotEdit) { return request<ShotEdit>(`/api/projects/${projectId}/shots/${shotId}/edit`, { method: 'PUT', ...json(payload) }) }
 export function getProductCompatibility(projectId: string) { return request<ProductCompatibility>(`/api/projects/${projectId}/product-compatibility`) }
 export function createPrompt(projectId: string, payload: { product_profile: string; visual_direction: string; audio_mode: string; audio_style: string; replace_product: boolean; replace_person: boolean; use_ai: boolean }) { return request<{ version: number; text: string; status: AnalysisState }>(`/api/projects/${projectId}/prompts`, { method: 'POST', ...json(payload) }) }
-export function refinePrompt(projectId: string, instruction: string) { return request<{ version: number; text: string; status: AnalysisState }>(`/api/projects/${projectId}/prompts/refine`, { method: 'POST', ...json({ instruction }) }) }
+export function listPromptRevisions(projectId: string) { return request<PromptRevisionSummary[]>(`/api/projects/${projectId}/prompts?current_timeline_only=true&status=completed`) }
+export function refinePrompt(projectId: string, instruction: string, sourceVersion?: number) { return request<{ version: number; text: string; status: AnalysisState }>(`/api/projects/${projectId}/prompts/refine`, { method: 'POST', ...json({ instruction, source_version: sourceVersion }) }) }
 export function publishReferenceVideo(projectId: string) { return request<{ url: string; expires_at: string; notice: string }>(`/api/projects/${projectId}/reference-video/publish`, { method: 'POST' }) }
 export function createGeneration(projectId: string, payload: { provider: string; prompt_version: number; ratio: string; duration: number; generate_audio: boolean; include_person_reference: boolean; include_background_reference: boolean }) { return request<{ id: string; status: string; error_message?: string | null }>(`/api/projects/${projectId}/generations`, { method: 'POST', ...json(payload) }) }
 export function getGeneration(projectId: string, generationId: string) { return request<{ id: string; status: string; result_url?: string | null; local_video_url?: string | null; error_message?: string | null }>(`/api/projects/${projectId}/generations/${generationId}`) }
