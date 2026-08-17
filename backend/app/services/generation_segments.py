@@ -105,8 +105,6 @@ def _balanced_shot_boundary_plan(
                 duration = boundary - previous
                 if duration < min_sec - EPSILON or duration > max_sec + EPSILON:
                     continue
-                if previous <= EPSILON and duration <= max_sec + EPSILON:
-                    pass
                 cost = best[previous][0] + (duration - target / count) ** 2
                 options.append((cost, best[previous][1] + [(previous, boundary)]))
             if options:
@@ -137,7 +135,7 @@ def validate_segments(
         if segment.end_sec <= segment.start_sec:
             raise SegmentValidationError("生成片段结束时间必须大于开始时间")
         if segment.end_sec - segment.start_sec > max_sec + EPSILON:
-            raise SegmentValidationError("生成片段超过 29 秒安全上限")
+            raise SegmentValidationError(f"生成片段超过 {max_sec:.0f} 秒安全上限")
         if index:
             previous = segments[index - 1]
             if abs(segment.start_sec - previous.end_sec) > EPSILON:
