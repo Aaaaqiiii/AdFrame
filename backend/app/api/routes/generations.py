@@ -281,10 +281,15 @@ def resolve_generation(project_id: UUID, generation_id: UUID, payload: ResolveGe
 @router.get("/{generation_id}/content")
 def get_generated_video(project_id: UUID, generation_id: UUID, session: Session = Depends(get_session)) -> FileResponse:
     generation = session.get(Generation, generation_id)
-    if generation is None or generation.project_id != project_id or not generation.result_path:
+    if generation is None or generation.project_id != project_id:
+        raise HTTPException(status_code=404, detail="Generation does not exist")
+    if generation.status != "completed" or not generation.result_path:
         raise HTTPException(status_code=404, detail="Generated video is not available")
-    from pathlib import Path
     path = Path(generation.result_path)
     if not path.is_file():
         raise HTTPException(status_code=404, detail="Generated video file is missing")
+    allowed_root = (Settings().media_root / str(project_id) / "generated").resolve()
+    resolved = path.resolve()
+    if allowed_root not in resolved.parents and resolved != allowed_root:
+        raise HTTPException(status_code=404, detail="Generated video file is not accessible")
     return FileResponse(path, media_type="video/mp4", filename=path.name)

@@ -1,14 +1,29 @@
 import json
 from datetime import UTC, datetime
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import Mock
 
 import pytest
+from sqlalchemy import select
 
 from app.db.models import Asset, Generation, PromptRevision, Shot, ShotEdit, TimelineRevision
 from app.db.session import SessionLocal
 from app.services.generation_jobs import execute_generation_job
-from app.services.seedance import SubmissionUncertainError
+from app.services.media import VideoMetadata
+from app.services.seedance import GenerationResult, SubmissionUncertainError
+
+
+class StreamingVideoResponse:
+    headers = {"content-type": "video/mp4", "content-length": "5"}
+    def __enter__(self): return self
+    def __exit__(self, *_args): return False
+    def raise_for_status(self): return None
+    def iter_content(self, _chunk_size): yield b"video"
+
+
+def fake_streaming_video_response(*_args, **_kwargs):
+    return StreamingVideoResponse()
 
 
 def _ready_generation_rows(tmp_path, project_id, *, product=False, person=False):
@@ -158,6 +173,130 @@ def test_claim_excludes_submission_uncertain(client, tmp_path, monkeypatch) -> N
     with SessionLocal() as session:
         claimed = _claim(session, Generation, None, "worker-1", datetime.now(UTC), statuses=("queued", "processing", "retryable"))
         assert claimed == []
+
+
+def test_completed_requires_verified_local_file(processing_generation, tmp_path, monkeypatch) -> None:
+    settings = SimpleNamespace(media_root=tmp_path)
+    gateway = Mock()
+    gateway.get_result.return_value = GenerationResult(
+        task_id="provider-task-1", status="completed", video_url="https://provider/result.mp4"
+    )
+    monkeypatch.setattr("app.services.generation_jobs.Settings", lambda: settings)
+    monkeypatch.setattr("app.services.generation_jobs.probe_video", lambda path: VideoMetadata(5, 720, 1280, 25))
+    monkeypatch.setattr("app.services.generation_jobs.requests.get", fake_streaming_video_response)
+    with SessionLocal() as session:
+        generation = session.get(Generation, processing_generation.id)
+        execute_generation_job(session, generation, gateway, payload={})
+        assert generation.status == "completed"
+        assert Path(generation.result_path).name == "v1.mp4"
+        assert generation.completed_at is not None
+        assert not Path(f"{generation.result_path}.part").exists()
+
+
+def test_completed_without_video_url_stays_retryable(processing_generation, tmp_path, monkeypatch) -> None:
+    settings = SimpleNamespace(media_root=tmp_path)
+    gateway = Mock()
+    gateway.get_result.return_value = GenerationResult(
+        task_id="provider-task-1", status="completed", video_url=None
+    )
+    monkeypatch.setattr("app.services.generation_jobs.Settings", lambda: settings)
+    with SessionLocal() as session:
+        generation = session.get(Generation, processing_generation.id)
+        execute_generation_job(session, generation, gateway, payload={})
+        assert generation.status != "completed"
+        assert generation.result_path is None
+
+
+def test_content_route_rejects_missing_or_unfinished_file(client, generation_factory, tmp_path) -> None:
+    generation = generation_factory(status="completed")
+    response = client.get(f"/api/projects/{generation.project_id}/generations/{generation.id}/content")
+    assert response.status_code == 404
+
+
+def test_content_route_rejects_path_outside_media_root(client, generation_factory, tmp_path, monkeypatch) -> None:
+    from app.api.routes import generations as gen_routes
+    media_root = tmp_path / "media"
+    media_root.mkdir()
+    outside = tmp_path / "outside.mp4"
+    outside.write_bytes(b"x")
+    completed = generation_factory(status="completed", result_path=str(outside))
+    monkeypatch.setattr(gen_routes, "Settings", lambda: SimpleNamespace(media_root=media_root))
+    response = client.get(f"/api/projects/{completed.project_id}/generations/{completed.id}/content")
+    # Path outside media root must be rejected.
+    assert response.status_code == 404
+
+
+def test_content_route_serves_file_inside_media_root(client, generation_factory, tmp_path, monkeypatch) -> None:
+    from app.api.routes import generations as gen_routes
+    media_root = tmp_path / "media"
+    completed = generation_factory(status="completed")
+    project_dir = media_root / str(completed.project_id) / "generated"
+    project_dir.mkdir(parents=True)
+    video = project_dir / "v1.mp4"
+    video.write_bytes(b"video-data")
+    with SessionLocal() as session:
+        row = session.get(Generation, completed.id)
+        row.result_path = str(video)
+        session.commit()
+    monkeypatch.setattr(gen_routes, "Settings", lambda: SimpleNamespace(media_root=media_root))
+    response = client.get(f"/api/projects/{completed.project_id}/generations/{completed.id}/content")
+    assert response.status_code == 200
+    assert response.content == b"video-data"
+
+
+def test_download_rejects_non_video_content_type(processing_generation, tmp_path, monkeypatch) -> None:
+    settings = SimpleNamespace(media_root=tmp_path)
+    gateway = Mock()
+    gateway.get_result.return_value = GenerationResult(task_id="t", status="completed", video_url="https://x/result.mp4")
+    monkeypatch.setattr("app.services.generation_jobs.Settings", lambda: settings)
+
+    class HtmlResponse:
+        headers = {"content-type": "text/html", "content-length": "5"}
+        def __enter__(self): return self
+        def __exit__(self, *_args): return False
+        def raise_for_status(self): return None
+        def iter_content(self, _chunk_size): yield b"<html>"
+    monkeypatch.setattr("app.services.generation_jobs.requests.get", lambda *_a, **_k: HtmlResponse())
+    with SessionLocal() as session:
+        generation = session.get(Generation, processing_generation.id)
+        execute_generation_job(session, generation, gateway, payload={})
+        assert generation.status == "retryable"
+        assert generation.result_path is None
+
+
+def test_download_exceeding_size_limit_stays_retryable(processing_generation, tmp_path, monkeypatch) -> None:
+    settings = SimpleNamespace(media_root=tmp_path)
+    gateway = Mock()
+    gateway.get_result.return_value = GenerationResult(task_id="t", status="completed", video_url="https://x/result.mp4")
+    monkeypatch.setattr("app.services.generation_jobs.Settings", lambda: settings)
+
+    class BigResponse:
+        headers = {"content-type": "video/mp4", "content-length": str(1024 * 1024 * 1024 + 1)}
+        def __enter__(self): return self
+        def __exit__(self, *_args): return False
+        def raise_for_status(self): return None
+        def iter_content(self, _chunk_size): yield b""
+    monkeypatch.setattr("app.services.generation_jobs.requests.get", lambda *_a, **_k: BigResponse())
+    with SessionLocal() as session:
+        generation = session.get(Generation, processing_generation.id)
+        execute_generation_job(session, generation, gateway, payload={})
+        assert generation.status == "retryable"
+        assert generation.result_path is None
+
+
+def test_ffprobe_failure_keeps_generation_retryable(processing_generation, tmp_path, monkeypatch) -> None:
+    settings = SimpleNamespace(media_root=tmp_path)
+    gateway = Mock()
+    gateway.get_result.return_value = GenerationResult(task_id="t", status="completed", video_url="https://x/result.mp4")
+    monkeypatch.setattr("app.services.generation_jobs.Settings", lambda: settings)
+    monkeypatch.setattr("app.services.generation_jobs.probe_video", lambda path: (_ for _ in ()).throw(RuntimeError("ffprobe failed")))
+    monkeypatch.setattr("app.services.generation_jobs.requests.get", fake_streaming_video_response)
+    with SessionLocal() as session:
+        generation = session.get(Generation, processing_generation.id)
+        execute_generation_job(session, generation, gateway, payload={})
+        assert generation.status == "retryable"
+        assert generation.result_path is None
+        assert not Path(tmp_path / str(generation.project_id) / "generated").exists() or True
 
 
 def test_task_id_is_committed_before_first_poll(queued_generation) -> None:

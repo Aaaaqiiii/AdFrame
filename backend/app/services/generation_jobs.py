@@ -6,6 +6,7 @@ from sqlalchemy.orm import Session
 
 from app.core.config import Settings
 from app.db.models import Generation
+from app.services.media import probe_video
 from app.services.seedance import GenerationGateway, GenerationResult, SubmissionUncertainError, sanitize_provider_summary
 from app.services.worker_state import MAX_ATTEMPTS, retry_at
 
@@ -32,7 +33,6 @@ def _download_result(source_url: str, destination: Path) -> None:
                         if total > MAX_GENERATED_VIDEO_BYTES:
                             raise RuntimeError("Generated result exceeds the download size limit")
                         output.write(chunk)
-        from app.services.media import probe_video
         probe_video(temporary)
         temporary.replace(destination)
     finally:
@@ -56,7 +56,6 @@ def execute_generation_job(session: Session, generation: Generation, gateway: Ge
             # 立即持久化任务 ID，避免轮询前崩溃导致状态丢失。
             session.commit()
         result: GenerationResult = gateway.get_result(generation.external_task_id)
-        generation.status = result.status
         generation.result_url = result.video_url
         generation.error_message = result.error_message
         if result.status == "completed" and result.video_url:
@@ -64,6 +63,16 @@ def execute_generation_job(session: Session, generation: Generation, gateway: Ge
             destination.parent.mkdir(parents=True, exist_ok=True)
             _download_result(result.video_url, destination)
             generation.result_path = str(destination)
+            generation.completed_at = datetime.now(UTC)
+            generation.status = "completed"
+            generation.next_attempt_at = None
+            generation.error_message = None
+        elif result.status == "completed":
+            # 供应商说完成但没给 URL：保持可重试，绝不标 completed。
+            generation.status = "retryable"
+            generation.next_attempt_at = retry_at(datetime.now(UTC), generation.attempts)
+        else:
+            generation.status = result.status
         session.commit()
     except Exception as exc:
         generation.attempts += 1
