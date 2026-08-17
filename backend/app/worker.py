@@ -4,23 +4,76 @@ from __future__ import annotations
 import time
 import json
 import socket
+import re
 from pathlib import Path
+from uuid import UUID
 from datetime import UTC, datetime, timedelta
 
 from sqlalchemy import or_, select
 
 from app.core.config import Settings
-from app.db.models import Generation, Job
+from app.db.models import Asset, Generation, Job, PromptRevision
 from app.db.migrations import require_database_at_head
 from app.db.session import SessionLocal
 from app.services.generation_jobs import execute_generation_job
 from app.services.seedance import JsonTaskGateway, build_seedance_request
+from app.services.tempfile_publisher import TempfilePublisher
 from app.services.comfly_frame_vision import ComflyFrameVisionGateway
 from app.services.dual_shot_vision import DualShotVisionGateway
 from app.services.vision_jobs import execute_vision_job
 from app.services.reference_profiles import execute_profile_job
 from app.services.final_prompt import execute_final_prompt_job, execute_prompt_refinement_job
 from app.services.worker_state import MAX_ATTEMPTS, next_poll_at, retry_at
+
+
+def redact_request_urls(payload: dict) -> dict:
+    """Replace every URL's query string with a redacted marker for persisted snapshots."""
+    def redact(value):
+        if isinstance(value, dict):
+            return {key: redact(item) for key, item in value.items()}
+        if isinstance(value, list):
+            return [redact(item) for item in value]
+        if isinstance(value, str):
+            match = re.match(r"^(https?://[^/?#]+[^?#]*)\?[^#]*", value)
+            if match:
+                return f"{match.group(1)}?[redacted]"
+            return value
+        return value
+    return redact(payload)
+
+
+def _resolve_asset_inputs(session, project_id: UUID, asset_ids: list[str]) -> list[Asset]:
+    """Restore generation inputs strictly from persisted asset IDs, in order."""
+    resolved = []
+    for raw in asset_ids:
+        try:
+            asset_id = UUID(raw)
+        except ValueError:
+            return []
+        asset = session.get(Asset, asset_id)
+        if asset is None or asset.project_id != project_id:
+            return []
+        path = Path(asset.original_path)
+        if not path.is_file():
+            return []
+        resolved.append(asset)
+    return resolved
+
+
+def _publish_if_expired(session, asset: Asset, settings: Settings) -> str:
+    """Republish an expired or missing temporary URL; otherwise reuse the stored one."""
+    expires_at = None
+    if asset.public_url_expires_at:
+        try:
+            expires_at = datetime.fromisoformat(asset.public_url_expires_at)
+        except ValueError:
+            expires_at = None
+    if asset.public_url and (expires_at is None or expires_at > datetime.now(UTC)):
+        return asset.public_url
+    published = TempfilePublisher().publish(Path(asset.original_path), asset.content_type or "application/octet-stream")
+    asset.public_url, asset.public_url_expires_at = published.url, published.expires_at.isoformat()
+    session.commit()
+    return asset.public_url
 
 
 def _generation_gateway(settings: Settings, provider: str):
@@ -45,13 +98,32 @@ def _mark_retryable(record: Job | Generation, exc: Exception) -> None:
         record.next_attempt_at = retry_at(datetime.now(UTC), record.attempts)
 
 
-def _claim(session, model, kinds: list[str] | None, worker_id: str, now: datetime):
-    predicates = [model.status.in_(["queued", "uploaded", "processing", "retryable"]), or_(model.next_attempt_at.is_(None), model.next_attempt_at <= now), or_(model.leased_at.is_(None), model.leased_at <= now - timedelta(minutes=10))]
+def _claim(
+    session,
+    model,
+    kinds: list[str] | None,
+    worker_id: str,
+    now: datetime,
+    *,
+    statuses: tuple[str, ...],
+):
+    predicates = [
+        model.status.in_(statuses),
+        or_(model.next_attempt_at.is_(None), model.next_attempt_at <= now),
+        or_(model.leased_at.is_(None), model.leased_at <= now - timedelta(minutes=10)),
+    ]
     if kinds:
         predicates.append(model.kind.in_(kinds))
-    records = session.scalars(select(model).where(*predicates).order_by(model.id).with_for_update(skip_locked=True).limit(5)).all()
+    records = session.scalars(
+        select(model)
+        .where(*predicates)
+        .order_by(model.id)
+        .with_for_update(skip_locked=True)
+        .limit(5)
+    ).all()
     for record in records:
-        record.leased_at, record.leased_by = now, worker_id
+        record.leased_at = now
+        record.leased_by = worker_id
         if record.created_at is None:
             record.created_at = now
     session.commit()
@@ -71,7 +143,7 @@ def run_once() -> int:
     now = datetime.now(UTC)
     worker_id = f"{socket.gethostname()}:{__import__('os').getpid()}"
     with SessionLocal() as session:
-        vision_jobs = _claim(session, Job, ["vision_analysis", "vision_shot_analysis", "reference_profile_analysis", "final_prompt_generation", "prompt_refinement"], worker_id, now)
+        vision_jobs = _claim(session, Job, ["vision_analysis", "vision_shot_analysis", "reference_profile_analysis", "final_prompt_generation", "prompt_refinement"], worker_id, now, statuses=("queued", "uploaded", "processing", "retryable"))
         for job in vision_jobs:
             try:
                 if job.kind == "reference_profile_analysis":
@@ -87,39 +159,41 @@ def run_once() -> int:
             except Exception as exc:
                 _mark_retryable(job, exc)
                 if job.kind in {"final_prompt_generation", "prompt_refinement"} and job.provider_input_id:
-                    from uuid import UUID
-                    from app.db.models import PromptRevision
                     revision = session.get(PromptRevision, UUID(job.provider_input_id))
                     if revision:
                         revision.status, revision.error_message = job.status, job.error_message
             _release(job, now)
             session.commit()
             processed += 1
-        generations = _claim(session, Generation, None, worker_id, now)
+        generations = _claim(session, Generation, None, worker_id, now, statuses=("queued", "processing", "retryable"))
         for generation in generations:
             try:
                 gateway, model = _generation_gateway(settings, generation.provider)
-                from app.db.models import Asset, PromptRevision
-                asset = session.scalar(select(Asset).where(Asset.project_id == generation.project_id, Asset.kind == "reference_video").order_by(Asset.id.desc()))
                 prompt = session.scalar(select(PromptRevision).where(PromptRevision.project_id == generation.project_id, PromptRevision.version == generation.prompt_version))
-                if asset is None or prompt is None or not asset.public_url:
+                if prompt is None or not (prompt.text or "").strip():
+                    generation.status, generation.error_message = "failed", "Prompt revision is no longer available"
+                    session.commit()
+                    continue
+                asset_ids = json.loads(generation.reference_asset_ids or "[]")
+                assets = _resolve_asset_inputs(session, generation.project_id, asset_ids)
+                if not assets:
                     generation.status, generation.error_message = "failed", "Generation input is no longer available"
                     session.commit()
-                else:
-                    execute_generation_job(
-                        session,
-                        generation,
-                        gateway,
-                        build_seedance_request(
-                            model,
-                            prompt.text,
-                            asset.public_url,
-                            generation.ratio,
-                            generation.duration,
-                            generation.generate_audio,
-                            json.loads(generation.reference_image_urls or "[]"),
-                        ),
-                    )
+                    continue
+                video_url = _publish_if_expired(session, assets[0], settings)
+                image_urls = [_publish_if_expired(session, asset, settings) for asset in assets[1:]]
+                payload = build_seedance_request(
+                    model,
+                    prompt.text,
+                    video_url,
+                    generation.ratio,
+                    generation.duration,
+                    generation.generate_audio,
+                    image_urls,
+                )
+                generation.request_snapshot = json.dumps(redact_request_urls(payload), ensure_ascii=False, sort_keys=True)
+                session.commit()
+                execute_generation_job(session, generation, gateway, payload)
             except Exception as exc:
                 _mark_retryable(generation, exc)
             _release(generation, now)
