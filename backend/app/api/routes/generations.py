@@ -3,6 +3,7 @@ import hashlib
 import json
 from pathlib import Path
 from datetime import datetime, timezone
+from typing import Literal
 
 from fastapi import APIRouter, Depends, HTTPException, status
 from fastapi.responses import FileResponse
@@ -216,6 +217,64 @@ def get_generation(project_id: UUID, generation_id: UUID, session: Session = Dep
     generation = session.get(Generation, generation_id)
     if generation is None or generation.project_id != project_id:
         raise HTTPException(status_code=404, detail="Generation does not exist")
+    return generation_response(project_id, generation)
+
+
+class ResolveGenerationRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    action: Literal["attach_task", "confirm_not_created"]
+    external_task_id: str | None = Field(default=None, max_length=255)
+
+
+@router.post("/{generation_id}/retry", response_model=GenerationResponse, status_code=status.HTTP_202_ACCEPTED)
+def retry_generation(project_id: UUID, generation_id: UUID, session: Session = Depends(get_session)) -> GenerationResponse:
+    project = session.scalar(select(Project).where(Project.id == project_id).with_for_update())
+    if project is None:
+        raise HTTPException(status_code=404, detail="Project does not exist")
+    generation = session.get(Generation, generation_id)
+    if generation is None or generation.project_id != project_id:
+        raise HTTPException(status_code=404, detail="Generation does not exist")
+    if generation.status not in {"failed"}:
+        raise HTTPException(status_code=422, detail="只有失败的生成任务可以重试")
+    version = (session.scalar(select(func.max(Generation.version)).where(Generation.project_id == project_id)) or 0) + 1
+    retried = Generation(
+        project_id=project_id,
+        version=version,
+        prompt_version=generation.prompt_version,
+        provider=generation.provider,
+        ratio="adaptive",
+        duration=-1,
+        generate_audio=generation.generate_audio,
+        status="queued",
+        reference_asset_ids=generation.reference_asset_ids,
+        request_snapshot=generation.request_snapshot,
+        submission_fingerprint=generation.submission_fingerprint,
+    )
+    session.add(retried)
+    session.commit()
+    return generation_response(project_id, retried)
+
+
+@router.post("/{generation_id}/resolve", response_model=GenerationResponse)
+def resolve_generation(project_id: UUID, generation_id: UUID, payload: ResolveGenerationRequest, session: Session = Depends(get_session)) -> GenerationResponse:
+    generation = session.get(Generation, generation_id)
+    if generation is None or generation.project_id != project_id:
+        raise HTTPException(status_code=404, detail="Generation does not exist")
+    if generation.status != "submission_uncertain":
+        raise HTTPException(status_code=422, detail="只有不确定的提交任务可以人工解析")
+    if payload.action == "attach_task":
+        task_id = (payload.external_task_id or "").strip()
+        if not task_id:
+            raise HTTPException(status_code=422, detail="必须提供非空的供应商任务 ID")
+        generation.external_task_id = task_id
+        generation.status = "processing"
+    else:
+        generation.status = "failed"
+        generation.error_message = "用户确认供应商未创建任务"
+    generation.leased_at = None
+    generation.leased_by = None
+    generation.next_attempt_at = None
+    session.commit()
     return generation_response(project_id, generation)
 
 

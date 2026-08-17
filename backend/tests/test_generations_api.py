@@ -218,3 +218,61 @@ def test_create_replace_mode_includes_confirmed_product_images(client, tmp_path)
         asset_ids = json.loads(generation.reference_asset_ids)
         assert len(asset_ids) == 2  # video + confirmed product
         assert asset_ids[0] == str(ready_project.video_asset_id)
+
+
+def test_retry_creates_new_version_without_mutating_failed_row(client, failed_generation) -> None:
+    response = client.post(f"/api/projects/{failed_generation.project_id}/generations/{failed_generation.id}/retry")
+    assert response.status_code == 202
+    assert response.json()["version"] == failed_generation.version + 1
+    assert response.json()["status"] == "queued"
+    with SessionLocal() as session:
+        original = session.get(Generation, failed_generation.id)
+        assert original.status == "failed"
+
+
+def test_retry_rejects_active_and_completed_states(client, generation_factory, queued_generation, processing_generation, uncertain_generation) -> None:
+    for generation in (queued_generation, processing_generation, uncertain_generation):
+        response = client.post(f"/api/projects/{generation.project_id}/generations/{generation.id}/retry")
+        assert response.status_code == 422
+    completed = generation_factory(status="completed")
+    response = client.post(f"/api/projects/{completed.project_id}/generations/{completed.id}/retry")
+    assert response.status_code == 422
+
+
+def test_uncertain_task_requires_explicit_resolution(client, uncertain_generation) -> None:
+    attach = client.post(f"/api/projects/{uncertain_generation.project_id}/generations/{uncertain_generation.id}/resolve", json={
+        "action": "attach_task", "external_task_id": "provider-123"
+    })
+    assert attach.status_code == 200
+    assert attach.json()["status"] == "processing"
+    with SessionLocal() as session:
+        resolved = session.get(Generation, uncertain_generation.id)
+        assert resolved.external_task_id == "provider-123"
+        assert resolved.next_attempt_at is None
+        assert resolved.leased_at is None
+
+
+def test_uncertain_confirm_not_created_sets_failed(client, uncertain_generation) -> None:
+    response = client.post(f"/api/projects/{uncertain_generation.project_id}/generations/{uncertain_generation.id}/resolve", json={
+        "action": "confirm_not_created"
+    })
+    assert response.status_code == 200
+    assert response.json()["status"] == "failed"
+    with SessionLocal() as session:
+        resolved = session.get(Generation, uncertain_generation.id)
+        assert resolved.error_message == "用户确认供应商未创建任务"
+
+
+def test_resolve_rejects_non_uncertain_states(client, failed_generation, queued_generation) -> None:
+    for generation in (failed_generation, queued_generation):
+        response = client.post(f"/api/projects/{generation.project_id}/generations/{generation.id}/resolve", json={
+            "action": "confirm_not_created"
+        })
+        assert response.status_code == 422
+
+
+def test_attach_task_requires_nonblank_id(client, uncertain_generation) -> None:
+    response = client.post(f"/api/projects/{uncertain_generation.project_id}/generations/{uncertain_generation.id}/resolve", json={
+        "action": "attach_task", "external_task_id": "  "
+    })
+    assert response.status_code == 422
