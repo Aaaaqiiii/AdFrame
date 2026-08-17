@@ -4,7 +4,7 @@ from sqlalchemy import select
 from unittest.mock import patch
 from uuid import UUID, uuid4
 
-from app.db.models import Asset, Job, PromptRevision
+from app.db.models import Asset, Job, PromptRevision, Shot, ShotEdit, TimelineRevision
 from app.db.session import SessionLocal
 from app.main import create_app
 from app.services.media import VideoMetadata
@@ -17,6 +17,25 @@ def _accepted_video_upload(client: TestClient, project_id: str, name: str = "ref
             f"/api/projects/{project_id}/reference-video",
             files={"file": (name, content, "video/mp4")},
         )
+
+
+def _ready_generation_project(client: TestClient, name: str = "ready") -> dict:
+    project = client.post("/api/projects", json={"name": name}).json()
+    _accepted_video_upload(client, project["id"])
+    timeline = client.put(
+        f"/api/projects/{project['id']}/timeline",
+        json={"shots": [{"start_sec": 0, "end_sec": 8}]},
+    ).json()
+    shot_id = timeline["shots"][0]["id"]
+    client.put(
+        f"/api/projects/{project['id']}/shots/{shot_id}/edit",
+        json={"action": "展示产品", "confirmed": True},
+    )
+    prompt = client.post(
+        f"/api/projects/{project['id']}/prompts",
+        json={"product_profile": "bottle", "visual_direction": "keep lighting", "use_ai": False},
+    ).json()
+    return {"id": project["id"], "prompt_version": prompt["version"]}
 
 
 def test_create_reference_adaptation_project() -> None:
@@ -506,24 +525,17 @@ def test_publish_reference_video_saves_temporary_link() -> None:
     assert response.json()["url"].endswith("/download")
 
 
-def test_expired_reference_video_link_is_republished_before_generation() -> None:
+def test_generation_creation_does_not_publish_material_in_http() -> None:
     client = TestClient(create_app())
-    project = client.post("/api/projects", json={"name": "expired material"}).json()
-    _accepted_video_upload(client, project["id"])
-    client.post(f"/api/projects/{project['id']}/prompts", json={"product_profile": "bottle", "visual_direction": "keep lighting"})
-
-    with patch("app.api.routes.generations._provider_gateway"), patch("app.api.routes.generations.TempfilePublisher.publish") as publish:
-        publish.return_value = type("Published", (), {"url": "https://tempfile.org/new/download", "expires_at": __import__("datetime").datetime(2026, 8, 13, tzinfo=__import__("datetime").UTC)})()
-        from app.db.models import Asset
-        from app.db.session import SessionLocal
-        with SessionLocal() as session:
-            asset = session.query(Asset).filter_by(project_id=UUID(project["id"]), kind="reference_video").first()
-            asset.public_url, asset.public_url_expires_at = "https://tempfile.org/old/download", "2020-01-01T00:00:00+00:00"
-            session.commit()
-        response = client.post(f"/api/projects/{project['id']}/generations", json={"provider": "volcengine", "prompt_version": 1})
-
+    project = _ready_generation_project(client, "no publish")
+    from app.services.tempfile_publisher import TempfilePublisher
+    with patch.object(TempfilePublisher, "publish") as publish:
+        response = client.post(
+            f"/api/projects/{project['id']}/generations",
+            json={"provider": "volcengine", "prompt_version": project["prompt_version"]},
+        )
     assert response.status_code == 202
-    assert publish.called
+    assert not publish.called
 
 
 def test_generation_rejects_missing_published_material_or_provider_config() -> None:
@@ -537,21 +549,12 @@ def test_generation_rejects_missing_published_material_or_provider_config() -> N
 
 def test_generation_api_queues_work_without_calling_provider() -> None:
     client = TestClient(create_app())
-    project = client.post("/api/projects", json={"name": "queued generation"}).json()
-    _accepted_video_upload(client, project["id"])
-    client.post(f"/api/projects/{project['id']}/prompts", json={"product_profile": "bottle", "visual_direction": "keep lighting"})
+    project = _ready_generation_project(client, "queued generation")
 
-    with patch("app.api.routes.generations._provider_gateway"):
-        from app.db.session import SessionLocal
-        from app.db.models import Asset
-        with SessionLocal() as session:
-            asset = session.query(Asset).filter_by(project_id=UUID(project["id"]), kind="reference_video").first()
-            asset.public_url = "https://tempfile.org/test/download"
-            session.commit()
-        response = client.post(
-            f"/api/projects/{project['id']}/generations",
-            json={"provider": "volcengine", "prompt_version": 1, "ratio": "16:9", "duration": 8, "generate_audio": True},
-        )
+    response = client.post(
+        f"/api/projects/{project['id']}/generations",
+        json={"provider": "volcengine", "prompt_version": project["prompt_version"], "generate_audio": True},
+    )
 
     assert response.status_code == 202
     assert response.json()["status"] == "queued"
@@ -573,40 +576,45 @@ def test_generation_blocks_reference_video_longer_than_30_seconds() -> None:
             files={"file": ("long.mp4", b"video-bytes", "video/mp4")},
         )
     assert uploaded.status_code == 202
-    prompt = client.post(
-        f"/api/projects/{project['id']}/prompts",
-        json={"product_profile": "原产品瓶身和 Logo", "visual_direction": "只修改背景"},
-    )
-    assert prompt.status_code == 201
+    with SessionLocal() as session:
+        video = session.scalar(select(Asset).where(Asset.project_id == UUID(project["id"]), Asset.kind == "reference_video"))
+        video.duration_sec = 31
+        revision = TimelineRevision(project_id=UUID(project["id"]), version=1, source="human")
+        session.add(revision)
+        session.flush()
+        shot = Shot(timeline_revision_id=revision.id, position=0, start_sec=0, end_sec=8, analysis_status="succeeded")
+        session.add(shot)
+        session.flush()
+        session.add(ShotEdit(project_id=UUID(project["id"]), shot_id=shot.id, action="展示", confirmed=True))
+        prompt = PromptRevision(project_id=UUID(project["id"]), version=1, text="保持镜头", status="completed", source_timeline_revision_id=revision.id)
+        session.add(prompt)
+        session.commit()
+        prompt_version = prompt.version
 
-    with patch("app.api.routes.generations._provider_gateway"):
-        response = client.post(
-            f"/api/projects/{project['id']}/generations",
-            json={"provider": "volcengine", "prompt_version": prompt.json()["version"]},
-        )
+    response = client.post(
+        f"/api/projects/{project['id']}/generations",
+        json={"provider": "volcengine", "prompt_version": prompt_version},
+    )
 
     assert response.status_code == 422
     assert "30" in response.json()["detail"]
 
 
-def test_generation_saves_reference_image_urls_only_when_requested() -> None:
+def test_generation_queues_person_asset_only_when_requested() -> None:
     client = TestClient(create_app())
-    project = client.post("/api/projects", json={"name": "image option"}).json()
-    _accepted_video_upload(client, project["id"])
-    client.post(f"/api/projects/{project['id']}/prompts", json={"product_profile": "bottle", "visual_direction": "keep lighting"})
+    project = _ready_generation_project(client, "image option")
+    from app.db.models import Asset
+    with SessionLocal() as session:
+        session.add(Asset(project_id=UUID(project["id"]), kind="person_reference_image", original_path="C:/person.jpg", original_filename="person.jpg", content_type="image/jpeg", profile_text="已确认人物", profile_user_edited=True, analysis_status="succeeded"))
+        session.commit()
 
-    with patch("app.api.routes.generations._provider_gateway"), patch("app.api.routes.generations.TempfilePublisher.publish") as publish:
-        publish.return_value = type("Published", (), {"url": "https://tempfile.org/image/download", "expires_at": __import__("datetime").datetime(2026, 8, 13, tzinfo=__import__("datetime").UTC)})()
-        from app.db.models import Asset
-        from app.db.session import SessionLocal
-        with SessionLocal() as session:
-            video = session.query(Asset).filter_by(project_id=UUID(project["id"]), kind="reference_video").first()
-            video.public_url = "https://tempfile.org/video/download"
-            session.add(Asset(project_id=UUID(project["id"]), kind="person_reference_image", original_path="C:/person.jpg", original_filename="person.jpg", content_type="image/jpeg"))
-            session.commit()
-        response = client.post(f"/api/projects/{project['id']}/generations", json={"provider": "volcengine", "prompt_version": 1, "include_person_reference": False})
-
+    response = client.post(
+        f"/api/projects/{project['id']}/generations",
+        json={"provider": "volcengine", "prompt_version": project["prompt_version"], "include_person_reference": False},
+    )
+    assert response.status_code == 202
     from app.db.models import Generation
+    import json as _json
     with SessionLocal() as session:
         generation = session.get(Generation, UUID(response.json()["id"]))
-        assert generation.reference_image_urls == "[]"
+        assert _json.loads(generation.reference_asset_ids) == [str(session.scalar(select(Asset).where(Asset.project_id == UUID(project["id"]), Asset.kind == "reference_video")).id)]

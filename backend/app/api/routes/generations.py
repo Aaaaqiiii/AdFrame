@@ -1,28 +1,29 @@
 from uuid import UUID
+import hashlib
 import json
 from pathlib import Path
 from datetime import datetime, timezone
 
 from fastapi import APIRouter, Depends, HTTPException, status
 from fastapi.responses import FileResponse
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field
 from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
 from app.core.config import Settings
-from app.db.models import Asset, Generation, Project, PromptRevision
+from app.db.models import Asset, Generation, Project, PromptRevision, Shot, ShotEdit, TimelineRevision
 from app.db.session import get_session
+from app.services.product_compatibility import check_product_compatibility
+from app.services.reference_profiles import load_structure
 from app.services.seedance import JsonTaskGateway, build_seedance_request
-from app.services.tempfile_publisher import TempfilePublisher
 
 router = APIRouter(prefix="/api/projects/{project_id}/generations", tags=["generations"])
 
 
 class CreateGenerationRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
     provider: str = Field(pattern="^(volcengine|comfly)$")
     prompt_version: int = Field(gt=0)
-    ratio: str = Field(default="adaptive")
-    duration: int = Field(default=-1, ge=-1, le=30)
     generate_audio: bool = False
     include_person_reference: bool = False
     include_background_reference: bool = False
@@ -73,55 +74,116 @@ def _provider_gateway(settings: Settings, provider: str) -> tuple[JsonTaskGatewa
     return JsonTaskGateway(settings.comfly_base_url, settings.comfly_api_key, settings.comfly_seedance_task_path), settings.comfly_seedance_model
 
 
-def _publish_if_expired(asset: Asset) -> str:
-    expires_at = datetime.fromisoformat(asset.public_url_expires_at) if asset.public_url_expires_at else None
-    # Older local projects predate expiry metadata. Keep their existing URL usable;
-    # only a known expired link is republished.
-    if asset.public_url and (expires_at is None or expires_at > datetime.now(timezone.utc)):
-        return asset.public_url
-    published = TempfilePublisher().publish(__import__("pathlib").Path(asset.original_path), asset.content_type or "application/octet-stream")
-    asset.public_url, asset.public_url_expires_at = published.url, published.expires_at.isoformat()
-    return asset.public_url
+def _require_provider_key(provider: str) -> None:
+    settings = Settings()
+    try:
+        _provider_gateway(settings, provider)
+    except ValueError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+
+
+def _current_timeline_revision(session: Session, project_id: UUID) -> TimelineRevision | None:
+    return session.scalar(select(TimelineRevision).where(TimelineRevision.project_id == project_id).order_by(TimelineRevision.version.desc()))
+
+
+def _current_shots(session: Session, revision: TimelineRevision) -> list[Shot]:
+    return list(session.scalars(select(Shot).where(Shot.timeline_revision_id == revision.id).order_by(Shot.position)))
+
+
+def _confirmed_product_assets(session: Session, project_id: UUID) -> list[Asset]:
+    assets = list(session.scalars(select(Asset).where(Asset.project_id == project_id, Asset.kind == "product_reference_image").order_by(Asset.id)))
+    confirmed = []
+    for asset in assets:
+        if not asset.profile_text or not asset.profile_text.strip():
+            continue
+        if asset.analysis_status not in {"succeeded", "completed"}:
+            continue
+        if not load_structure(asset).get("summary_confirmed"):
+            continue
+        confirmed.append(asset)
+    return confirmed
+
+
+def _person_profile_confirmed(asset: Asset | None) -> bool:
+    return bool(asset and asset.profile_user_edited)
+
+
+def _asset_ids(assets: list[Asset]) -> str:
+    return json.dumps([str(asset.id) for asset in assets], ensure_ascii=False)
 
 
 @router.post("", response_model=GenerationResponse, status_code=status.HTTP_202_ACCEPTED)
-def create_generation(project_id: UUID, payload: CreateGenerationRequest, session: Session = Depends(get_session)) -> Generation:
-    project = session.get(Project, project_id)
+def create_generation(project_id: UUID, payload: CreateGenerationRequest, session: Session = Depends(get_session)) -> GenerationResponse:
+    project = session.scalar(select(Project).where(Project.id == project_id).with_for_update())
     if project is None:
         raise HTTPException(status_code=404, detail="Project does not exist")
-    if project.mode == "replace_product":
-        product = session.scalar(select(Asset).where(Asset.project_id == project_id, Asset.kind == "product_reference_image").order_by(Asset.id.desc()))
-        if product is None or not product.profile_text or product.analysis_status not in {"succeeded", "completed"}:
-            raise HTTPException(status_code=422, detail="页面二生成前必须上传目标产品图，并确认完整的目标产品文字档案。")
     prompt = session.scalar(select(PromptRevision).where(PromptRevision.project_id == project_id, PromptRevision.version == payload.prompt_version))
-    asset = session.scalar(select(Asset).where(Asset.project_id == project_id, Asset.kind == "reference_video").order_by(Asset.id.desc()))
-    if prompt is None or asset is None:
-        raise HTTPException(status_code=422, detail="Save a prompt and upload the reference video before generation")
-    if asset.duration_sec is not None and asset.duration_sec > 30:
+    if prompt is None or prompt.status != "completed" or not (prompt.text or "").strip():
+        raise HTTPException(status_code=422, detail="请先生成或保存一份完整提示词")
+    current_revision = _current_timeline_revision(session, project_id)
+    if current_revision is None or prompt.source_timeline_revision_id != current_revision.id:
+        raise HTTPException(status_code=422, detail="提示词来自旧时间轴，请重新生成提示词")
+    shots = _current_shots(session, current_revision)
+    if not shots:
+        raise HTTPException(status_code=422, detail="当前时间轴没有镜头")
+    unconfirmed = [shot for shot in shots if not session.scalar(select(ShotEdit).where(ShotEdit.project_id == project_id, ShotEdit.shot_id == shot.id, ShotEdit.confirmed.is_(True)))]
+    if unconfirmed:
+        raise HTTPException(status_code=422, detail="时间轴存在未确认镜头，请先确认全部镜头")
+
+    video = session.scalar(select(Asset).where(Asset.project_id == project_id, Asset.kind == "reference_video").order_by(Asset.id.desc()))
+    if video is None:
+        raise HTTPException(status_code=422, detail="请先上传参考视频")
+    if video.duration_sec is not None and video.duration_sec > 30:
         raise HTTPException(status_code=422, detail="参考视频超过 30 秒，Seedance 提交前请先裁剪或更换视频")
-    try:
-        _provider_gateway(Settings(), payload.provider)
-    except ValueError as exc:
-        raise HTTPException(status_code=409, detail=str(exc)) from exc
-    try:
-        _publish_if_expired(asset)
-    except Exception as exc:
-        raise HTTPException(status_code=502, detail="Reference video publishing failed") from exc
-    version = (session.scalar(select(func.max(Generation.version)).where(Generation.project_id == project_id)) or 0) + 1
-    image_urls: list[str] = []
-    selected_kinds = []
-    if payload.include_person_reference:
-        selected_kinds.append("person_reference_image")
+
+    _require_provider_key(payload.provider)
+
+    assets: list[Asset] = [video]
+    if project.mode == "replace_product":
+        product_assets = _confirmed_product_assets(session, project_id)
+        if not product_assets:
+            raise HTTPException(status_code=422, detail="页面二生成前必须上传目标产品图，并确认完整的目标产品文字档案。")
+        profile = product_assets[-1].profile_text.strip()
+        _, conflicts = check_product_compatibility(profile, shots)
+        if conflicts:
+            raise HTTPException(status_code=422, detail={
+                "message": "目标产品形态与部分原镜头动作不兼容，请先修正这些镜头",
+                "shot_ids": [conflict["shot_id"] for conflict in conflicts],
+                "conflicts": conflicts,
+            })
+        assets.extend(product_assets)
+    if prompt.replace_person:
+        person = session.scalar(select(Asset).where(Asset.project_id == project_id, Asset.kind == "person_reference_image").order_by(Asset.id.desc()))
+        if person is None or not _person_profile_confirmed(person):
+            raise HTTPException(status_code=422, detail="选择替换人物前，请先上传并确认人物图片档案")
+        if not payload.include_person_reference:
+            raise HTTPException(status_code=422, detail="提示词已开启人物替换，必须包含人物参考图")
+        assets.append(person)
+    elif payload.include_person_reference:
+        raise HTTPException(status_code=422, detail="提示词未开启人物替换，不能包含人物参考图")
     if payload.include_background_reference:
-        selected_kinds.append("background_reference_image")
-    for kind in selected_kinds:
-        image = session.scalar(select(Asset).where(Asset.project_id == project_id, Asset.kind == kind).order_by(Asset.id.desc()))
-        if image is None:
-            continue
-        try:
-            image_urls.append(_publish_if_expired(image))
-        except Exception as exc:
-            raise HTTPException(status_code=502, detail="Reference image publishing failed") from exc
+        background = session.scalar(select(Asset).where(Asset.project_id == project_id, Asset.kind == "background_reference_image").order_by(Asset.id.desc()))
+        if background is None:
+            raise HTTPException(status_code=422, detail="请求包含背景参考图，但项目没有背景参考图素材")
+        assets.append(background)
+
+    fingerprint_payload = {
+        "project_id": str(project.id),
+        "timeline_revision_id": str(current_revision.id),
+        "prompt_revision_id": str(prompt.id),
+        "provider": payload.provider,
+        "generate_audio": payload.generate_audio,
+        "asset_ids": [str(item.id) for item in assets],
+    }
+    fingerprint = hashlib.sha256(
+        json.dumps(fingerprint_payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    ).hexdigest()
+    active_statuses = ("queued", "processing", "retryable", "submission_uncertain")
+    duplicate = session.scalar(select(Generation).where(Generation.project_id == project_id, Generation.submission_fingerprint == fingerprint, Generation.status.in_(active_statuses)))
+    if duplicate is not None:
+        raise HTTPException(status_code=409, detail="相同输入和设置的生成任务已存在")
+
+    version = (session.scalar(select(func.max(Generation.version)).where(Generation.project_id == project_id)) or 0) + 1
     generation = Generation(
         project_id=project_id,
         version=version,
@@ -130,8 +192,9 @@ def create_generation(project_id: UUID, payload: CreateGenerationRequest, sessio
         ratio="adaptive",
         duration=-1,
         generate_audio=payload.generate_audio,
-        reference_image_urls=json.dumps(image_urls),
         status="queued",
+        reference_asset_ids=_asset_ids(assets),
+        submission_fingerprint=fingerprint,
     )
     session.add(generation)
     session.commit()

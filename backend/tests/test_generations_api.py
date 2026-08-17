@@ -3,6 +3,7 @@ from types import SimpleNamespace
 from uuid import UUID
 
 import pytest
+from sqlalchemy import select
 
 from app.db.models import Asset, Generation, PromptRevision, Shot, ShotEdit, TimelineRevision
 from app.db.session import SessionLocal
@@ -107,3 +108,113 @@ def test_generation_detail_builds_local_url_instead_of_returning_raw_orm(client,
     generation = generation_factory(status="completed", result_path=str(local_file))
     body = client.get(f"/api/projects/{generation.project_id}/generations/{generation.id}").json()
     assert body["local_video_url"].endswith(f"/{generation.id}/content")
+
+
+def test_create_rejects_client_ratio_and_duration(client, tmp_path) -> None:
+    ready_project = _ready_project(client, tmp_path)
+    response = client.post(ready_project.generations_url, json={
+        "provider": "volcengine", "prompt_version": 1,
+        "ratio": "16:9", "duration": 8,
+        "generate_audio": True,
+        "include_person_reference": False,
+        "include_background_reference": False,
+    })
+    assert response.status_code == 422
+
+
+def test_create_only_queues_and_stores_asset_ids(client, tmp_path, monkeypatch) -> None:
+    ready_project = _ready_project(client, tmp_path)
+    monkeypatch.setattr(TempfilePublisher, "publish", lambda *_: (_ for _ in ()).throw(AssertionError("published in HTTP")))
+    response = client.post(ready_project.generations_url, json=ready_project.payload)
+    assert response.status_code == 202
+    with SessionLocal() as session:
+        generation = session.get(Generation, UUID(response.json()["id"]))
+        assert generation.status == "queued"
+        assert json.loads(generation.reference_asset_ids)[0] == str(ready_project.video_asset_id)
+        assert generation.reference_image_urls is None
+        assert generation.ratio == "adaptive"
+        assert generation.duration == -1
+
+
+def test_create_rejects_old_timeline_prompt(client, tmp_path) -> None:
+    ready_project = _ready_project(client, tmp_path)
+    with SessionLocal() as session:
+        revision = session.scalar(
+            select(TimelineRevision).where(TimelineRevision.project_id == ready_project.project_id).order_by(TimelineRevision.version.desc())
+        )
+        prompt = session.scalar(
+            select(PromptRevision).where(PromptRevision.project_id == ready_project.project_id, PromptRevision.status == "completed").order_by(PromptRevision.version.desc())
+        )
+        # Create a second (newer) timeline revision the prompt does not reference.
+        newer = TimelineRevision(project_id=ready_project.project_id, version=revision.version + 1, source="human")
+        session.add(newer)
+        session.commit()
+        prompt.source_timeline_revision_id = revision.id
+        session.commit()
+    response = client.post(ready_project.generations_url, json={**ready_project.payload, "prompt_version": prompt.version})
+    assert response.status_code == 422
+
+
+def test_create_rejects_non_completed_prompt(client, tmp_path) -> None:
+    ready_project = _ready_project(client, tmp_path)
+    with SessionLocal() as session:
+        prompt = session.scalar(
+            select(PromptRevision).where(PromptRevision.project_id == ready_project.project_id)
+        )
+        prompt.status = "queued"
+        prompt.text = ""
+        session.commit()
+    response = client.post(ready_project.generations_url, json=ready_project.payload)
+    assert response.status_code == 422
+
+
+def test_create_rejects_unconfirmed_shot(client, tmp_path) -> None:
+    ready_project = _ready_project(client, tmp_path)
+    with SessionLocal() as session:
+        edit = session.scalar(
+            select(ShotEdit).where(ShotEdit.project_id == ready_project.project_id)
+        )
+        edit.confirmed = False
+        session.commit()
+    response = client.post(ready_project.generations_url, json=ready_project.payload)
+    assert response.status_code == 422
+
+
+def test_create_rejects_missing_provider_key(client, tmp_path, monkeypatch) -> None:
+    from types import SimpleNamespace as _NS
+    fake_settings = _NS(volcengine_api_key="", volcengine_seedance_base_url="https://x", volcengine_seedance_task_path="/t", comfly_api_key="", comfly_base_url="https://y", comfly_seedance_task_path="/t")
+    monkeypatch.setattr("app.api.routes.generations.Settings", lambda: fake_settings)
+    ready_project = _ready_project(client, tmp_path)
+    response = client.post(ready_project.generations_url, json=ready_project.payload)
+    assert response.status_code == 409
+
+
+def test_create_rejects_reference_video_longer_than_30_seconds(client, tmp_path) -> None:
+    ready_project = _ready_project(client, tmp_path)
+    with SessionLocal() as session:
+        video = session.scalar(
+            select(Asset).where(Asset.project_id == ready_project.project_id, Asset.kind == "reference_video")
+        )
+        video.duration_sec = 31
+        session.commit()
+    response = client.post(ready_project.generations_url, json=ready_project.payload)
+    assert response.status_code == 422
+
+
+def test_create_duplicate_fingerprint_returns_conflict(client, tmp_path) -> None:
+    ready_project = _ready_project(client, tmp_path)
+    first = client.post(ready_project.generations_url, json=ready_project.payload)
+    assert first.status_code == 202
+    duplicate = client.post(ready_project.generations_url, json=ready_project.payload)
+    assert duplicate.status_code == 409
+
+
+def test_create_replace_mode_includes_confirmed_product_images(client, tmp_path) -> None:
+    ready_project = _ready_project(client, tmp_path, mode="replace_product")
+    response = client.post(ready_project.generations_url, json=ready_project.payload)
+    assert response.status_code == 202
+    with SessionLocal() as session:
+        generation = session.get(Generation, UUID(response.json()["id"]))
+        asset_ids = json.loads(generation.reference_asset_ids)
+        assert len(asset_ids) == 2  # video + confirmed product
+        assert asset_ids[0] == str(ready_project.video_asset_id)
