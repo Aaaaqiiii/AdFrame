@@ -1,6 +1,6 @@
 # AdFlow 本地启动
 
-AdFlow 是独立广告视频生成系统：上传参考视频 → AI 切分与校正 → 理解分镜 → 确认分镜事实 → 生成提示词 → 生成与结果，共六步。
+AdFlow 是独立广告视频生成系统，当前**前五步提示词闭环**可实际投入本地使用：上传参考视频 → AI 切分与校正 → 理解分镜 → 确认分镜事实 → 生成提示词。第六步（Seedance 视频生成、结果播放下载）**暂缓**，前端尚未接入生成页面。
 
 首次使用先完成 PostgreSQL 初始化与本地环境配置：
 
@@ -26,16 +26,19 @@ For a company LAN test, first allow the selected ports in Windows Firewall, then
 & "E:\工具-商用\scripts\start-adflow-local.ps1" -BindHost 0.0.0.0 -ApiPublicHost 192.168.1.20
 ```
 
-## 六步工作流
+## 当前可用：前五步提示词闭环
 
 1. **上传素材**：上传参考视频（4—30 秒）与目标产品/人物参考图。
 2. **切分与校正**：AI 自动切分镜头，人工校正时间轴。
 3. **理解分镜**：双模型（火山方舟 + Comfly GPT）逐镜分析画面事实。
 4. **确认分镜事实**：人工确认每个镜头的事实与动作。
-5. **生成提示词**：基于确认后的事实生成最终提示词，可保存多个版本。
-6. **生成与结果**：提交 Seedance 生成，完成后本地播放、下载，支持版本重试与结果历史。
+5. **生成提示词**：基于确认后的事实生成最终提示词，可保存多个版本、选择历史版本精修。
 
-结果保存在 `data/media/{project_id}/generated/v{version}.mp4`。
+提示词闭环全部在本地完成，不会调用 `/generations` 或 Seedance。
+
+## 暂缓：第六步 Seedance 视频生成
+
+后端已实现生成 API（`/api/projects/{id}/generations`）、Worker 提交/轮询/下载落盘与六状态恢复，但**前端尚未接入生成页面**（`App.tsx` 未挂载 GenerationStage，组件目录无生成与结果组件）。这部分属于后续能力，不代表当前页面已可用。
 
 ## 数据库与迁移
 
@@ -57,10 +60,12 @@ Pop-Location
 
 ## 配置
 
-后台 Worker 会处理 Vision 与生成任务。真实火山能力需要在 `backend/.env` 配置 AK/SK、VOD 空间和 `VOLCENGINE_API_KEY`；Comfly 需要单独配置 API Key 与 Base URL。
+后台 Worker 会处理 Vision 与提示词任务。真实能力需要在 `backend/.env` 配置：
 
-参考视频发布到 tempfile.org 是 Worker 执行生成时自动触发的临时公网化步骤，链接约 24 小时有效；HTTP 创建生成请求本身不会外发素材。
+- **Comfly API Key**（`COMFLY_API_KEY`）：驱动 GPT 关键帧理解、综合事实和最终提示词，走 `https://ai.comfly.org/v1/chat/completions`。设置页"保存并测试"即检查该端点。
+- **火山方舟 Key**（`VOLCENGINE_API_KEY`）：用于豆包完整镜头理解。
+- 第六步 Seedance 生成所需 AK/SK、VOD 空间与 `VOLCENGINE_API_KEY` 属于暂缓能力，暂不配置也能走完前五步。
 
 ## 设计参考
 
-完整设计见 `docs/superpowers/specs/2026-08-15-adflow-local-generation-closed-loop-design.md`。
+完整设计见 `docs/superpowers/specs/2026-08-15-adflow-local-generation-closed-loop-design.md`。当前实际页面能力以本文"当前可用"章节为准。
