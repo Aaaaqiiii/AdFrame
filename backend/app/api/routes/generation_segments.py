@@ -55,14 +55,21 @@ def _current_timeline_revision(session: Session, project_id: UUID) -> TimelineRe
     )
 
 
-def _current_plan_version(session: Session, project_id: UUID, revision: TimelineRevision) -> int:
-    """当前方案必须是基于当前时间轴的方案，避免旧时间轴方案被当成当前方案。"""
+def _latest_current_plan_version(session: Session, project_id: UUID, revision_id: UUID) -> int:
+    """GET 当前方案：只统计基于当前时间轴的方案，旧时间轴方案不算数。"""
     return session.scalar(
         select(func.max(GenerationSegment.plan_version)).where(
             GenerationSegment.project_id == project_id,
-            GenerationSegment.source_timeline_revision_id == revision.id,
+            GenerationSegment.source_timeline_revision_id == revision_id,
         )
     ) or 0
+
+
+def _next_project_plan_version(session: Session, project_id: UUID) -> int:
+    """创建新方案：项目全局 max(plan_version) + 1，避免跨时间轴重复版本撞唯一约束。"""
+    return (session.scalar(
+        select(func.max(GenerationSegment.plan_version)).where(GenerationSegment.project_id == project_id)
+    ) or 0) + 1
 
 
 def _segment_output(segment: GenerationSegment) -> GenerationSegmentOutput:
@@ -111,7 +118,7 @@ def _validated_current_plan_context(session: Session, project_id: UUID) -> tuple
 def _persist_plan(session: Session, project_id: UUID, revision: TimelineRevision, drafts: list[SegmentDraft]) -> GenerationSegmentPlanResponse:
     """Lock the project row, bump plan_version, and persist one immutable plan."""
     session.execute(select(Project).where(Project.id == project_id).with_for_update())
-    plan_version = _current_plan_version(session, project_id, revision) + 1
+    plan_version = _next_project_plan_version(session, project_id)
     rows = [
         GenerationSegment(
             project_id=project_id, plan_version=plan_version, position=index,
@@ -141,7 +148,7 @@ def get_generation_segments(project_id: UUID, session: Session = Depends(get_ses
             recommended_min_seconds=settings.recommended_min_segment_seconds,
             segments=[],
         )
-    plan_version = _current_plan_version(session, project_id, revision)
+    plan_version = _latest_current_plan_version(session, project_id, revision.id)
     if plan_version == 0:
         return GenerationSegmentPlanResponse(
             plan_version=0, timeline_revision_id=revision.id,
@@ -172,12 +179,38 @@ def auto_plan_generation_segments(project_id: UUID, session: Session = Depends(g
     return _persist_plan(session, project_id, revision, drafts)
 
 
-def _validate_boundary_types(items: list[GenerationSegmentInput], duration_sec: float) -> None:
-    """相邻片段共享切点，前后类型必须一致；首尾必须是 video_edge。"""
+def _validate_boundary_types(items: list[GenerationSegmentInput], duration_sec: float, shots: list[Shot]) -> None:
+    """校验边界标签与真实分镜位置一致，并保持相邻共享切点类型一致。
+
+    - ``video_edge`` 只能用于 0 秒或视频结束；
+    - ``shot_boundary`` 切点必须落在某个分镜结束点的 0.001 秒容差内；
+    - ``inside_shot`` 切点不得位于任何分镜边界；
+    - 相邻片段共享切点，前后类型必须一致；首尾必须是 ``video_edge``。
+    """
+    shot_ends = {round(shot.end_sec, 3) for shot in shots}
+    epsilon = 0.001
+
+    def _is_shot_boundary(value: float) -> bool:
+        return any(abs(value - end) <= epsilon for end in shot_ends)
+
+    def _check(boundary_type: str, value: float) -> None:
+        if boundary_type == "video_edge":
+            if not (abs(value) <= epsilon or abs(value - duration_sec) <= epsilon):
+                raise HTTPException(status_code=422, detail="视频边缘只能用于 0 秒或视频结束")
+        elif boundary_type == "shot_boundary":
+            if not _is_shot_boundary(value):
+                raise HTTPException(status_code=422, detail="声明为镜头边界的切点必须落在分镜结束点")
+        elif boundary_type == "inside_shot":
+            if _is_shot_boundary(value):
+                raise HTTPException(status_code=422, detail="声明为镜头内部的切点不能落在分镜边界")
+
     if items[0].start_boundary_type != "video_edge":
         raise HTTPException(status_code=422, detail="第一段起点必须是视频边缘")
     if items[-1].end_boundary_type != "video_edge":
         raise HTTPException(status_code=422, detail="最后一段终点必须是视频边缘")
+    for item in items:
+        _check(item.start_boundary_type, item.source_start_sec)
+        _check(item.end_boundary_type, item.source_end_sec)
     for previous, current in zip(items, items[1:]):
         if previous.end_boundary_type != current.start_boundary_type:
             raise HTTPException(status_code=422, detail="相邻片段共享切点类型必须一致")
@@ -185,9 +218,9 @@ def _validate_boundary_types(items: list[GenerationSegmentInput], duration_sec: 
 
 @router.put("", response_model=GenerationSegmentPlanResponse, status_code=status.HTTP_201_CREATED)
 def save_manual_generation_segments(project_id: UUID, payload: GenerationSegmentPlanInput, session: Session = Depends(get_session)) -> GenerationSegmentPlanResponse:
-    revision, _, duration_sec = _validated_current_plan_context(session, project_id)
+    revision, shots, duration_sec = _validated_current_plan_context(session, project_id)
     settings = Settings()
-    _validate_boundary_types(payload.segments, duration_sec)
+    _validate_boundary_types(payload.segments, duration_sec, shots)
     drafts = [
         SegmentDraft(
             start_sec=item.source_start_sec, end_sec=item.source_end_sec,

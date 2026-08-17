@@ -99,10 +99,12 @@ def test_auto_plan_rejects_unconfirmed_shots(client, tmp_path) -> None:
 
 def test_manual_plan_rejects_gap(client, tmp_path) -> None:
     project = _segment_project(client, tmp_path, duration_sec=32.0)
+    # 两端类型一致（inside_shot）且位置合法（10/14 都不是分镜边界，位于镜头内部），
+    # 但 10→14 之间有空缺，应触发空缺校验。
     response = client.put(project.segments_url, json={
         "segments": [
-            {"source_start_sec": 0, "source_end_sec": 15, "start_boundary_type": "video_edge", "end_boundary_type": "shot_boundary", "short_segment_accepted": False},
-            {"source_start_sec": 16, "source_end_sec": 32, "start_boundary_type": "shot_boundary", "end_boundary_type": "video_edge", "short_segment_accepted": False},
+            {"source_start_sec": 0, "source_end_sec": 10, "start_boundary_type": "video_edge", "end_boundary_type": "inside_shot", "short_segment_accepted": False},
+            {"source_start_sec": 14, "source_end_sec": 32, "start_boundary_type": "inside_shot", "end_boundary_type": "video_edge", "short_segment_accepted": False},
         ]
     })
     assert response.status_code == 422
@@ -163,6 +165,67 @@ def test_stale_plan_after_timeline_update_is_not_current(client, tmp_path) -> No
     assert body["timeline_revision_id"] != str(project.revision_id)
 
 
+def test_new_timeline_plan_uses_next_project_plan_version(client, tmp_path) -> None:
+    """新时间轴的首个方案必须使用项目全局下一版本，避免撞唯一约束。"""
+    project = _segment_project(client, tmp_path, duration_sec=32.0)
+    v1_plan = client.post(f"{project.segments_url}/auto")
+    assert v1_plan.status_code == 201
+    assert v1_plan.json()["plan_version"] == 1
+    # 创建带完整确认镜头的时间轴 v2。
+    with SessionLocal() as session:
+        revision2 = TimelineRevision(project_id=project.project_id, version=2, source="human")
+        session.add(revision2)
+        session.flush()
+        for index, (start, end) in enumerate([(0.0, 8.0), (8.0, 16.0), (16.0, 24.0), (24.0, 32.0)]):
+            shot = Shot(timeline_revision_id=revision2.id, position=index, start_sec=start, end_sec=end, analysis_status="succeeded")
+            session.add(shot)
+            session.flush()
+            session.add(ShotEdit(project_id=project.project_id, shot_id=shot.id, action="展示", confirmed=True))
+        session.commit()
+        revision2_id = revision2.id
+    # v2 自动规划必须成功，且版本号全局递增为 2，不撞 v1 的唯一约束。
+    v2_plan = client.post(f"{project.segments_url}/auto")
+    assert v2_plan.status_code == 201
+    body = v2_plan.json()
+    assert body["plan_version"] == 2
+    assert body["timeline_revision_id"] == str(revision2_id)
+    # GET 只返回 v2 方案。
+    current = client.get(project.segments_url).json()
+    assert current["plan_version"] == 2
+    # v1 方案仍保留在数据库中。
+    with SessionLocal() as session:
+        versions = list(session.scalars(select(GenerationSegment.plan_version).where(GenerationSegment.project_id == project.project_id).distinct()))
+        assert sorted(versions) == [1, 2]
+
+
+def test_manual_plan_rejects_false_shot_boundary_claim(client, tmp_path) -> None:
+    """切点不在真实分镜边界时，声明 shot_boundary 必须被拒。"""
+    project = _segment_project(client, tmp_path, duration_sec=32.0)
+    # 12.3 秒不是任何分镜结束点（分镜结束点为 8/16/24/32），却声明 shot_boundary。
+    response = client.put(project.segments_url, json={
+        "segments": [
+            {"source_start_sec": 0, "source_end_sec": 12.3, "start_boundary_type": "video_edge", "end_boundary_type": "shot_boundary", "short_segment_accepted": False},
+            {"source_start_sec": 12.3, "source_end_sec": 32, "start_boundary_type": "shot_boundary", "end_boundary_type": "video_edge", "short_segment_accepted": False},
+        ]
+    })
+    assert response.status_code == 422
+    assert response.json()["detail"] == "声明为镜头边界的切点必须落在分镜结束点"
+
+
+def test_manual_plan_rejects_false_inside_shot_claim(client, tmp_path) -> None:
+    """切点落在真实分镜边界时，声明 inside_shot 必须被拒。"""
+    project = _segment_project(client, tmp_path, duration_sec=32.0)
+    # 16 秒是真实分镜边界，却声明 inside_shot。
+    response = client.put(project.segments_url, json={
+        "segments": [
+            {"source_start_sec": 0, "source_end_sec": 16, "start_boundary_type": "video_edge", "end_boundary_type": "inside_shot", "short_segment_accepted": False},
+            {"source_start_sec": 16, "source_end_sec": 32, "start_boundary_type": "inside_shot", "end_boundary_type": "video_edge", "short_segment_accepted": False},
+        ]
+    })
+    assert response.status_code == 422
+    assert response.json()["detail"] == "声明为镜头内部的切点不能落在分镜边界"
+
+
 def test_response_does_not_expose_clip_path_or_public_url(client, tmp_path) -> None:
     """输出不得暴露 Worker 内部本地路径或临时公网 URL。"""
     project = _segment_project(client, tmp_path, duration_sec=32.0)
@@ -194,7 +257,7 @@ def test_manual_plan_rejects_invalid_boundary_type(client, tmp_path) -> None:
 
 
 def test_manual_plan_rejects_mismatched_shared_boundary_types(client, tmp_path) -> None:
-    """相邻片段共享切点类型必须一致。"""
+    """同一真实分镜边界切点，两端声明不同类型必须被拒（两端之一位置校验失败）。"""
     project = _segment_project(client, tmp_path, duration_sec=32.0)
     response = client.put(project.segments_url, json={
         "segments": [
@@ -202,5 +265,6 @@ def test_manual_plan_rejects_mismatched_shared_boundary_types(client, tmp_path) 
             {"source_start_sec": 16, "source_end_sec": 32, "start_boundary_type": "inside_shot", "end_boundary_type": "video_edge", "short_segment_accepted": False},
         ]
     })
+    # 16 是真实分镜边界：后段 inside_shot 声明违反"内部切点不得落在分镜边界"。
     assert response.status_code == 422
-    assert response.json()["detail"] == "相邻片段共享切点类型必须一致"
+    assert response.json()["detail"] == "声明为镜头内部的切点不能落在分镜边界"
