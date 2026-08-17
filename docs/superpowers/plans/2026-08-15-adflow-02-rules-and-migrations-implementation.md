@@ -55,7 +55,7 @@
 - Consumes: `Session`, `Project`, physical `Asset.kind`.
 - Produces: `product_assets_for_project()`、`confirmed_target_product_assets()` and `contains_product_replacement()`.
 
-- [ ] **Step 1: Write strict-role failing tests**
+- [x] **Step 1: Write strict-role failing tests**
 
 First remove `STRICT_MODE_DEFECT` from the three tests carried by plan 1 so they fail normally: `test_page_two_rejects_incompatible_actions_with_chinese_shot_details`, `test_preserve_product_mode_rejects_replacement_during_prompt_creation`, and `test_prompt_save_cannot_bypass_product_lock`. `test_page_two_applies_target_product_to_every_product_shot` is already green asynchronous coverage; retain it in the full dual-product module regression command without changing its status. Then add tests proving all three rules:
 
@@ -109,7 +109,7 @@ def test_replace_mode_forces_replacement_when_client_sends_false() -> None:
 
 The second test must create a `product_reference_image` whose latest `profile_json` contains `{"summary_confirmed": true}` and confirm every current `ShotEdit`.
 
-- [ ] **Step 2: Run strict-role tests and verify failure**
+- [x] **Step 2: Run strict-role tests and verify failure**
 
 ```powershell
 Set-Location E:\工具-商用\backend
@@ -118,7 +118,7 @@ python -m pytest tests/test_dual_product_workflows.py tests/test_projects_api.py
 
 Expected: FAIL because preserve mode currently accepts `payload.replace_product`.
 
-- [ ] **Step 3: Create the role service**
+- [x] **Step 3: Create the role service**
 
 ```python
 from sqlalchemy import select
@@ -143,7 +143,7 @@ def confirmed_target_product_assets(session: Session, project: Project) -> list[
 
 Move the existing `_contains_product_replacement` regular-expression implementation out of `projects.py` as public `contains_product_replacement(text: str) -> bool` in the same service; preserve its negative-phrase handling and Chinese/English patterns byte-for-byte before adding tests.
 
-- [ ] **Step 4: Enforce project-owned replacement in both HTTP and Worker paths**
+- [x] **Step 4: Enforce project-owned replacement in both HTTP and Worker paths**
 
 In `create_prompt_revision`:
 
@@ -161,7 +161,7 @@ For replace mode, run `check_product_compatibility(product_profile, current_shot
 
 In `execute_final_prompt_job`, load `Project`, call `confirmed_target_product_assets`, and pass an empty product profile when the mode is preserve. After GPT returns and before setting `completed`, reject output for which `contains_product_replacement()` is true in preserve mode. Apply the same post-generation check in `execute_prompt_refinement_job`. Remove every new-flow read of `target_product_reference_image`.
 
-- [ ] **Step 5: Run dual-mode and prompt tests**
+- [x] **Step 5: Run dual-mode and prompt tests**
 
 ```powershell
 python -m pytest tests/test_dual_product_workflows.py tests/test_prompting.py tests/test_simplified_prompt_workflow.py tests/test_projects_api.py -q
@@ -169,7 +169,7 @@ python -m pytest tests/test_dual_product_workflows.py tests/test_prompting.py te
 
 Expected: PASS.
 
-- [ ] **Step 6: Commit strict mode rules**
+- [x] **Step 6: Commit strict mode rules**
 
 ```powershell
 git add backend/app/services/product_rules.py backend/app/api/routes/projects.py backend/app/services/final_prompt.py backend/tests/test_dual_product_workflows.py backend/tests/test_projects_api.py
@@ -186,7 +186,7 @@ git commit -m "fix: enforce immutable product modes"
 - Consumes: `GET /api/projects/{project_id}/prompts?current_timeline_only=true&status=completed`.
 - Produces: `list[PromptRevisionSummary]` ordered by version descending.
 
-- [ ] **Step 1: Write failing history and filter tests**
+- [x] **Step 1: Write failing history and filter tests**
 
 ```python
 def test_prompt_history_filters_to_completed_current_timeline() -> None:
@@ -204,7 +204,7 @@ def test_prompt_history_rejects_unknown_status_filter() -> None:
     assert response.status_code == 422
 ```
 
-- [ ] **Step 2: Run the new tests**
+- [x] **Step 2: Run the new tests**
 
 ```powershell
 python -m pytest tests/test_projects_api.py -k "prompt_history" -q
@@ -212,7 +212,7 @@ python -m pytest tests/test_projects_api.py -k "prompt_history" -q
 
 Expected: FAIL with 405 or validation mismatch.
 
-- [ ] **Step 3: Add the response model and route**
+- [x] **Step 3: Add the response model and route**
 
 ```python
 class PromptRevisionSummary(BaseModel):
@@ -253,7 +253,7 @@ def list_prompt_revisions(
 
 Import `datetime` and `Query` explicitly.
 
-- [ ] **Step 4: Run prompt history and project API tests**
+- [x] **Step 4: Run prompt history and project API tests**
 
 ```powershell
 python -m pytest tests/test_projects_api.py -q
@@ -261,7 +261,7 @@ python -m pytest tests/test_projects_api.py -q
 
 Expected: PASS.
 
-- [ ] **Step 5: Commit the prompt list API**
+- [x] **Step 5: Commit the prompt list API**
 
 ```powershell
 git add backend/app/api/routes/projects.py backend/tests/test_projects_api.py
@@ -278,7 +278,7 @@ git commit -m "feat: list current prompt revisions"
 - Consumes: existing `Generation` rows.
 - Produces: nullable snapshots plus status indexes without deleting existing fields.
 
-- [ ] **Step 1: Write the model contract test**
+- [x] **Step 1: Write the model contract test**
 
 ```python
 def test_generation_has_recovery_snapshot_fields() -> None:
@@ -291,7 +291,7 @@ def test_generation_has_recovery_snapshot_fields() -> None:
     }
 ```
 
-- [ ] **Step 2: Run the test and verify missing columns**
+- [x] **Step 2: Run the test and verify missing columns**
 
 ```powershell
 python -m pytest tests/test_models.py::test_generation_has_recovery_snapshot_fields -q
@@ -299,7 +299,7 @@ python -m pytest tests/test_models.py::test_generation_has_recovery_snapshot_fie
 
 Expected: FAIL.
 
-- [ ] **Step 3: Add the exact model fields and indexes**
+- [x] **Step 3: Add the exact model fields and indexes**
 
 ```python
 from sqlalchemy import Index
@@ -319,7 +319,7 @@ class Generation(Base):
     completed_at: Mapped[datetime | None] = mapped_column(nullable=True)
 ```
 
-- [ ] **Step 4: Run model tests**
+- [x] **Step 4: Run model tests**
 
 ```powershell
 python -m pytest tests/test_models.py -q
@@ -327,7 +327,7 @@ python -m pytest tests/test_models.py -q
 
 Expected: PASS.
 
-- [ ] **Step 5: Commit the model contract**
+- [x] **Step 5: Commit the model contract**
 
 ```powershell
 git add backend/app/db/models.py backend/tests/test_models.py
@@ -350,7 +350,7 @@ git commit -m "feat: persist generation recovery metadata"
 - Consumes: existing installations stamped at `0001_adflow_baseline` and empty databases at base.
 - Produces: head revision `0002_generation_closed_loop`.
 
-- [ ] **Step 1: Write migration metadata tests**
+- [x] **Step 1: Write migration metadata tests**
 
 ```python
 from pathlib import Path
@@ -369,7 +369,7 @@ def test_application_does_not_create_production_schema(monkeypatch) -> None:
     create_app()
 ```
 
-- [ ] **Step 2: Run migration metadata tests**
+- [x] **Step 2: Run migration metadata tests**
 
 ```powershell
 python -m pytest tests/test_schema.py -q
@@ -377,7 +377,7 @@ python -m pytest tests/test_schema.py -q
 
 Expected: FAIL because the current app calls `create_schema()` and only 0001 exists.
 
-- [ ] **Step 3: Rewrite 0001 as a fixed full-schema snapshot**
+- [x] **Step 3: Rewrite 0001 as a fixed full-schema snapshot**
 
 Implement `upgrade()` exclusively with `op.create_table`, `op.create_index`, `op.create_unique_constraint`, and the four existing check constraints. Create these tables in dependency order with the columns exactly matching the pre-Task-3 model schema: `projects`, `assets`, `timeline_revisions`, `shots`, `shot_evidence`, `shot_ai_summaries`, `shot_edits`, `prompt_revisions`, `video_analyses`, `jobs`, `generations`. `downgrade()` drops them in reverse dependency order.
 
@@ -401,7 +401,7 @@ generations: id UUID PK; project_id UUID FK projects; version INTEGER; prompt_ve
 
 Because `video_analyses.job_id` references `jobs` while `jobs` has no dependency on `video_analyses`, create `jobs` before `video_analyses` even though the list above groups analysis tables together. Apply server defaults matching current ORM defaults for existing required booleans, counters, statuses and timestamps.
 
-- [ ] **Step 4: Add the additive 0002 migration**
+- [x] **Step 4: Add the additive 0002 migration**
 
 ```python
 revision = "0002_generation_closed_loop"
@@ -421,7 +421,7 @@ def upgrade() -> None:
 
 `downgrade()` drops the three indexes first, then the five columns in reverse order.
 
-- [ ] **Step 5: Remove production schema mutation and keep test schema creation explicit**
+- [x] **Step 5: Remove production schema mutation and keep test schema creation explicit**
 
 Reduce `backend/app/db/session.py` to engine/session/get-session responsibilities; delete `create_schema()` and imports of `text` and `Base`. Remove `create_schema()` calls from `main.py` and `worker.py`.
 
@@ -461,7 +461,7 @@ def pytest_sessionstart(session) -> None:
     Base.metadata.create_all(engine)
 ```
 
-- [ ] **Step 6: Move Alembic into runtime dependencies**
+- [x] **Step 6: Move Alembic into runtime dependencies**
 
 ```toml
 dependencies = [
@@ -473,7 +473,7 @@ dependencies = [
 dev = ["httpx>=0.28,<1", "pytest>=8.3,<9"]
 ```
 
-- [ ] **Step 7: Run schema and full backend tests**
+- [x] **Step 7: Run schema and full backend tests**
 
 ```powershell
 python -m pytest tests/test_schema.py -q
@@ -482,7 +482,7 @@ python -m pytest -q
 
 Expected: PASS; `create_app()` no longer creates tables.
 
-- [ ] **Step 8: Commit Alembic authority**
+- [x] **Step 8: Commit Alembic authority**
 
 ```powershell
 git add backend/alembic/versions/0001_adflow_baseline.py backend/alembic/versions/0002_generation_closed_loop.py backend/app/db/session.py backend/app/db/migrations.py backend/app/main.py backend/app/worker.py backend/tests/conftest.py backend/tests/test_schema.py backend/pyproject.toml
@@ -501,7 +501,7 @@ git commit -m "refactor: make alembic the schema authority"
 - Consumes: `backend/.env` and a user-supplied backup directory.
 - Produces: a non-empty `.dump` file and migration-before-process startup.
 
-- [ ] **Step 1: Add a parse-level test command before editing**
+- [x] **Step 1: Add a parse-level test command before editing**
 
 ```powershell
 $errors = $null
@@ -509,7 +509,7 @@ $errors = $null
 if ($errors.Count) { throw ($errors | Out-String) }
 ```
 
-- [ ] **Step 2: Run Alembic synchronously before opening background processes**
+- [x] **Step 2: Run Alembic synchronously before opening background processes**
 
 Insert after FFmpeg checks and before port checks:
 
@@ -525,7 +525,7 @@ try {
 
 Update `backend/scripts/start-adflow-worker.ps1` with the same synchronous Alembic command before `python -m app.worker`; throw when `$LASTEXITCODE -ne 0`.
 
-- [ ] **Step 3: Implement explicit backup output handling**
+- [x] **Step 3: Implement explicit backup output handling**
 
 The new script accepts:
 
@@ -541,7 +541,7 @@ It reads `DATABASE_URL` from `backend/.env`, parses the PostgreSQL URI with `[Sy
 
 After the command, throw unless `$LASTEXITCODE -eq 0`, the output exists, and `(Get-Item -LiteralPath $outputPath).Length -gt 0`. Remove `Env:PGPASSWORD` in `finally`. Return the absolute backup path with `Write-Output`.
 
-- [ ] **Step 4: Parse both PowerShell scripts**
+- [x] **Step 4: Parse both PowerShell scripts**
 
 ```powershell
 $files = @('E:\工具-商用\scripts\start-adflow-local.ps1','E:\工具-商用\backend\scripts\start-adflow-worker.ps1','E:\工具-商用\scripts\backup-adflow-database.ps1')
@@ -554,7 +554,7 @@ foreach ($file in $files) {
 
 Expected: no parser errors.
 
-- [ ] **Step 5: Commit startup migration and backup**
+- [x] **Step 5: Commit startup migration and backup**
 
 ```powershell
 git add scripts/start-adflow-local.ps1 backend/scripts/start-adflow-worker.ps1 scripts/backup-adflow-database.ps1

@@ -42,7 +42,7 @@
 - Consumes: `DATABASE_URL` and `MEDIA_ROOT` environment variables read by `Settings`.
 - Produces: `media_tools` pytest marker and one fresh SQLite schema per test session.
 
-- [ ] **Step 1: Run the complete backend suite and preserve the exact failure list**
+- [x] **Step 1: Run the complete backend suite and preserve the exact failure list**
 
 ```powershell
 Set-Location E:\工具-商用\backend
@@ -51,7 +51,7 @@ python -m pytest -q
 
 Expected: current baseline reports failures; record failing node IDs in the task notes before edits.
 
-- [ ] **Step 2: Add deterministic media capability detection to `conftest.py`**
+- [x] **Step 2: Add deterministic media capability detection to `conftest.py`**
 
 ```python
 import subprocess
@@ -85,11 +85,11 @@ def pytest_collection_modifyitems(items) -> None:
 
 Keep the existing environment assignment and `pytest_sessionfinish()` cleanup unchanged.
 
-- [ ] **Step 3: Mark only tests that execute real FFmpeg binaries**
+- [x] **Step 3: Mark only tests that execute real FFmpeg binaries**
 
 Add `@pytest.mark.media_tools` to `video_31_seconds`, `video_with_cut`, and `test_analysis_start_creates_ai_timeline_from_real_candidate_cuts`. Do not mark tests that mock `probe_video`, `clip_video`, or subprocess calls.
 
-- [ ] **Step 4: Verify database isolation and media collection**
+- [x] **Step 4: Verify database isolation and media collection**
 
 ```powershell
 python -m pytest tests/test_database_connection.py tests/test_media.py tests/test_timeline_api.py -q
@@ -97,7 +97,7 @@ python -m pytest tests/test_database_connection.py tests/test_media.py tests/tes
 
 Expected on the configured workstation: PASS with 0 skipped. In a restricted sandbox: only explicitly marked real-media tests may be skipped.
 
-- [ ] **Step 5: Commit the environment-safe baseline fixture**
+- [x] **Step 5: Commit the environment-safe baseline fixture**
 
 ```powershell
 git add backend/tests/conftest.py backend/tests/test_media.py backend/tests/test_timeline_api.py
@@ -115,7 +115,7 @@ git commit -m "test: make media baseline environment aware"
 - Consumes: API response IDs as strings.
 - Produces: `UUID(response_json["id"])` before ORM lookup or UUID-column predicates.
 
-- [ ] **Step 1: Add a focused regression assertion**
+- [x] **Step 1: Add a focused regression assertion**
 
 In `test_generation_api_queues_work_without_calling_provider`, convert the response ID once and use it for `session.get`:
 
@@ -126,7 +126,7 @@ with SessionLocal() as session:
     assert generation is not None
 ```
 
-- [ ] **Step 2: Run the test to expose remaining string/UUID comparisons**
+- [x] **Step 2: Run the test to expose remaining string/UUID comparisons**
 
 ```powershell
 python -m pytest tests/test_projects_api.py::test_generation_api_queues_work_without_calling_provider -q
@@ -134,7 +134,7 @@ python -m pytest tests/test_projects_api.py::test_generation_api_queues_work_wit
 
 Expected before all replacements: FAIL with UUID coercion/binding error.
 
-- [ ] **Step 3: Convert every ORM-facing project, shot, generation, and revision ID in the two files**
+- [x] **Step 3: Convert every ORM-facing project, shot, generation, and revision ID in the two files**
 
 Use this exact pattern:
 
@@ -153,7 +153,7 @@ generation = session.get(Generation, generation_id)
 
 Import `UUID` from `uuid` at the top of each changed test file. API URLs and JSON payloads continue using strings.
 
-- [ ] **Step 4: Run both test modules**
+- [x] **Step 4: Run both test modules**
 
 ```powershell
 python -m pytest tests/test_projects_api.py tests/test_dual_product_workflows.py -q
@@ -161,7 +161,7 @@ python -m pytest tests/test_projects_api.py tests/test_dual_product_workflows.py
 
 Expected: UUID binding errors are gone; remaining failures must be behavior assertions handled in Task 3.
 
-- [ ] **Step 5: Commit UUID-safe tests**
+- [x] **Step 5: Commit UUID-safe tests**
 
 ```powershell
 git add backend/tests/test_projects_api.py backend/tests/test_dual_product_workflows.py
@@ -181,7 +181,7 @@ git commit -m "test: use UUID values in ORM assertions"
 - Consumes: `POST /api/projects/{id}/prompts`, `Job(kind="final_prompt_generation")`, `execute_final_prompt_job`.
 - Produces: separate tests for synchronous manual prompt saves and asynchronous AI prompt jobs.
 
-- [ ] **Step 1: Replace the stale default-AI assertion with an explicit manual save**
+- [x] **Step 1: Replace the stale default-AI assertion with an explicit manual save**
 
 ```python
 response = client.post(
@@ -203,7 +203,7 @@ assert response.json() == {
 }
 ```
 
-- [ ] **Step 2: Run the two prompt regression tests before updating the Worker assertion**
+- [x] **Step 2: Run the two prompt regression tests before updating the Worker assertion**
 
 ```powershell
 python -m pytest tests/test_prompting.py::test_prompt_revisions_are_saved_with_audio_choice tests/test_simplified_prompt_workflow.py::test_final_prompt_uses_only_confirmed_edit_and_can_be_saved_manually -q
@@ -211,7 +211,7 @@ python -m pytest tests/test_prompting.py::test_prompt_revisions_are_saved_with_a
 
 Expected: manual test passes; stale synchronous AI test fails because the route now returns `queued`.
 
-- [ ] **Step 3: Assert AI prompt creation queues work and the Worker completes the revision**
+- [x] **Step 3: Assert AI prompt creation queues work and the Worker completes the revision**
 
 Use the actual queue contract:
 
@@ -241,7 +241,7 @@ with SessionLocal() as session:
 
 Add the required imports: `UUID`, `Settings`, `Job`, `PromptRevision`, `execute_final_prompt_job`, and `select`.
 
-- [ ] **Step 4: Separate route validation from asynchronous generated-text assertions**
+- [x] **Step 4: Separate route validation from asynchronous generated-text assertions**
 
 Set `"use_ai": False` only in tests whose assertion is an immediate HTTP validation error. Tests that inspect GPT-produced text keep `use_ai=True` and execute the queued Worker job as shown in Step 3.
 
@@ -256,7 +256,7 @@ STRICT_MODE_DEFECT = pytest.mark.xfail(
 
 Place `@STRICT_MODE_DEFECT` immediately above the existing definitions of `test_page_two_rejects_incompatible_actions_with_chinese_shot_details`, `test_preserve_product_mode_rejects_replacement_during_prompt_creation`, and `test_prompt_save_cannot_bypass_product_lock`; their complete bodies remain unchanged. Do not mark missing-product, timeline, UUID, media, queueing, database tests, or `test_page_two_applies_target_product_to_every_product_shot`.
 
-- [ ] **Step 5: Run the prompt and dual-mode modules**
+- [x] **Step 5: Run the prompt and dual-mode modules**
 
 ```powershell
 python -m pytest tests/test_prompting.py tests/test_simplified_prompt_workflow.py tests/test_dual_product_workflows.py tests/test_projects_api.py -q
@@ -264,7 +264,7 @@ python -m pytest tests/test_prompting.py tests/test_simplified_prompt_workflow.p
 
 Expected: no unexpected failures; exactly the three named strict-mode tests are XFAIL, with no synchronous provider patch on the HTTP route.
 
-- [ ] **Step 6: Commit the asynchronous test contract**
+- [x] **Step 6: Commit the asynchronous test contract**
 
 ```powershell
 git add backend/tests/test_prompting.py backend/tests/test_simplified_prompt_workflow.py backend/tests/test_dual_product_workflows.py backend/tests/test_projects_api.py
@@ -280,7 +280,7 @@ git commit -m "test: align prompt assertions with worker jobs"
 - Consumes: Tasks 1—3.
 - Produces: a recorded full-suite baseline for the next plan.
 
-- [ ] **Step 1: Run the complete backend suite**
+- [x] **Step 1: Run the complete backend suite**
 
 ```powershell
 Set-Location E:\工具-商用\backend
@@ -289,7 +289,7 @@ python -m pytest -q
 
 Expected: exit code 0, `101 passed, 3 xfailed, 0 failed/errors/skipped`, and on the real workstation skipped count 0.
 
-- [ ] **Step 2: Run the existing frontend gate to prove no cross-stack regression**
+- [x] **Step 2: Run the existing frontend gate to prove no cross-stack regression**
 
 ```powershell
 Set-Location E:\工具-商用\frontend
@@ -300,6 +300,6 @@ npm.cmd run build
 
 Expected: all three commands exit 0.
 
-- [ ] **Step 3: Record the exact counts in the implementation task notes**
+- [x] **Step 3: Record the exact counts in the implementation task notes**
 
 Record `passed`, `xfailed`, `failed`, `errors`, and `skipped` from pytest plus the Vitest test count. Confirm `passed == 101`, `xfailed == 3`, `failed == 0`, `errors == 0`, and `skipped == 0`. Do not create a code commit when this step changes no files.
