@@ -1,5 +1,6 @@
 from uuid import UUID
 import json
+from pathlib import Path
 from datetime import datetime, timezone
 
 from fastapi import APIRouter, Depends, HTTPException, status
@@ -29,12 +30,41 @@ class CreateGenerationRequest(BaseModel):
 
 class GenerationResponse(BaseModel):
     id: UUID
-    status: str
+    version: int
+    prompt_version: int
     provider: str
+    status: str
+    generate_audio: bool
     external_task_id: str | None
+    attempts: int
+    next_attempt_at: datetime | None
     result_url: str | None
+    local_video_url: str | None
     error_message: str | None
-    local_video_url: str | None = None
+    created_at: datetime
+    completed_at: datetime | None
+
+
+def generation_response(project_id: UUID, generation: Generation) -> GenerationResponse:
+    return GenerationResponse(
+        id=generation.id,
+        version=generation.version,
+        prompt_version=generation.prompt_version,
+        provider=generation.provider,
+        status=generation.status,
+        generate_audio=generation.generate_audio,
+        external_task_id=generation.external_task_id,
+        attempts=generation.attempts,
+        next_attempt_at=generation.next_attempt_at,
+        result_url=generation.result_url,
+        local_video_url=(
+            f"/api/projects/{project_id}/generations/{generation.id}/content"
+            if generation.result_path and Path(generation.result_path).is_file() else None
+        ),
+        error_message=generation.error_message,
+        created_at=generation.created_at,
+        completed_at=generation.completed_at,
+    )
 
 
 def _provider_gateway(settings: Settings, provider: str) -> tuple[JsonTaskGateway, str]:
@@ -105,17 +135,25 @@ def create_generation(project_id: UUID, payload: CreateGenerationRequest, sessio
     )
     session.add(generation)
     session.commit()
-    response = GenerationResponse.model_validate(generation, from_attributes=True)
-    response.local_video_url = f"/api/projects/{project_id}/generations/{generation.id}/content" if generation.result_path else None
-    return response
+    return generation_response(project_id, generation)
+
+
+@router.get("", response_model=list[GenerationResponse])
+def list_generations(project_id: UUID, session: Session = Depends(get_session)) -> list[GenerationResponse]:
+    if session.get(Project, project_id) is None:
+        raise HTTPException(status_code=404, detail="Project does not exist")
+    generations = session.scalars(
+        select(Generation).where(Generation.project_id == project_id).order_by(Generation.version.desc())
+    ).all()
+    return [generation_response(project_id, generation) for generation in generations]
 
 
 @router.get("/{generation_id}", response_model=GenerationResponse)
-def get_generation(project_id: UUID, generation_id: UUID, session: Session = Depends(get_session)) -> Generation:
+def get_generation(project_id: UUID, generation_id: UUID, session: Session = Depends(get_session)) -> GenerationResponse:
     generation = session.get(Generation, generation_id)
     if generation is None or generation.project_id != project_id:
         raise HTTPException(status_code=404, detail="Generation does not exist")
-    return generation
+    return generation_response(project_id, generation)
 
 
 @router.get("/{generation_id}/content")
