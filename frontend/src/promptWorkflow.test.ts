@@ -19,6 +19,10 @@ describe('prompt-only recovery', () => {
     expect(promptTaskFromJobs([{ job_id: 'g', kind: 'final_prompt_generation', status: 'queued' }])).toBe('generate')
     expect(promptTaskFromJobs([{ job_id: 'f', kind: 'prompt_refinement', status: 'failed' }])).toBeNull()
     expect(promptTaskFromJobs([{ job_id: 'other', kind: 'vision_analysis', status: 'running' }])).toBeNull()
+    expect(promptTaskFromJobs([
+      { job_id: 'done', kind: 'prompt_refinement', status: 'completed' },
+      { job_id: 'active', kind: 'final_prompt_generation', status: 'processing' },
+    ])).toBe('generate')
   })
 
   it('returns the newest prompt job, even when it is terminal', () => {

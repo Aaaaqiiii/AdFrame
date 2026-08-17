@@ -9,6 +9,7 @@ import {
   getProject,
   getReferenceProfile,
   listAnalysisJobs,
+  listPromptRevisions,
   listProjects,
   mediaUrl,
   referenceImageAssetUrl,
@@ -27,7 +28,7 @@ import {
   uploadReferenceImage,
   uploadReferenceVideo,
 } from './api'
-import type { AnalysisJob, AssetKind, ConnectionCheck, Project, ProjectDetails, SettingsSaveResult, Timeline, TimelineShot } from './api'
+import type { AnalysisJob, AssetKind, ConnectionCheck, Project, ProjectDetails, PromptRevisionSummary, SettingsSaveResult, Timeline, TimelineShot } from './api'
 import { AppHeader } from './components/AppHeader'
 import { AnalysisStage } from './components/AnalysisStage'
 import { MaterialsStage } from './components/MaterialsStage'
@@ -43,6 +44,7 @@ import { inferProductProfile } from './productProfile'
 import { restoreProjectId, saveProjectId } from './projectSession'
 import { shotIndexAtTime } from './timelineScrubbing'
 import { modeFromPath, modePath, preserveShotSelection, shouldRefreshProjectDuringPolling } from './workspaceDomain'
+import { choosePromptRevision, latestPromptJob, promptTaskFromJobs } from './promptWorkflow'
 import { localId } from './runtime'
 import type { WorkflowStage } from './workspaceDomain'
 
@@ -111,10 +113,10 @@ function App() {
   const [promptText, setPromptText] = useState('')
   const [promptDirection, setPromptDirection] = useState('保持原视频的镜头时长、动作节奏、构图、运镜与原BGM。')
   const [promptRefinement, setPromptRefinement] = useState('')
-  const [replaceProduct, setReplaceProduct] = useState(MODE === 'replace_product')
   const [replacePerson, setReplacePerson] = useState(false)
   const [promptTask, setPromptTask] = useState<'generate' | 'refine' | null>(null)
   const [promptVersion, setPromptVersion] = useState(0)
+  const [promptVersions, setPromptVersions] = useState<PromptRevisionSummary[]>([])
   const [preflight, setPreflight] = useState<Record<string, { ready: boolean; model: string; endpoint: string }> | null>(null)
   const [connectionChecks, setConnectionChecks] = useState<Record<string, ConnectionCheck>>({})
   const [volcengineKey, setVolcengineKey] = useState('')
@@ -123,7 +125,7 @@ function App() {
 
   const shots = timeline?.shots || []
   const selectedShot = shots.find((shot) => shot.id === selectedShotId)
-  const promptProduct = MODE === 'replace_product' ? materials.product : materials.target_product
+  const promptProduct = materials.product
   const productProfile = promptProduct.profile.trim() || inferProductProfile(shots.map((shot) => ({ productInteraction: shot.product_interaction, observations: shot.observations })))
   const allShotJobsDone = shots.length > 0 && shots.every((shot) => success(shot.analysis_status) || success(jobs.find((job) => job.shot_id === shot.id)?.status))
 
@@ -134,6 +136,15 @@ function App() {
     setSelectedBoundary(null)
     setTimelineDirty(false)
     setTimelineConfirmed(confirmed)
+  }, [])
+
+  const restorePromptVersions = useCallback(async (id: string, preferredVersion?: number, preferLatest = false) => {
+    const versions = await listPromptRevisions(id)
+    setPromptVersions(versions)
+    const selected = choosePromptRevision(versions, preferLatest ? undefined : preferredVersion)
+    setPromptVersion(selected?.version ?? 0)
+    setPromptText(selected?.text ?? '')
+    return selected
   }, [])
 
   const restoreProject = useCallback(async (id: string) => {
@@ -150,10 +161,7 @@ function App() {
       background: { ...current.background, filename: project.background_reference_image_name || '', previewUrl: project.background_reference_image_name ? referenceImageUrl(project.id, 'background') : '', images: project.background_reference_image_name ? [{ filename: project.background_reference_image_name, previewUrl: referenceImageUrl(project.id, 'background'), viewLabel: 'other', note: '' }] : [] },
     }))
     setProductIdentity({ name: project.product_name || '', sellingPoints: project.product_selling_points || '', confirmed: Boolean(project.product_profile_confirmed) })
-    setPromptVersion(project.latest_prompt_version || 0)
-    setPromptText(project.latest_prompt_text || '')
     if (project.prompt_visual_direction) setPromptDirection(project.prompt_visual_direction)
-    setReplaceProduct(MODE === 'replace_product' || Boolean(project.prompt_replace_product))
     setReplacePerson(Boolean(project.prompt_replace_person))
     if (project.timeline) {
       setTimeline(project.timeline)
@@ -168,8 +176,9 @@ function App() {
       setTimeline(null)
       setTimelineConfirmed(false)
     }
+    await restorePromptVersions(project.id, undefined, true)
     return project
-  }, [])
+  }, [restorePromptVersions])
 
   useEffect(() => {
     if (!window.location.pathname.startsWith(modePath(MODE))) window.history.replaceState(null, '', modePath(MODE))
@@ -185,6 +194,8 @@ function App() {
     if (!projectId) return []
     const next = await listAnalysisJobs(projectId)
     setJobs(next)
+    const recoveredTask = promptTaskFromJobs(next)
+    if (recoveredTask) setPromptTask(recoveredTask)
     const global = next.find((job) => job.kind === 'vision_analysis')
     if (global) {
       setGlobalStatus(global.status)
@@ -199,9 +210,9 @@ function App() {
       try {
         const current = await refreshJobs()
         const global = current.find((job) => job.kind === 'vision_analysis')
-        // 生成与修改共用同一工作区，但界面只跟踪用户本次启动的任务。
-        const promptJobKind = promptTask === 'generate' ? 'final_prompt_generation' : 'prompt_refinement'
-        const promptJob = promptTask ? current.find((job) => job.kind === promptJobKind) : undefined
+        const effectivePromptTask = promptTask ?? promptTaskFromJobs(current)
+        const promptJobKind = effectivePromptTask === 'generate' ? 'final_prompt_generation' : 'prompt_refinement'
+        const promptJob = effectivePromptTask ? current.find((job) => job.kind === promptJobKind) : undefined
         if (shouldRefreshProjectDuringPolling({
           globalStatus: global?.status,
           timelineSource: timeline?.source,
@@ -212,12 +223,12 @@ function App() {
           const project = await restoreProject(projectId)
           if (success(global?.status) && project.timeline?.source === 'vision_hybrid') setAiRevisionId(project.timeline.revision_id)
         }
-        if (promptTask && promptJob && terminal(promptJob.status)) {
+        if (effectivePromptTask && promptJob && terminal(promptJob.status)) {
           await restoreProject(projectId)
           setPromptTask(null)
           if (success(promptJob.status) && promptJob.kind === 'prompt_refinement') setPromptRefinement('')
           setNotice(success(promptJob.status) ? 'GPT 提示词新版本已生成并恢复到编辑框。' : `GPT 提示词任务失败：${promptJob.error_message || '未知错误'}`)
-        } else if (promptTask && promptJob && (promptJob.attempts || 0) > 0) {
+        } else if (effectivePromptTask && promptJob && (promptJob.attempts || 0) > 0) {
           setNotice(`GPT 正在补全缺失镜头，已自动重试 ${promptJob.attempts} 次…`)
         }
         for (const kind of ['product', 'target_product', 'person', 'background'] as AssetKind[]) {
@@ -267,7 +278,7 @@ function App() {
     setPromptText('')
     setPromptRefinement('')
     setPromptVersion(0)
-    setReplaceProduct(MODE === 'replace_product')
+    setPromptVersions([])
     setStage('materials')
     setNotice('新项目已创建，请上传参考视频。')
   }
@@ -307,12 +318,6 @@ function App() {
       setNotice(`${kind === 'product' ? '原产品' : kind === 'target_product' ? '目标产品' : kind === 'person' ? '人物' : '背景'}图片已上传，AI 正在生成可编辑文字档案。`)
       return true
     } catch (error) { setNotice(`图片上传失败：${errorMessage(error)}`); return false }
-  }
-
-  async function uploadTargetProducts(files: File[]) {
-    let uploaded = 0
-    for (const file of files) if (await uploadImage('target_product', file, true)) uploaded += 1
-    if (uploaded) setNotice(`已追加 ${uploaded} 张目标产品图，AI 将综合所有图片生成产品档案。`)
   }
 
   async function uploadProducts(items: ProductImageUpload[], productName: string, sellingPoints: string) {
@@ -536,13 +541,14 @@ function App() {
         visual_direction: useAi ? promptDirection : promptText,
         audio_mode: 'keep_original',
         audio_style: '',
-        replace_product: MODE === 'replace_product' || replaceProduct,
+        replace_product: MODE === 'replace_product',
         replace_person: replacePerson,
         use_ai: useAi,
       })
       setPromptVersion(saved.version)
       if (saved.text) setPromptText(saved.text)
       setPromptTask(useAi && (saved.status === 'queued' || saved.status === 'processing') ? 'generate' : null)
+      if (!useAi) await restorePromptVersions(projectId, saved.version)
       setNotice(useAi ? `GPT 提示词任务 v${saved.version} 已进入后台，完成后页面会自动显示。` : `人工提示词已保存为 v${saved.version}。`)
       return saved.version
     } catch (error) { setPromptTask(null); setNotice(`${useAi ? '生成' : '保存'}提示词失败：${errorMessage(error)}`); return 0 }
@@ -552,7 +558,7 @@ function App() {
     if (!projectId || !promptText.trim() || !promptRefinement.trim()) return
     setPromptTask('refine')
     try {
-      const saved = await refinePrompt(projectId, promptRefinement.trim())
+      const saved = await refinePrompt(projectId, promptRefinement.trim(), promptVersion || undefined)
       setPromptVersion(saved.version)
       setNotice(`GPT-5.6 修改任务 v${saved.version} 已进入后台，当前提示词版本会继续保留。`)
     } catch (error) { setPromptTask(null); setNotice(`修改提示词失败：${errorMessage(error)}`) }
@@ -602,7 +608,7 @@ function App() {
           if (!window.confirm('重新理解将产生一个新的 AI 总结版本，当前人工版本会继续保留。是否继续？')) return
           void retryShotAnalysis(projectId, id).then(refreshJobs).catch((error) => setNotice(`重试失败：${errorMessage(error)}`))
         }} onOpenPrompt={() => setStage('prompt')} />}
-        {stage === 'prompt' && <PromptStage mode={MODE} prompt={promptText} direction={promptDirection} refinement={promptRefinement} promptVersion={promptVersion} productReady={success(promptProduct.status) && Boolean(promptProduct.profile.trim()) && (MODE !== 'replace_product' || productIdentity.confirmed)} personReady={success(materials.person.status) && Boolean(materials.person.profile.trim())} replaceProduct={replaceProduct} replacePerson={replacePerson} busy={promptTask} blockingReason={!timelineConfirmed ? '人工时间轴尚未确认。' : !allShotJobsDone ? '逐镜理解尚未全部完成。' : !shots.every((shot) => shot.edit?.confirmed) ? '请先确认每个镜头的最终事实。' : ''} onPrompt={setPromptText} onDirection={setPromptDirection} onRefinement={setPromptRefinement} onReplaceProduct={setReplaceProduct} onReplacePerson={setReplacePerson} onSave={() => void savePrompt(false)} onGenerate={() => void savePrompt(true)} onRefine={() => void refineCurrentPrompt()} targetProduct={materials.target_product} onTargetProduct={(file) => void uploadImage('target_product', file, true)} onTargetProducts={(files) => void uploadTargetProducts(files)} onTargetProductRetry={() => void retryProfile('target_product')} onTargetProductProfile={(profile) => setMaterials((old) => ({ ...old, target_product: { ...old.target_product, profile } }))} onTargetProductProfileSave={() => void saveProfile('target_product')} person={materials.person} onPerson={(file) => void uploadImage('person', file)} onPersonRetry={() => void retryProfile('person')} onPersonProfile={(profile) => setMaterials((old) => ({ ...old, person: { ...old.person, profile } }))} onPersonProfileSave={() => void saveProfile('person')} />}
+        {stage === 'prompt' && <PromptStage mode={MODE} prompt={promptText} direction={promptDirection} refinement={promptRefinement} promptVersion={promptVersion} versions={promptVersions} selectedVersion={promptVersion} taskStatus={latestPromptJob(jobs)} personReady={success(materials.person.status) && Boolean(materials.person.profile.trim())} replacePerson={replacePerson} busy={promptTask} blockingReason={!timelineConfirmed ? '人工时间轴尚未确认。' : !allShotJobsDone ? '逐镜理解尚未全部完成。' : !shots.every((shot) => shot.edit?.confirmed) ? '请先确认每个镜头的最终事实。' : ''} onPrompt={setPromptText} onDirection={setPromptDirection} onRefinement={setPromptRefinement} onReplacePerson={setReplacePerson} onSelectVersion={(version) => { const selected = choosePromptRevision(promptVersions, version); setPromptVersion(selected?.version ?? 0); setPromptText(selected?.text ?? '') }} onSave={() => void savePrompt(false)} onGenerate={() => void savePrompt(true)} onRefine={() => void refineCurrentPrompt()} person={materials.person} onPerson={(file) => void uploadImage('person', file)} onPersonRetry={() => void retryProfile('person')} onPersonProfile={(profile) => setMaterials((old) => ({ ...old, person: { ...old.person, profile } }))} onPersonProfileSave={() => void saveProfile('person')} />}
       </div>
     </div>
     <div className="global-notice" role="status"><i />{notice}</div>
