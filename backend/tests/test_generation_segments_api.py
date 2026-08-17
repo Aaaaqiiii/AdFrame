@@ -142,3 +142,65 @@ def test_manual_plan_rejects_unaccepted_short_segment(client, tmp_path) -> None:
         ]
     })
     assert accepted.status_code == 201
+
+
+def test_stale_plan_after_timeline_update_is_not_current(client, tmp_path) -> None:
+    """时间轴更新后，旧时间轴的分段方案不得再作为当前方案返回。"""
+    project = _segment_project(client, tmp_path, duration_sec=32.0)
+    auto = client.post(f"{project.segments_url}/auto")
+    assert auto.status_code == 201
+    # 创建更新的时间轴版本（旧方案仍挂在旧 revision 上）。
+    with SessionLocal() as session:
+        newer = TimelineRevision(project_id=project.project_id, version=2, source="human")
+        session.add(newer)
+        session.commit()
+    current = client.get(project.segments_url)
+    assert current.status_code == 200
+    body = current.json()
+    # 新时间轴没有对应方案，返回空当前方案，而不是旧方案。
+    assert body["plan_version"] == 0
+    assert body["segments"] == []
+    assert body["timeline_revision_id"] != str(project.revision_id)
+
+
+def test_response_does_not_expose_clip_path_or_public_url(client, tmp_path) -> None:
+    """输出不得暴露 Worker 内部本地路径或临时公网 URL。"""
+    project = _segment_project(client, tmp_path, duration_sec=32.0)
+    auto = client.post(f"{project.segments_url}/auto")
+    assert auto.status_code == 201
+    with SessionLocal() as session:
+        segment = session.scalar(select(GenerationSegment).where(GenerationSegment.project_id == project.project_id))
+        segment.clip_path = "C:/secret/local/path.mp4"
+        segment.public_url = "https://tempfile.org/signed/segment-0/download"
+        segment.public_url_expires_at = "2026-08-18T00:00:00Z"
+        session.commit()
+    body = client.get(project.segments_url).json()
+    segment_body = body["segments"][0]
+    assert "clip_path" not in segment_body
+    assert "public_url" not in segment_body
+    assert "public_url_expires_at" not in segment_body
+
+
+def test_manual_plan_rejects_invalid_boundary_type(client, tmp_path) -> None:
+    """非法边界类型字符串必须被 Pydantic 拒绝。"""
+    project = _segment_project(client, tmp_path, duration_sec=32.0)
+    response = client.put(project.segments_url, json={
+        "segments": [
+            {"source_start_sec": 0, "source_end_sec": 16, "start_boundary_type": "video_edge", "end_boundary_type": "banana", "short_segment_accepted": False},
+            {"source_start_sec": 16, "source_end_sec": 32, "start_boundary_type": "banana", "end_boundary_type": "video_edge", "short_segment_accepted": False},
+        ]
+    })
+    assert response.status_code == 422
+
+
+def test_manual_plan_rejects_mismatched_shared_boundary_types(client, tmp_path) -> None:
+    """相邻片段共享切点类型必须一致。"""
+    project = _segment_project(client, tmp_path, duration_sec=32.0)
+    response = client.put(project.segments_url, json={
+        "segments": [
+            {"source_start_sec": 0, "source_end_sec": 16, "start_boundary_type": "video_edge", "end_boundary_type": "shot_boundary", "short_segment_accepted": False},
+            {"source_start_sec": 16, "source_end_sec": 32, "start_boundary_type": "inside_shot", "end_boundary_type": "video_edge", "short_segment_accepted": False},
+        ]
+    })
+    assert response.status_code == 422
+    assert response.json()["detail"] == "相邻片段共享切点类型必须一致"

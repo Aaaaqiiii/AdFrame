@@ -1,3 +1,4 @@
+from typing import Literal
 from uuid import UUID
 
 from fastapi import APIRouter, Depends, HTTPException, status
@@ -13,12 +14,15 @@ from app.services.generation_segments import SegmentDraft, SegmentValidationErro
 router = APIRouter(prefix="/api/projects/{project_id}/generation-segments", tags=["generation-segments"])
 
 
+BoundaryType = Literal["video_edge", "shot_boundary", "inside_shot"]
+
+
 class GenerationSegmentInput(BaseModel):
     model_config = ConfigDict(extra="forbid")
     source_start_sec: float = Field(ge=0)
     source_end_sec: float = Field(gt=0)
-    start_boundary_type: str
-    end_boundary_type: str
+    start_boundary_type: BoundaryType
+    end_boundary_type: BoundaryType
     short_segment_accepted: bool = False
 
 
@@ -27,17 +31,14 @@ class GenerationSegmentOutput(BaseModel):
     position: int
     source_start_sec: float
     source_end_sec: float
-    start_boundary_type: str
-    end_boundary_type: str
+    start_boundary_type: BoundaryType
+    end_boundary_type: BoundaryType
     short_segment_accepted: bool
-    clip_path: str | None = None
-    public_url: str | None = None
-    public_url_expires_at: str | None = None
 
 
 class GenerationSegmentPlanResponse(BaseModel):
     plan_version: int
-    timeline_revision_id: UUID
+    timeline_revision_id: UUID | None
     max_segment_seconds: float
     recommended_min_seconds: float
     segments: list[GenerationSegmentOutput]
@@ -54,19 +55,23 @@ def _current_timeline_revision(session: Session, project_id: UUID) -> TimelineRe
     )
 
 
-def _current_plan_version(session: Session, project_id: UUID) -> int:
+def _current_plan_version(session: Session, project_id: UUID, revision: TimelineRevision) -> int:
+    """当前方案必须是基于当前时间轴的方案，避免旧时间轴方案被当成当前方案。"""
     return session.scalar(
-        select(func.max(GenerationSegment.plan_version)).where(GenerationSegment.project_id == project_id)
+        select(func.max(GenerationSegment.plan_version)).where(
+            GenerationSegment.project_id == project_id,
+            GenerationSegment.source_timeline_revision_id == revision.id,
+        )
     ) or 0
 
 
 def _segment_output(segment: GenerationSegment) -> GenerationSegmentOutput:
+    # 传输元数据（本地裁切路径、临时公网 URL）仅属于 Worker 内部，不暴露给 API。
     return GenerationSegmentOutput(
         id=segment.id, position=segment.position,
         source_start_sec=segment.source_start_sec, source_end_sec=segment.source_end_sec,
         start_boundary_type=segment.start_boundary_type, end_boundary_type=segment.end_boundary_type,
         short_segment_accepted=segment.short_segment_accepted,
-        clip_path=segment.clip_path, public_url=segment.public_url, public_url_expires_at=segment.public_url_expires_at,
     )
 
 
@@ -106,7 +111,7 @@ def _validated_current_plan_context(session: Session, project_id: UUID) -> tuple
 def _persist_plan(session: Session, project_id: UUID, revision: TimelineRevision, drafts: list[SegmentDraft]) -> GenerationSegmentPlanResponse:
     """Lock the project row, bump plan_version, and persist one immutable plan."""
     session.execute(select(Project).where(Project.id == project_id).with_for_update())
-    plan_version = _current_plan_version(session, project_id) + 1
+    plan_version = _current_plan_version(session, project_id, revision) + 1
     rows = [
         GenerationSegment(
             project_id=project_id, plan_version=plan_version, position=index,
@@ -128,15 +133,15 @@ def get_generation_segments(project_id: UUID, session: Session = Depends(get_ses
         raise HTTPException(status_code=404, detail="项目不存在")
     revision = _current_timeline_revision(session, project_id)
     if revision is None:
-        # 无时间轴时返回空计划，前端显示自动规划入口。
+        # 无时间轴时返回空计划（timeline_revision_id 为 null），前端显示自动规划入口。
         settings = Settings()
         return GenerationSegmentPlanResponse(
-            plan_version=0, timeline_revision_id=UUID(int=0),
+            plan_version=0, timeline_revision_id=None,
             max_segment_seconds=settings.effective_segment_limit_seconds,
             recommended_min_seconds=settings.recommended_min_segment_seconds,
             segments=[],
         )
-    plan_version = _current_plan_version(session, project_id)
+    plan_version = _current_plan_version(session, project_id, revision)
     if plan_version == 0:
         return GenerationSegmentPlanResponse(
             plan_version=0, timeline_revision_id=revision.id,
@@ -148,6 +153,7 @@ def get_generation_segments(project_id: UUID, session: Session = Depends(get_ses
         select(GenerationSegment).where(
             GenerationSegment.project_id == project_id,
             GenerationSegment.plan_version == plan_version,
+            GenerationSegment.source_timeline_revision_id == revision.id,
         ).order_by(GenerationSegment.position)
     ))
     return _plan_response(session, project_id, revision, plan_version, segments)
@@ -166,10 +172,22 @@ def auto_plan_generation_segments(project_id: UUID, session: Session = Depends(g
     return _persist_plan(session, project_id, revision, drafts)
 
 
+def _validate_boundary_types(items: list[GenerationSegmentInput], duration_sec: float) -> None:
+    """相邻片段共享切点，前后类型必须一致；首尾必须是 video_edge。"""
+    if items[0].start_boundary_type != "video_edge":
+        raise HTTPException(status_code=422, detail="第一段起点必须是视频边缘")
+    if items[-1].end_boundary_type != "video_edge":
+        raise HTTPException(status_code=422, detail="最后一段终点必须是视频边缘")
+    for previous, current in zip(items, items[1:]):
+        if previous.end_boundary_type != current.start_boundary_type:
+            raise HTTPException(status_code=422, detail="相邻片段共享切点类型必须一致")
+
+
 @router.put("", response_model=GenerationSegmentPlanResponse, status_code=status.HTTP_201_CREATED)
 def save_manual_generation_segments(project_id: UUID, payload: GenerationSegmentPlanInput, session: Session = Depends(get_session)) -> GenerationSegmentPlanResponse:
     revision, _, duration_sec = _validated_current_plan_context(session, project_id)
     settings = Settings()
+    _validate_boundary_types(payload.segments, duration_sec)
     drafts = [
         SegmentDraft(
             start_sec=item.source_start_sec, end_sec=item.source_end_sec,
