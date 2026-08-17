@@ -41,7 +41,7 @@ def _consolidate_product_profiles(session, asset: Asset, settings: Settings) -> 
         metadata = load_structure(item)
         raw_profile = str(metadata.get("image_profile_text") or item.profile_text or "").strip()
         entries.append(
-            f"参考图{index}；角度={metadata.get('view_label') or '其他'}；"
+            f"参考图{index}；角度={metadata.get('display_name') or metadata.get('view_label') or '其他'}；"
             f"人工备注={metadata.get('note') or '无'}\n{raw_profile}"
         )
 
@@ -135,7 +135,7 @@ def execute_profile_job(session, job: Job, settings: Settings | None = None) -> 
         annotation = ""
         if asset.kind in {"product_reference_image", "target_product_reference_image"}:
             annotation = (
-                f"\n用户标注：本图角度={metadata.get('view_label') or '其他'}；"
+                f"\n用户标注：本图角度={metadata.get('display_name') or metadata.get('view_label') or '其他'}；"
                 f"单图备注={metadata.get('note') or '无'}；"
                 f"产品名称={metadata.get('product_name') or '未填写'}；"
                 f"用户提供的产品卖点={metadata.get('selling_points') or '未填写'}。"

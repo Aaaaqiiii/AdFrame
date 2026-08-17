@@ -417,7 +417,7 @@ def _combined_reference_profile(assets: list[Asset]) -> str | None:
     facts = []
     for index, item in enumerate(profiled, 1):
         metadata = load_structure(item)
-        label = str(metadata.get("view_label") or "其他")
+        label = str(metadata.get("display_name") or metadata.get("view_label") or "其他")
         note = str(metadata.get("note") or "").strip()
         annotation = f"；人工备注：{note}" if note else ""
         facts.append(f"参考图 {index}（{label}{annotation}）：\n{item.profile_text.strip()}")
@@ -594,6 +594,7 @@ def upload_reference_image(
     consent: bool = False,
     file: UploadFile = File(...),
     view_label: str = Form(default="other"),
+    display_name: str = Form(default="", max_length=40),
     note: str = Form(default=""),
     product_name: str = Form(default=""),
     selling_points: str = Form(default=""),
@@ -627,6 +628,7 @@ def upload_reference_image(
             raise HTTPException(status_code=422, detail="未知的产品图片角度")
         metadata = {
             "view_label": view_label,
+            "display_name": display_name.strip(),
             "note": note.strip()[:1000],
             "product_name": product_name.strip()[:200],
             "selling_points": selling_points.strip()[:3000],

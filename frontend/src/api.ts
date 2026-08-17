@@ -63,7 +63,7 @@ export type Project = {
   person_analysis_error?: string | null
   background_reference_image_name?: string | null
   product_reference_image_name?: string | null
-  product_reference_images?: Array<{ id: string; filename: string; image_url: string; status: AnalysisState; view_label: string; note: string }>
+  product_reference_images?: Array<{ id: string; filename: string; image_url: string; status: AnalysisState; view_label: string; display_name: string; note: string }>
   product_profile?: string | null
   product_analysis_status?: AnalysisState | null
   product_analysis_error?: string | null
@@ -71,7 +71,7 @@ export type Project = {
   product_selling_points?: string
   product_profile_confirmed?: boolean
   target_product_reference_image_name?: string | null
-  target_product_reference_images?: Array<{ id: string; filename: string; image_url: string; status: AnalysisState; view_label: string; note: string }>
+  target_product_reference_images?: Array<{ id: string; filename: string; image_url: string; status: AnalysisState; view_label: string; display_name: string; note: string }>
   target_product_profile?: string | null
   target_product_analysis_status?: AnalysisState | null
   target_product_analysis_error?: string | null
@@ -170,10 +170,13 @@ export function uploadReferenceVideo(projectId: string, file: File) {
   const body = new FormData(); body.append('file', file)
   return request<{ filename?: string; asset_kind?: string; job_kind?: string }>(`/api/projects/${projectId}/reference-video`, { method: 'POST', body })
 }
-export function uploadReferenceImage(projectId: string, kind: AssetKind, file: File, consent = false, metadata?: { view_label: string; note: string; product_name: string; selling_points: string }) {
+export function uploadReferenceImage(projectId: string, kind: AssetKind, file: File, consent = false, metadata?: { view_label: string; display_name: string; note: string; product_name: string; selling_points: string }) {
   const body = new FormData(); body.append('file', file)
   if (metadata) Object.entries(metadata).forEach(([key, value]) => body.append(key, value))
   return request<{ asset_id: string; filename: string; job_id?: string; status?: AnalysisState; analysis_status?: AnalysisState }>(`/api/projects/${projectId}/reference-images/${kind}?consent=${consent}`, { method: 'POST', body })
+}
+export function updateProductReferenceImage(projectId: string, kind: 'product' | 'target_product', assetId: string, payload: { view_label: string; display_name: string }) {
+  return request<{ id: string; filename: string; image_url: string; status: AnalysisState; view_label: string; display_name: string; note: string }>(`/api/projects/${projectId}/reference-images/${kind}/${assetId}`, { method: 'PATCH', ...json({ ...payload, display_name: payload.display_name.trim() }) })
 }
 export function analyzeReferenceImage(projectId: string, kind: AssetKind) {
   return request<{ job_id?: string; status: AnalysisState; profile?: string }>(`/api/projects/${projectId}/reference-images/${kind}/analyze`, { method: 'POST' })

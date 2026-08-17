@@ -90,7 +90,7 @@ button, .button { border: 0; font: inherit; cursor: pointer; }
 .product-reference-card { grid-column: 1 / -1; }
 .product-basics { margin: 14px 0; display: grid; grid-template-columns: minmax(220px, .7fr) minmax(320px, 1.3fr); gap: 12px; }
 .product-basics label { display: grid; gap: 7px; color: var(--muted); font-size: 11px; }
-.product-basics input, .product-basics textarea, .product-image-cards select, .product-image-cards textarea { width: 100%; padding: 10px; border: 1px solid var(--line-strong); border-radius: 8px; background: white; color: var(--ink); font: inherit; }
+.product-basics input, .product-basics textarea, .product-image-cards input, .product-image-cards select, .product-image-cards textarea { width: 100%; padding: 10px; border: 1px solid var(--line-strong); border-radius: 8px; background: white; color: var(--ink); font: inherit; }
 .product-basics textarea { min-height: 74px; resize: vertical; }
 .product-image-cards { margin: 12px 0; display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 10px; }
 .product-image-cards section { min-width: 0; padding: 10px; display: grid; grid-template-columns: 92px minmax(0, 1fr); gap: 10px; border: 1px solid var(--line); border-radius: 10px; background: white; }
@@ -99,6 +99,11 @@ button, .button { border: 0; font: inherit; cursor: pointer; }
 .product-image-cards small, .product-image-cards p { overflow-wrap: anywhere; color: var(--subtle); font-size: 9px; line-height: 1.45; }
 .product-image-cards textarea { min-height: 58px; resize: vertical; font-size: 10px; }
 .product-image-cards button { justify-self: start; color: var(--danger); font-size: 9px; font-weight: 700; }
+.product-image-cards.stored .image-name { display: flex; align-items: baseline; gap: 7px; color: var(--ink); text-align: left; }
+.product-image-cards.stored .image-name small { color: var(--accent-dark); white-space: nowrap; }
+.image-name-editor { display: grid; gap: 6px; }
+.image-name-editor span { display: flex; gap: 10px; }
+.image-name-editor button:first-child { color: var(--accent-dark); }
 .product-drop { min-height: 92px; }
 .product-fact-summary { margin-top: 18px; padding-top: 16px; display: grid; gap: 10px; border-top: 1px solid var(--line); }
 .product-fact-summary > header, .product-fact-summary > footer { display: flex; align-items: center; justify-content: space-between; gap: 10px; }

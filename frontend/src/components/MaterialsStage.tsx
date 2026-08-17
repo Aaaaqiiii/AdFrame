@@ -14,6 +14,7 @@ type Props = {
   onVideo: (file: File) => void
   onImage: (kind: AssetKind, file: File) => void
   onProductImages: (items: ProductImageUpload[], productName: string, sellingPoints: string) => Promise<boolean>
+  onProductImageRename: (imageId: string, viewLabel: string, displayName: string) => Promise<boolean>
   onProductName: (value: string) => void
   onProductSellingPoints: (value: string) => void
   onProductProfileSave: (confirmed: boolean) => void
@@ -28,7 +29,7 @@ type Props = {
 export function MaterialsStage(p: Props) {
   const productTitle = p.mode === 'replace_product' ? '目标产品图' : '原产品辅助图'
   const productCard = p.mode === 'replace_product'
-    ? <ProductReferenceCard productName={p.productIdentity.name} sellingPoints={p.productIdentity.sellingPoints} images={p.materials.product.images} status={p.materials.product.status} error={p.materials.product.error} profile={p.materials.product.profile} confirmed={p.productIdentity.confirmed} onProductName={p.onProductName} onSellingPoints={p.onProductSellingPoints} onUpload={p.onProductImages} onProfile={(value) => p.onProfile('product', value)} onSave={p.onProductProfileSave} onRetry={() => p.onRetry('product')} />
+    ? <ProductReferenceCard productName={p.productIdentity.name} sellingPoints={p.productIdentity.sellingPoints} images={p.materials.product.images} status={p.materials.product.status} error={p.materials.product.error} profile={p.materials.product.profile} confirmed={p.productIdentity.confirmed} onProductName={p.onProductName} onSellingPoints={p.onProductSellingPoints} onUpload={p.onProductImages} onRename={p.onProductImageRename} onProfile={(value) => p.onProfile('product', value)} onSave={p.onProductProfileSave} onRetry={() => p.onRetry('product')} />
     : <AssetCard title={productTitle} description="辅助核对原视频里的产品，不会自动作为生成参考图。" filename={p.materials.product.filename} previewUrl={p.materials.product.previewUrl} images={p.materials.product.images} accept="image/jpeg,image/png,image/webp" status={p.materials.product.status} error={p.materials.product.error} profile={p.materials.product.profile} onFile={(file) => p.onImage('product', file)} onRetry={() => p.onRetry('product')} onProfile={(value) => p.onProfile('product', value)} onSaveProfile={() => p.onSaveProfile('product')} />
   const videoCard = <AssetCard title="参考视频" required description="先在本地切分镜头；人工确认边界后才启动豆包和 GPT 逐镜理解。" filename={p.video.filename} previewUrl={p.video.previewUrl} accept="video/mp4,video/quicktime,video/webm" uploading={p.video.uploading} onFile={p.onVideo} />
   return <section className="stage-content">

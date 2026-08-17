@@ -195,6 +195,7 @@ def test_product_image_display_name_is_persisted_without_reanalysis() -> None:
     assert response.json()["display_name"] == "瓶身正面"
     details = client.get(f"/api/projects/{project['id']}").json()
     assert details["product_reference_images"][0]["display_name"] == "瓶身正面"
+    assert "参考图 1（瓶身正面" in details["product_profile"]
     with SessionLocal() as session:
         saved = session.get(Asset, UUID(asset_id))
         assert saved is not None and saved.analysis_status == "succeeded"

@@ -25,6 +25,7 @@ import {
   testServiceConnection,
   startAnalysis,
   updateReferenceProfile,
+  updateProductReferenceImage,
   uploadReferenceImage,
   uploadReferenceVideo,
 } from './api'
@@ -155,10 +156,10 @@ function App() {
     setProjectName(project.name)
     setVideo({ filename: project.reference_video_name || '', previewUrl: project.reference_video_url ? mediaUrl(project.reference_video_url) : '', uploading: false })
     setMaterials((current) => ({
-      product: { ...current.product, filename: project.product_reference_image_name || '', previewUrl: project.product_reference_image_name ? referenceImageUrl(project.id, 'product') : '', images: (project.product_reference_images || []).map((item) => ({ id: item.id, filename: item.filename, previewUrl: referenceImageAssetUrl(item.image_url), viewLabel: item.view_label || 'other', note: item.note || '' })), status: project.product_analysis_status || 'pending', profile: project.product_profile || '', error: project.product_analysis_error || '' },
-      target_product: { ...current.target_product, filename: project.target_product_reference_image_name || '', previewUrl: project.target_product_reference_image_name ? referenceImageUrl(project.id, 'target_product') : '', images: (project.target_product_reference_images || []).map((item) => ({ id: item.id, filename: item.filename, previewUrl: referenceImageAssetUrl(item.image_url), viewLabel: item.view_label || 'other', note: item.note || '' })), status: project.target_product_analysis_status || 'pending', profile: project.target_product_profile || '', error: project.target_product_analysis_error || '' },
-      person: { ...current.person, filename: project.person_reference_image_name || '', previewUrl: project.person_reference_image_name ? referenceImageUrl(project.id, 'person') : '', images: project.person_reference_image_name ? [{ filename: project.person_reference_image_name, previewUrl: referenceImageUrl(project.id, 'person'), viewLabel: 'other', note: '' }] : [], status: project.person_analysis_status || 'pending', profile: project.person_profile || '', error: project.person_analysis_error || '' },
-      background: { ...current.background, filename: project.background_reference_image_name || '', previewUrl: project.background_reference_image_name ? referenceImageUrl(project.id, 'background') : '', images: project.background_reference_image_name ? [{ filename: project.background_reference_image_name, previewUrl: referenceImageUrl(project.id, 'background'), viewLabel: 'other', note: '' }] : [] },
+      product: { ...current.product, filename: project.product_reference_image_name || '', previewUrl: project.product_reference_image_name ? referenceImageUrl(project.id, 'product') : '', images: (project.product_reference_images || []).map((item) => ({ id: item.id, filename: item.filename, previewUrl: referenceImageAssetUrl(item.image_url), viewLabel: item.view_label || 'other', displayName: item.display_name || '', note: item.note || '' })), status: project.product_analysis_status || 'pending', profile: project.product_profile || '', error: project.product_analysis_error || '' },
+      target_product: { ...current.target_product, filename: project.target_product_reference_image_name || '', previewUrl: project.target_product_reference_image_name ? referenceImageUrl(project.id, 'target_product') : '', images: (project.target_product_reference_images || []).map((item) => ({ id: item.id, filename: item.filename, previewUrl: referenceImageAssetUrl(item.image_url), viewLabel: item.view_label || 'other', displayName: item.display_name || '', note: item.note || '' })), status: project.target_product_analysis_status || 'pending', profile: project.target_product_profile || '', error: project.target_product_analysis_error || '' },
+      person: { ...current.person, filename: project.person_reference_image_name || '', previewUrl: project.person_reference_image_name ? referenceImageUrl(project.id, 'person') : '', images: project.person_reference_image_name ? [{ filename: project.person_reference_image_name, previewUrl: referenceImageUrl(project.id, 'person'), viewLabel: 'other', displayName: '', note: '' }] : [], status: project.person_analysis_status || 'pending', profile: project.person_profile || '', error: project.person_analysis_error || '' },
+      background: { ...current.background, filename: project.background_reference_image_name || '', previewUrl: project.background_reference_image_name ? referenceImageUrl(project.id, 'background') : '', images: project.background_reference_image_name ? [{ filename: project.background_reference_image_name, previewUrl: referenceImageUrl(project.id, 'background'), viewLabel: 'other', displayName: '', note: '' }] : [] },
     }))
     setProductIdentity({ name: project.product_name || '', sellingPoints: project.product_selling_points || '', confirmed: Boolean(project.product_profile_confirmed) })
     if (project.prompt_visual_direction) setPromptDirection(project.prompt_visual_direction)
@@ -313,7 +314,7 @@ function App() {
       const id = await ensureProject()
       const result = await uploadReferenceImage(id, kind, file, kind === 'person')
       const previewUrl = URL.createObjectURL(file)
-      const image = { id: result.asset_id, filename: file.name, previewUrl, viewLabel: 'other', note: '' }
+      const image = { id: result.asset_id, filename: file.name, previewUrl, viewLabel: 'other', displayName: '', note: '' }
       setMaterials((old) => ({ ...old, [kind]: { filename: file.name, previewUrl, images: append ? [...old[kind].images, image] : [image], status: result.analysis_status || result.status || 'queued', profile: '', error: '' } }))
       setNotice(`${kind === 'product' ? '原产品' : kind === 'target_product' ? '目标产品' : kind === 'person' ? '人物' : '背景'}图片已上传，AI 正在生成可编辑文字档案。`)
       return true
@@ -328,9 +329,9 @@ function App() {
     let uploaded = 0
     for (const item of items) {
       try {
-        const result = await uploadReferenceImage(id, 'product', item.file, false, { view_label: item.viewLabel, note: item.note, product_name: productName, selling_points: sellingPoints })
+        const result = await uploadReferenceImage(id, 'product', item.file, false, { view_label: item.viewLabel, display_name: item.displayName.trim(), note: item.note, product_name: productName, selling_points: sellingPoints })
         const previewUrl = URL.createObjectURL(item.file)
-        setMaterials((old) => ({ ...old, product: { ...old.product, filename: item.file.name, previewUrl, images: [...old.product.images, { id: result.asset_id, filename: item.file.name, previewUrl, viewLabel: item.viewLabel, note: item.note }], status: result.analysis_status || result.status || 'queued', profile: '', error: '' } }))
+        setMaterials((old) => ({ ...old, product: { ...old.product, filename: item.file.name, previewUrl, images: [...old.product.images, { id: result.asset_id, filename: item.file.name, previewUrl, viewLabel: item.viewLabel, displayName: item.displayName.trim(), note: item.note }], status: result.analysis_status || result.status || 'queued', profile: '', error: '' } }))
         uploaded += 1
       } catch (error) { setNotice(`产品图“${item.file.name}”上传失败：${errorMessage(error)}`) }
     }
@@ -339,6 +340,16 @@ function App() {
       setNotice(`已上传 ${uploaded} 张目标产品图，AI 正在根据角度和备注生成产品事实。`)
     }
     return uploaded === items.length
+  }
+
+  async function renameProductImage(imageId: string, viewLabel: string, displayName: string) {
+    if (!projectId) return false
+    try {
+      const saved = await updateProductReferenceImage(projectId, 'product', imageId, { view_label: viewLabel, display_name: displayName })
+      setMaterials((old) => ({ ...old, product: { ...old.product, images: old.product.images.map((image) => image.id === imageId ? { ...image, viewLabel: saved.view_label, displayName: saved.display_name } : image) } }))
+      setNotice(`图片名称已保存为“${saved.display_name}”。`)
+      return true
+    } catch (error) { setNotice(`保存图片名称失败：${errorMessage(error)}`); return false }
   }
 
   async function retryProfile(kind: AssetKind) {
@@ -600,7 +611,7 @@ function App() {
     <div className="workflow-shell">
       <WorkflowRail active={stage} unlocked={unlocked} onSelect={setStage} />
       <div className="stage-host">
-        {stage === 'materials' && <MaterialsStage mode={MODE} video={video} materials={materials} productIdentity={productIdentity} onVideo={(file) => void uploadVideo(file)} onImage={(kind, file) => void uploadImage(kind, file)} onProductImages={uploadProducts} onProductName={(name) => setProductIdentity((current) => ({ ...current, name, confirmed: false }))} onProductSellingPoints={(sellingPoints) => setProductIdentity((current) => ({ ...current, sellingPoints, confirmed: false }))} onProductProfileSave={(confirmed) => void saveProductProfile(confirmed)} onRetry={(kind) => void retryProfile(kind)} onProfile={(kind, profile) => { setMaterials((old) => ({ ...old, [kind]: { ...old[kind], profile } })); if (kind === 'product') setProductIdentity((current) => ({ ...current, confirmed: false })) }} onSaveProfile={(kind) => void saveProfile(kind)} onContinue={() => void startGlobalFlow()} ready={materialsReady} blockingReason={materialsBlockingReason} />}
+        {stage === 'materials' && <MaterialsStage mode={MODE} video={video} materials={materials} productIdentity={productIdentity} onVideo={(file) => void uploadVideo(file)} onImage={(kind, file) => void uploadImage(kind, file)} onProductImages={uploadProducts} onProductImageRename={renameProductImage} onProductName={(name) => setProductIdentity((current) => ({ ...current, name, confirmed: false }))} onProductSellingPoints={(sellingPoints) => setProductIdentity((current) => ({ ...current, sellingPoints, confirmed: false }))} onProductProfileSave={(confirmed) => void saveProductProfile(confirmed)} onRetry={(kind) => void retryProfile(kind)} onProfile={(kind, profile) => { setMaterials((old) => ({ ...old, [kind]: { ...old[kind], profile } })); if (kind === 'product') setProductIdentity((current) => ({ ...current, confirmed: false })) }} onSaveProfile={(kind) => void saveProfile(kind)} onContinue={() => void startGlobalFlow()} ready={materialsReady} blockingReason={materialsBlockingReason} />}
         {stage === 'analysis' && <AnalysisStage shots={shots} jobs={jobs} onOpenShots={() => { if (!projectId) return; void restoreProject(projectId).then(() => setStage('shots')).catch((error) => setNotice(`读取分镜事实失败：${errorMessage(error)}`)) }} />}
         {stage === 'timeline' && timeline && <TimelineEditor videoUrl={video.previewUrl} videoRatio={videoRatio} videoRef={videoRef} shots={shots} selectedIds={selectedIds} selectedBoundary={selectedBoundary} playhead={playhead} fps={fps} dirty={timelineDirty} saving={timelineSaving} canContinue={timelineConfirmed} onMetadata={(width, height) => { setVideoRatio(`${width} / ${height}`); const element = videoRef.current; if (element && Number.isFinite(element.duration) && element.duration > 0) setFps(25) }} onPlayhead={seekTimeline} onSelectShot={selectTimelineShot} onSelectBoundary={setSelectedBoundary} onMoveBoundary={moveTimelineBoundary} onSplit={splitAtPlayhead} onMerge={mergeSelected} onRestore={() => void restoreAi()} onSave={() => void saveHumanTimeline()} onContinue={() => void beginShotAnalysis()} />}
         {stage === 'shots' && <ShotWorkspace shots={shots} selectedId={selectedShotId} jobs={jobs} edit={shotEdit} saving={shotSaving} mode={MODE} compatibility={null} onSelect={setSelectedShotId} onEdit={setShotEdit} onSave={(confirmed) => void saveCurrentShot(confirmed)} onAdoptAI={(id) => void adoptLatestAI(id)} onRetry={(id) => {
