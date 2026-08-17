@@ -6,7 +6,7 @@ import requests
 from fastapi.testclient import TestClient
 from sqlalchemy import select
 
-from app.db.models import Asset, PromptRevision
+from app.db.models import Asset, Job, PromptRevision
 from app.db.session import SessionLocal
 from app.main import create_app
 from app.services.final_prompt import generate_final_prompt, refine_prompt
@@ -166,6 +166,53 @@ def test_page_two_collects_product_images_and_forces_replacement() -> None:
             PromptRevision.project_id == UUID(project["id"]),
         ).order_by(PromptRevision.version.desc()))
         assert revision is not None and revision.replace_product is True
+
+
+def test_product_image_display_name_is_persisted_without_reanalysis() -> None:
+    """修改单张产品图名称不得重跑分析，并且刷新项目后必须恢复。"""
+    client = TestClient(create_app())
+    project = client.post("/api/projects", json={"name": "image labels", "mode": "replace_product"}).json()
+    other_project = client.post("/api/projects", json={"name": "other project", "mode": "replace_product"}).json()
+    with SessionLocal() as session:
+        asset = Asset(
+            project_id=UUID(project["id"]), kind="product_reference_image",
+            original_path="unused-front.png", original_filename="front.png",
+            analysis_status="succeeded", profile_text="已完成的图片事实",
+            profile_json='{"view_label":"other","note":"保留备注"}',
+        )
+        session.add(asset)
+        session.commit()
+        asset_id = str(asset.id)
+        jobs_before = len(session.scalars(select(Job).where(Job.project_id == UUID(project["id"]))).all())
+
+    response = client.patch(
+        f"/api/projects/{project['id']}/reference-images/product/{asset_id}",
+        json={"view_label": "front", "display_name": "  瓶身正面  "},
+    )
+
+    assert response.status_code == 200
+    assert response.json()["view_label"] == "front"
+    assert response.json()["display_name"] == "瓶身正面"
+    details = client.get(f"/api/projects/{project['id']}").json()
+    assert details["product_reference_images"][0]["display_name"] == "瓶身正面"
+    with SessionLocal() as session:
+        saved = session.get(Asset, UUID(asset_id))
+        assert saved is not None and saved.analysis_status == "succeeded"
+        assert load_structure(saved)["note"] == "保留备注"
+        assert len(session.scalars(select(Job).where(Job.project_id == UUID(project["id"]))).all()) == jobs_before
+
+    assert client.patch(
+        f"/api/projects/{project['id']}/reference-images/product/{asset_id}",
+        json={"view_label": "front", "display_name": "   "},
+    ).status_code == 422
+    assert client.patch(
+        f"/api/projects/{project['id']}/reference-images/product/{asset_id}",
+        json={"view_label": "front", "display_name": "超" * 41},
+    ).status_code == 422
+    assert client.patch(
+        f"/api/projects/{other_project['id']}/reference-images/product/{asset_id}",
+        json={"view_label": "front", "display_name": "其他项目图片"},
+    ).status_code == 404
 
 
 def test_multiple_product_images_generate_one_background_summary() -> None:

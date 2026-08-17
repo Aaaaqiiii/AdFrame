@@ -47,7 +47,13 @@ class ReferenceImageDetails(BaseModel):
     image_url: str
     status: str
     view_label: str = "other"
+    display_name: str = ""
     note: str = ""
+
+
+class UpdateReferenceImageRequest(BaseModel):
+    view_label: str
+    display_name: str = Field(min_length=1, max_length=40)
 
 
 @router.get("", response_model=list[ProjectListResponse])
@@ -326,6 +332,7 @@ def get_project(project_id: UUID, session: Session = Depends(get_session)) -> Pr
             image_url=f"/api/projects/{project_id}/reference-images/product/content/{item.id}",
             status=_api_analysis_status(item.analysis_status),
             view_label=str(load_structure(item).get("view_label") or "other"),
+            display_name=str(load_structure(item).get("display_name") or ""),
             note=str(load_structure(item).get("note") or ""),
         ) for item in product_assets],
         product_profile=_combined_reference_profile(product_assets),
@@ -341,6 +348,7 @@ def get_project(project_id: UUID, session: Session = Depends(get_session)) -> Pr
             image_url=f"/api/projects/{project_id}/reference-images/target_product/content/{item.id}",
             status=_api_analysis_status(item.analysis_status),
             view_label=str(load_structure(item).get("view_label") or "other"),
+            display_name=str(load_structure(item).get("display_name") or ""),
             note=str(load_structure(item).get("note") or ""),
         ) for item in target_product_assets],
         target_product_profile=_combined_reference_profile(target_product_assets),
@@ -485,6 +493,39 @@ def get_reference_image_asset_content(project_id: UUID, reference_kind: str, ass
     if not path.is_file():
         raise HTTPException(status_code=404, detail="参考图片文件不存在")
     return FileResponse(path, media_type=asset.content_type or mimetypes.guess_type(path.name)[0] or "image/jpeg", filename=asset.original_filename or path.name)
+
+
+@router.patch("/{project_id}/reference-images/{reference_kind}/{asset_id}", response_model=ReferenceImageDetails)
+def update_reference_image(
+    project_id: UUID,
+    reference_kind: str,
+    asset_id: UUID,
+    payload: UpdateReferenceImageRequest,
+    session: Session = Depends(get_session),
+) -> ReferenceImageDetails:
+    if reference_kind not in {"product", "target_product"}:
+        raise HTTPException(status_code=422, detail="只能修改产品图片名称")
+    if payload.view_label not in PRODUCT_VIEW_LABELS:
+        raise HTTPException(status_code=422, detail="未知的产品图片角度")
+    display_name = payload.display_name.strip()
+    if not display_name:
+        raise HTTPException(status_code=422, detail="图片名称不能为空")
+    asset = session.get(Asset, asset_id)
+    if asset is None or asset.project_id != project_id or asset.kind != _asset_kind(reference_kind):
+        raise HTTPException(status_code=404, detail="参考图片不存在")
+    metadata = load_structure(asset)
+    metadata.update({"view_label": payload.view_label, "display_name": display_name})
+    asset.profile_json = json.dumps(metadata, ensure_ascii=False)
+    session.commit()
+    return ReferenceImageDetails(
+        id=asset.id,
+        filename=asset.original_filename or Path(asset.original_path).name,
+        image_url=f"/api/projects/{project_id}/reference-images/{reference_kind}/content/{asset.id}",
+        status=_api_analysis_status(asset.analysis_status),
+        view_label=payload.view_label,
+        display_name=display_name,
+        note=str(metadata.get("note") or ""),
+    )
 
 
 @router.get("/{project_id}/evidence/{evidence_id}/content")
