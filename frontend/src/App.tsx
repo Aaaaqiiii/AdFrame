@@ -571,7 +571,7 @@ function App() {
 
   async function finishSettingsSave(result: SettingsSaveResult, clear: () => void) {
     clear()
-    const service = result.service || (comflyKey ? 'comfly_generation' : volcengineKey ? 'volcengine_generation' : 'volcengine_vision')
+    const service = result.service || (comflyKey ? 'comfly_prompt' : volcengineKey ? 'volcengine_generation' : 'volcengine_vision')
     const connection = result.connection || await testServiceConnection(service)
     setConnectionChecks((old) => ({ ...old, [service]: connection }))
     setPreflight(await getPreflight())

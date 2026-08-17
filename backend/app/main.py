@@ -25,7 +25,9 @@ class LocalSettingsUpdate(BaseModel):
 
 SETTING_GROUPS = {
     "volcengine_generation": {"VOLCENGINE_API_KEY"},
-    "comfly_generation": {"COMFLY_API_KEY"},
+    # 保存 Comfly Key 时默认验证 GPT Chat Completions（提示词/关键帧理解实际端点）。
+    "comfly_prompt": {"COMFLY_API_KEY"},
+    "comfly_generation": set(),
     "volcengine_vision": {"VOLCENGINE_ACCESS_KEY", "VOLCENGINE_SECRET_KEY", "VOLCENGINE_VOD_SPACE"},
 }
 
@@ -68,6 +70,11 @@ def create_app() -> FastAPI:
                 "ready": bool(current.comfly_api_key),
                 "model": current.comfly_seedance_model,
                 "endpoint": current.comfly_base_url + current.comfly_seedance_task_path,
+            },
+            "comfly_prompt": {
+                "ready": bool(current.comfly_api_key),
+                "model": current.comfly_vision_model,
+                "endpoint": current.comfly_vision_base_url + "/v1/chat/completions",
             },
             "storyboard_vision": {
                 # 逐镜链路必须同时具备豆包完整片段理解和 GPT 关键帧理解。
