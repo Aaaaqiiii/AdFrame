@@ -3,7 +3,7 @@ from __future__ import annotations
 from uuid import UUID, uuid4
 from datetime import datetime, timezone
 
-from sqlalchemy import Float, ForeignKey, Integer, String, Text, UniqueConstraint
+from sqlalchemy import Float, ForeignKey, Index, Integer, String, Text, UniqueConstraint
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from app.db.base import Base
@@ -27,7 +27,12 @@ class Project(Base):
 
 class Generation(Base):
     __tablename__ = "generations"
-    __table_args__ = (UniqueConstraint("project_id", "version"),)
+    __table_args__ = (
+        UniqueConstraint("project_id", "version"),
+        Index("ix_generations_project_status", "project_id", "status"),
+        Index("ix_generations_status_next_attempt", "status", "next_attempt_at"),
+        Index("ix_generations_submission_fingerprint", "submission_fingerprint"),
+    )
 
     id: Mapped[UUID] = mapped_column(primary_key=True, default=uuid4)
     project_id: Mapped[UUID] = mapped_column(ForeignKey("projects.id"))
@@ -48,6 +53,11 @@ class Generation(Base):
     leased_by: Mapped[str | None] = mapped_column(String(100), nullable=True)
     created_at: Mapped[datetime] = mapped_column(default=lambda: datetime.now(timezone.utc))
     result_path: Mapped[str | None] = mapped_column(String(500), nullable=True)
+    request_snapshot: Mapped[str | None] = mapped_column(Text, nullable=True)
+    reference_asset_ids: Mapped[str | None] = mapped_column(Text, nullable=True)
+    provider_response_summary: Mapped[str | None] = mapped_column(Text, nullable=True)
+    submission_fingerprint: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    completed_at: Mapped[datetime | None] = mapped_column(nullable=True)
     project: Mapped[Project] = relationship(back_populates="generations")
 
 

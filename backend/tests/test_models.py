@@ -30,6 +30,16 @@ def test_asset_and_pending_job_belong_to_project() -> None:
     assert project.jobs == [job]
 
 
+def test_generation_has_recovery_snapshot_fields() -> None:
+    columns = Generation.__table__.columns
+    assert {"request_snapshot", "reference_asset_ids", "provider_response_summary", "submission_fingerprint", "completed_at"} <= set(columns.keys())
+    assert {tuple(index.columns.keys()) for index in Generation.__table__.indexes} >= {
+        ("project_id", "status"),
+        ("status", "next_attempt_at"),
+        ("submission_fingerprint",),
+    }
+
+
 def test_shot_fact_fields_keep_observations_separate_from_inferences() -> None:
     project = Project(name="事实时间轴")
     revision = TimelineRevision(project=project, version=1, source="ai")
