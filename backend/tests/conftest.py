@@ -13,6 +13,10 @@ os.environ["DATABASE_URL"] = f"sqlite:///{test_database.as_posix()}"
 test_media = Path(__file__).resolve().parent / ".test-media"
 os.environ["MEDIA_ROOT"] = str(test_media)
 
+from app.db.base import Base
+from app.db import models  # noqa: F401
+from app.db.session import engine
+
 
 def _tool_runs(name: str) -> bool:
     executable = shutil.which(name)
@@ -38,10 +42,12 @@ def pytest_collection_modifyitems(items) -> None:
             item.add_marker(marker)
 
 
+def pytest_sessionstart(session) -> None:
+    Base.metadata.create_all(engine)
+
+
 def pytest_sessionfinish() -> None:
     # Windows 必须先释放 SQLite 连接，才能可靠删除测试库；正式库从不在此路径中。
-    from app.db.session import engine
-
     engine.dispose()
     test_database.unlink(missing_ok=True)
     shutil.rmtree(test_media, ignore_errors=True)

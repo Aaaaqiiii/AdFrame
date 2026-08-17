@@ -7,7 +7,7 @@ from app.api.routes.projects import router as projects_router
 from app.api.routes.timeline import router as timeline_router
 from app.api.routes.analysis import router as analysis_router
 from app.api.routes.generations import router as generations_router
-from app.db.session import create_schema
+from app.db.migrations import require_database_at_head
 from app.core.config import Settings
 from app.core.license import LicenseError, verify_license
 from app.core.logging import configure_logging
@@ -38,7 +38,7 @@ def create_app() -> FastAPI:
             verify_license(settings.app_license_path, settings.app_license_public_key_path)
         except (OSError, LicenseError) as exc:
             raise RuntimeError("AdFlow licence verification failed") from exc
-    create_schema()
+    require_database_at_head()
     app = FastAPI(title="AdFlow API")
     app.add_middleware(
         CORSMiddleware,

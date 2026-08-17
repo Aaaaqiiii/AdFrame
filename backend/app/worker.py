@@ -11,7 +11,8 @@ from sqlalchemy import or_, select
 
 from app.core.config import Settings
 from app.db.models import Generation, Job
-from app.db.session import SessionLocal, create_schema
+from app.db.migrations import require_database_at_head
+from app.db.session import SessionLocal
 from app.services.generation_jobs import execute_generation_job
 from app.services.seedance import JsonTaskGateway, build_seedance_request
 from app.services.comfly_frame_vision import ComflyFrameVisionGateway
@@ -128,7 +129,7 @@ def run_once() -> int:
 
 
 def main() -> None:
-    create_schema()
+    require_database_at_head()
     settings = Settings()
     lock_path = settings.media_root / ".adflow-worker.lock"
     lock_path.parent.mkdir(parents=True, exist_ok=True)
