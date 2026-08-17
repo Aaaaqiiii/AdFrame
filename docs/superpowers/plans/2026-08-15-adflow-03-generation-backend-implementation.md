@@ -200,7 +200,7 @@ def _ready_project(client, tmp_path, mode="preserve_product", replace_person=Fal
 - Consumes: `Generation` ORM rows.
 - Produces: `generation_response()` used by create, list, detail, retry and resolve routes.
 
-- [ ] **Step 1: Write failing list/detail response tests**
+- [x] **Step 1: Write failing list/detail response tests**
 
 ```python
 def test_generation_list_is_version_descending_and_builds_local_url(client, generation_factory, tmp_path) -> None:
@@ -222,7 +222,7 @@ def test_generation_detail_builds_local_url_instead_of_returning_raw_orm(client,
     assert body["local_video_url"].endswith(f"/{generation.id}/content")
 ```
 
-- [ ] **Step 2: Run the tests**
+- [x] **Step 2: Run the tests**
 
 ```powershell
 Set-Location E:\工具-商用\backend
@@ -231,7 +231,7 @@ python -m pytest tests/test_generations_api.py -k "list or detail" -q
 
 Expected: FAIL because list is missing and detail does not populate `local_video_url`.
 
-- [ ] **Step 3: Define the response model and single constructor**
+- [x] **Step 3: Define the response model and single constructor**
 
 ```python
 class GenerationResponse(BaseModel):
@@ -275,7 +275,7 @@ def generation_response(project_id: UUID, generation: Generation) -> GenerationR
 
 Add `GET ""` ordered by `Generation.version.desc()` and make `GET /{generation_id}` return `generation_response()`.
 
-- [ ] **Step 4: Run response tests**
+- [x] **Step 4: Run response tests**
 
 ```powershell
 python -m pytest tests/test_generations_api.py -k "list or detail" -q
@@ -283,7 +283,7 @@ python -m pytest tests/test_generations_api.py -k "list or detail" -q
 
 Expected: PASS.
 
-- [ ] **Step 5: Commit response consistency**
+- [x] **Step 5: Commit response consistency**
 
 ```powershell
 git add backend/app/api/routes/generations.py backend/tests/conftest.py backend/tests/test_generations_api.py
@@ -301,7 +301,7 @@ git commit -m "feat: expose generation history consistently"
 - Consumes: `CreateGenerationRequest(provider, prompt_version, generate_audio, include_person_reference, include_background_reference)`.
 - Produces: queued `Generation` with `reference_asset_ids`, `submission_fingerprint`, `ratio="adaptive"`, `duration=-1`.
 
-- [ ] **Step 1: Write failing create-contract tests**
+- [x] **Step 1: Write failing create-contract tests**
 
 Cover these exact cases:
 
@@ -334,7 +334,7 @@ def test_create_only_queues_and_stores_asset_ids(client, tmp_path, monkeypatch) 
 
 Also test: old timeline prompt rejected; non-completed prompt rejected; unconfirmed shot rejected; missing provider key returns 409; reference >30 seconds rejected; replace mode automatically includes every confirmed `product_reference_image`; an unresolved product/action compatibility conflict rejects generation; preserve mode ignores `target_product_reference_image`; person flag mismatch with prompt snapshot rejected; unconfirmed person profile rejected; optional background missing rejected instead of silently ignored.
 
-- [ ] **Step 2: Run create tests**
+- [x] **Step 2: Run create tests**
 
 ```powershell
 python -m pytest tests/test_generations_api.py -k "create" -q
@@ -342,7 +342,7 @@ python -m pytest tests/test_generations_api.py -k "create" -q
 
 Expected: FAIL under the current synchronous publisher behavior.
 
-- [ ] **Step 3: Use a strict request model**
+- [x] **Step 3: Use a strict request model**
 
 ```python
 from pydantic import BaseModel, ConfigDict, Field
@@ -357,7 +357,7 @@ class CreateGenerationRequest(BaseModel):
     include_background_reference: bool = False
 ```
 
-- [ ] **Step 4: Resolve and validate immutable inputs without publishing**
+- [x] **Step 4: Resolve and validate immutable inputs without publishing**
 
 Build `asset_ids` in this order: current reference video; all confirmed target product assets for replace mode; confirmed person asset when the prompt snapshot has `replace_person=True`; selected background asset. Reject mismatches instead of omitting them. In replace mode call `check_product_compatibility()` against current shots again and reject non-empty conflicts, because a prompt may predate a later manual shot edit.
 
@@ -381,7 +381,7 @@ fingerprint = hashlib.sha256(
 
 Query active duplicate fingerprints and return 409. Lock the `Project` row with `select(Project).where(Project.id == project_id).with_for_update()` before calculating `max(version)+1`.
 
-- [ ] **Step 5: Run create and strict-mode tests**
+- [x] **Step 5: Run create and strict-mode tests**
 
 ```powershell
 python -m pytest tests/test_generations_api.py tests/test_dual_product_workflows.py -q
@@ -389,7 +389,7 @@ python -m pytest tests/test_generations_api.py tests/test_dual_product_workflows
 
 Expected: PASS.
 
-- [ ] **Step 6: Commit immutable queueing**
+- [x] **Step 6: Commit immutable queueing**
 
 ```powershell
 git add backend/app/api/routes/generations.py backend/app/api/routes/projects.py backend/tests/test_generations_api.py
@@ -406,7 +406,7 @@ git commit -m "feat: queue validated generation snapshots"
 - Consumes: `POST /{generation_id}/retry` and `POST /{generation_id}/resolve`.
 - Produces: new failed-task version or a resolved uncertain task.
 
-- [ ] **Step 1: Write failing transition tests**
+- [x] **Step 1: Write failing transition tests**
 
 ```python
 def test_retry_creates_new_version_without_mutating_failed_row(client, failed_generation) -> None:
@@ -429,7 +429,7 @@ def test_uncertain_task_requires_explicit_resolution(client, uncertain_generatio
 
 Also assert retry rejects `queued`, `processing`, `retryable`, `submission_uncertain`, and `completed`; resolve rejects non-uncertain states; `confirm_not_created` sets `failed`; `attach_task` requires a nonblank ID of at most 255 characters.
 
-- [ ] **Step 2: Run transition tests**
+- [x] **Step 2: Run transition tests**
 
 ```powershell
 python -m pytest tests/test_generations_api.py -k "retry or uncertain" -q
@@ -437,7 +437,7 @@ python -m pytest tests/test_generations_api.py -k "retry or uncertain" -q
 
 Expected: FAIL with missing routes.
 
-- [ ] **Step 3: Implement explicit models and transitions**
+- [x] **Step 3: Implement explicit models and transitions**
 
 ```python
 class ResolveGenerationRequest(BaseModel):
@@ -448,7 +448,7 @@ class ResolveGenerationRequest(BaseModel):
 
 Retry copies provider, prompt version, fixed ratio/duration, audio, `reference_asset_ids`, `request_snapshot`, and fingerprint into a new queued row with a new locked version. Resolve attaches a stripped task ID and sets `processing`, or sets `failed` with `error_message="用户确认供应商未创建任务"`. Clear lease fields and set `next_attempt_at=None` in both actions.
 
-- [ ] **Step 4: Run transition tests**
+- [x] **Step 4: Run transition tests**
 
 ```powershell
 python -m pytest tests/test_generations_api.py -k "retry or uncertain" -q
@@ -456,7 +456,7 @@ python -m pytest tests/test_generations_api.py -k "retry or uncertain" -q
 
 Expected: PASS.
 
-- [ ] **Step 5: Commit recovery APIs**
+- [x] **Step 5: Commit recovery APIs**
 
 ```powershell
 git add backend/app/api/routes/generations.py backend/tests/test_generations_api.py
@@ -475,7 +475,7 @@ git commit -m "feat: resolve and retry generation tasks"
 - Consumes: `JsonTaskGateway.submit()` and `GenerationGateway`.
 - Produces: `SubmissionUncertainError`, immediate task ID commit, sanitized response summary.
 
-- [ ] **Step 1: Write gateway and job failing tests**
+- [x] **Step 1: Write gateway and job failing tests**
 
 ```python
 def test_submit_timeout_is_classified_as_uncertain() -> None:
@@ -500,7 +500,7 @@ def test_uncertain_submission_is_never_automatically_retried(queued_generation) 
 
 Also test that a returned task ID is committed before the first `get_result()` call by observing it from a second session inside the fake gateway.
 
-- [ ] **Step 2: Run the tests**
+- [x] **Step 2: Run the tests**
 
 ```powershell
 python -m pytest tests/test_seedance.py tests/test_generation_jobs.py -k "submit or task_id" -q
@@ -508,7 +508,7 @@ python -m pytest tests/test_seedance.py tests/test_generation_jobs.py -k "submit
 
 Expected: FAIL.
 
-- [ ] **Step 3: Add the explicit exception and sanitize summaries**
+- [x] **Step 3: Add the explicit exception and sanitize summaries**
 
 ```python
 class SubmissionUncertainError(RuntimeError):
@@ -523,7 +523,7 @@ def sanitize_provider_summary(value: object) -> str:
 
 Wrap only `requests.Timeout` and `requests.ConnectionError` from `submit()` as `SubmissionUncertainError`; deterministic HTTP 4xx/5xx continues through normal retry/failure classification.
 
-- [ ] **Step 4: Handle uncertain submission before the generic exception block**
+- [x] **Step 4: Handle uncertain submission before the generic exception block**
 
 ```python
 except SubmissionUncertainError as exc:
@@ -536,7 +536,7 @@ except SubmissionUncertainError as exc:
 
 After `gateway.submit(payload)` returns, set `external_task_id`, `status="processing"`, sanitized `provider_response_summary`, then commit before polling.
 
-- [ ] **Step 5: Run gateway/job tests**
+- [x] **Step 5: Run gateway/job tests**
 
 ```powershell
 python -m pytest tests/test_seedance.py tests/test_generation_jobs.py -q
@@ -544,7 +544,7 @@ python -m pytest tests/test_seedance.py tests/test_generation_jobs.py -q
 
 Expected: PASS.
 
-- [ ] **Step 6: Commit ambiguity-safe submission**
+- [x] **Step 6: Commit ambiguity-safe submission**
 
 ```powershell
 git add backend/app/services/seedance.py backend/app/services/generation_jobs.py backend/tests/test_seedance.py backend/tests/test_generation_jobs.py
@@ -563,7 +563,7 @@ git commit -m "fix: prevent duplicate ambiguous submissions"
 - Consumes: ordered `Generation.reference_asset_ids` and local `Asset.original_path`.
 - Produces: fresh provider payload saved as redacted `request_snapshot`.
 
-- [ ] **Step 1: Write failing recovery tests**
+- [x] **Step 1: Write failing recovery tests**
 
 Test that the Worker:
 
@@ -576,7 +576,7 @@ assert "secret" not in generation.request_snapshot
 
 Also test an expired URL is republished, an unexpired URL is reused, a missing local file fails clearly, and `_claim()` excludes `submission_uncertain`.
 
-- [ ] **Step 2: Run Worker recovery tests**
+- [x] **Step 2: Run Worker recovery tests**
 
 ```powershell
 python -m pytest tests/test_worker.py tests/test_generation_jobs.py -k "asset or publish or claim" -q
@@ -584,7 +584,7 @@ python -m pytest tests/test_worker.py tests/test_generation_jobs.py -k "asset or
 
 Expected: FAIL because the Worker currently reads latest assets and stored public URLs.
 
-- [ ] **Step 3: Resolve only persisted asset IDs**
+- [x] **Step 3: Resolve only persisted asset IDs**
 
 Parse `reference_asset_ids`; convert each string to `UUID`; query each `Asset`; reject missing rows, project mismatches, non-files, and unexpected first kind. Publish only expired/missing URLs via one `_publish_if_expired(asset, publisher, now)` helper. Build the image URL list from all assets after the first video.
 
@@ -595,7 +595,7 @@ generation.request_snapshot = json.dumps(redact_request_urls(payload), ensure_as
 session.commit()
 ```
 
-- [ ] **Step 4: Restrict generation claiming states**
+- [x] **Step 4: Restrict generation claiming states**
 
 Change `_claim()` to this signature:
 
@@ -634,7 +634,7 @@ def _claim(
 
 Job calls pass `statuses=("queued", "uploaded", "processing", "retryable")`; generation calls pass `statuses=("queued", "processing", "retryable")`. `submission_uncertain`, `failed`, and `completed` are never claimed.
 
-- [ ] **Step 5: Run Worker tests**
+- [x] **Step 5: Run Worker tests**
 
 ```powershell
 python -m pytest tests/test_worker.py tests/test_generation_jobs.py -q
@@ -642,7 +642,7 @@ python -m pytest tests/test_worker.py tests/test_generation_jobs.py -q
 
 Expected: PASS.
 
-- [ ] **Step 6: Commit deterministic Worker inputs**
+- [x] **Step 6: Commit deterministic Worker inputs**
 
 ```powershell
 git add backend/app/worker.py backend/app/services/generation_jobs.py backend/tests/test_worker.py backend/tests/test_generation_jobs.py
@@ -661,7 +661,7 @@ git commit -m "feat: recover generation inputs from local assets"
 - Consumes: completed provider result URL.
 - Produces: `generated/v{version}.mp4`, `completed_at`, and safe `FileResponse`.
 
-- [ ] **Step 1: Write failing file-state tests**
+- [x] **Step 1: Write failing file-state tests**
 
 Add these local helpers at the top of `test_generation_jobs.py`:
 
@@ -703,7 +703,7 @@ def test_completed_requires_verified_local_file(processing_generation, tmp_path,
 
 Also cover: content-type mismatch; declared and streamed size >1 GiB; FFprobe error; download interruption; completed provider response without URL; final file absent from completed API response; traversal impossible because request has no path parameter.
 
-- [ ] **Step 2: Run result tests**
+- [x] **Step 2: Run result tests**
 
 ```powershell
 python -m pytest tests/test_generation_jobs.py tests/test_generations_api.py -k "download or content or completed" -q
@@ -711,7 +711,7 @@ python -m pytest tests/test_generation_jobs.py tests/test_generations_api.py -k 
 
 Expected: at least completed timestamp and missing-file response tests fail.
 
-- [ ] **Step 3: Keep remote success retryable until the local file is valid**
+- [x] **Step 3: Keep remote success retryable until the local file is valid**
 
 Normalize provider `queued`, `pending`, and `running` to local `processing`. For remote completed results, download to `.part`, stream with the 1 GiB cap, call `probe_video(temporary)`, then `temporary.replace(destination)`. Only afterward set:
 
@@ -725,11 +725,11 @@ generation.error_message = None
 
 Any download/probe failure follows normal retryable backoff and keeps `result_path=None` and `completed_at=None`.
 
-- [ ] **Step 4: Harden the content route**
+- [x] **Step 4: Harden the content route**
 
 Require `generation.status == "completed"`, `result_path`, and `Path(result_path).is_file()`. Resolve the path and verify it is inside `(Settings().media_root / str(project_id) / "generated").resolve()` before returning `FileResponse(media_type="video/mp4")`.
 
-- [ ] **Step 5: Run the full backend gate**
+- [x] **Step 5: Run the full backend gate**
 
 ```powershell
 python -m pytest -q
@@ -737,7 +737,7 @@ python -m pytest -q
 
 Expected: PASS with 0 failures and, on the real workstation, 0 skips.
 
-- [ ] **Step 6: Commit permanent result handling**
+- [x] **Step 6: Commit permanent result handling**
 
 ```powershell
 git add backend/app/services/generation_jobs.py backend/app/api/routes/generations.py backend/tests/test_generation_jobs.py backend/tests/test_generations_api.py
