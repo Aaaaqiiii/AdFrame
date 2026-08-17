@@ -91,6 +91,8 @@ class PromptRevision(Base):
     id: Mapped[UUID] = mapped_column(primary_key=True, default=uuid4)
     project_id: Mapped[UUID] = mapped_column(ForeignKey("projects.id"))
     version: Mapped[int] = mapped_column(Integer)
+    prompt_mode: Mapped[str] = mapped_column(String(30), default="full_video_description")
+    generation_segment_id: Mapped[UUID | None] = mapped_column(ForeignKey("generation_segments.id"), nullable=True)
     text: Mapped[str] = mapped_column(Text)
     visual_direction: Mapped[str] = mapped_column(Text, default="")
     audio_mode: Mapped[str] = mapped_column(String(30), default="keep_original")

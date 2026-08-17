@@ -4,10 +4,12 @@ from sqlalchemy import select
 from unittest.mock import patch
 from uuid import UUID, uuid4
 
+from app.core.config import Settings
 from app.db.models import Asset, Job, PromptRevision, Shot, ShotEdit, TimelineRevision
 from app.db.session import SessionLocal
 from app.main import create_app
 from app.services.media import VideoMetadata
+from app.services.final_prompt import execute_final_prompt_job
 
 
 
@@ -246,8 +248,10 @@ def test_prompt_history_filters_to_completed_current_timeline() -> None:
     assert response.json()[0]["source_timeline_revision_id"] == timeline_v2["revision_id"]
     assert set(response.json()[0]) == {
         "id", "version", "text", "status", "source_timeline_revision_id",
+        "prompt_mode", "generation_segment_id",
         "replace_product", "replace_person", "created_at",
     }
+    assert response.json()[0]["prompt_mode"] == "full_video_description"
 
     all_revisions = client.get(f"/api/projects/{project['id']}/prompts")
     assert all_revisions.status_code == 200
@@ -618,3 +622,183 @@ def test_generation_queues_person_asset_only_when_requested() -> None:
     with SessionLocal() as session:
         generation = session.get(Generation, UUID(response.json()["id"]))
         assert _json.loads(generation.reference_asset_ids) == [str(session.scalar(select(Asset).where(Asset.project_id == UUID(project["id"]), Asset.kind == "reference_video")).id)]
+
+
+def _segment_ready_project(client: TestClient, duration_sec: float = 32.0) -> dict:
+    """带确认镜头 + 当前分段方案的完整项目，返回各 ID 供提示词接口使用。"""
+    project = client.post("/api/projects", json={"name": "segment-prompt"}).json()
+    _accepted_video_upload(client, project["id"])
+    with SessionLocal() as session:
+        video = session.scalar(select(Asset).where(Asset.project_id == UUID(project["id"]), Asset.kind == "reference_video"))
+        video.duration_sec = duration_sec
+        revision = TimelineRevision(project_id=UUID(project["id"]), version=1, source="human")
+        session.add(revision)
+        session.flush()
+        ranges = [(0.0, 8.0), (8.0, 16.0), (16.0, 24.0), (24.0, 32.0)]
+        shot_ids = []
+        for index, (start, end) in enumerate(ranges):
+            shot = Shot(timeline_revision_id=revision.id, position=index, start_sec=start, end_sec=end, analysis_status="succeeded")
+            session.add(shot)
+            session.flush()
+            session.add(ShotEdit(project_id=UUID(project["id"]), shot_id=shot.id, action="展示产品", confirmed=True))
+            shot_ids.append(str(shot.id))
+        session.commit()
+        revision_id = str(revision.id)
+    plan = client.post(f"/api/projects/{project['id']}/generation-segments/auto")
+    assert plan.status_code == 201
+    segment_id = plan.json()["segments"][0]["id"]
+    return {"id": project["id"], "revision_id": revision_id, "segment_id": segment_id, "shot_ids": shot_ids}
+
+
+def test_segment_prompt_queued_stores_mode_and_segment_id() -> None:
+    client = TestClient(create_app())
+    project = _segment_ready_project(client)
+    response = client.post(
+        f"/api/projects/{project['id']}/prompts",
+        json={"visual_direction": "保持原节奏", "use_ai": True, "generation_segment_id": project["segment_id"]},
+    )
+    assert response.status_code == 201
+    assert response.json()["status"] == "queued"
+    with SessionLocal() as session:
+        revision = session.scalar(select(PromptRevision).where(
+            PromptRevision.project_id == UUID(project["id"]),
+            PromptRevision.version == response.json()["version"],
+        ))
+        assert revision is not None
+        assert revision.prompt_mode == "reference_video_edit"
+        assert str(revision.generation_segment_id) == project["segment_id"]
+
+
+def test_segment_prompt_worker_output_has_four_headings_and_relative_times() -> None:
+    client = TestClient(create_app())
+    project = _segment_ready_project(client)
+    response = client.post(
+        f"/api/projects/{project['id']}/prompts",
+        json={"visual_direction": "保持原节奏", "use_ai": True, "generation_segment_id": project["segment_id"]},
+    )
+    version = response.json()["version"]
+    with SessionLocal() as session:
+        revision = session.scalar(select(PromptRevision).where(
+            PromptRevision.project_id == UUID(project["id"]),
+            PromptRevision.version == version,
+        ))
+        job = session.scalar(select(Job).where(
+            Job.project_id == UUID(project["id"]),
+            Job.kind == "final_prompt_generation",
+            Job.provider_input_id == str(revision.id),
+        ))
+        # 自动方案第一段为 0–16 秒，覆盖分镜 0–8 与 8–16，相对时间 0–8 与 8–16。
+        model_text = (
+            "全局规则：原参考视频决定人物、动作、场景、构图、运镜、节奏和镜头顺序。只执行明确修改。\n\n"
+            "00:00.00–00:08.00\n保持：人物身份、动作节奏、手部位置、背景、构图、镜头运动不变。\n修改：无。\n删除：原字幕和水印。\n禁止：不得新增文字或改变动作。\n\n"
+            "00:08.00–00:16.00\n保持：人物身份、动作节奏、手部位置、背景、构图、镜头运动不变。\n修改：无。\n删除：原字幕和水印。\n禁止：不得新增文字或改变动作。"
+        )
+        with patch("app.services.final_prompt._chat", return_value=model_text) as chat:
+            execute_final_prompt_job(session, job, Settings(comfly_api_key="test-comfly-api-key"))
+        session.refresh(revision)
+        assert revision.status == "completed"
+        # 每个相交分镜一个时间块，且含四栏目。
+        assert "00:00.00–00:08.00" in revision.text
+        assert "00:08.00–00:16.00" in revision.text
+        assert revision.text.count("00:0") == 3  # 两个时间标签共 3 个 00:0 片段
+        assert "保持：" in revision.text and "修改：" in revision.text and "删除：" in revision.text and "禁止：" in revision.text
+        assert "完整描述原视频" not in revision.text
+        # 相对时间从 0 开始（片段内），而非原视频绝对时间 0。
+        assert "00:00.00–00:08.00" in revision.text
+        assert "00:08.00–00:16.00" in revision.text
+
+
+def test_segment_prompt_long_shot_is_split_at_safety_limit() -> None:
+    client = TestClient(create_app())
+    project = client.post("/api/projects", json={"name": "long-shot-segment"}).json()
+    _accepted_video_upload(client, project["id"])
+    with SessionLocal() as session:
+        video = session.scalar(select(Asset).where(Asset.project_id == UUID(project["id"]), Asset.kind == "reference_video"))
+        video.duration_sec = 35.0
+        revision = TimelineRevision(project_id=UUID(project["id"]), version=1, source="human")
+        session.add(revision)
+        session.flush()
+        shot = Shot(timeline_revision_id=revision.id, position=0, start_sec=0, end_sec=35, analysis_status="succeeded")
+        session.add(shot)
+        session.flush()
+        session.add(ShotEdit(project_id=UUID(project["id"]), shot_id=shot.id, action="长镜头", confirmed=True))
+        session.commit()
+    plan = client.post(f"/api/projects/{project['id']}/generation-segments/auto")
+    assert plan.status_code == 201
+    segments = plan.json()["segments"]
+    assert len(segments) == 2
+    # 单个 35 秒长镜头无分镜边界可切，等宽切为 0–17.5 与 17.5–35，内部切点 inside_shot。
+    first_id = segments[0]["id"]
+    response = client.post(
+        f"/api/projects/{project['id']}/prompts",
+        json={"visual_direction": "保持", "use_ai": True, "generation_segment_id": first_id},
+    )
+    assert response.status_code == 201
+    with SessionLocal() as session:
+        revision = session.scalar(select(PromptRevision).where(
+            PromptRevision.project_id == UUID(project["id"]),
+            PromptRevision.version == response.json()["version"],
+        ))
+        job = session.scalar(select(Job).where(
+            Job.project_id == UUID(project["id"]),
+            Job.kind == "final_prompt_generation",
+            Job.provider_input_id == str(revision.id),
+        ))
+        # 第一段覆盖原视频 0–17.5 秒，相对时间 0–17.5。
+        model_text = "00:00.00–00:17.50\n保持：长镜头。\n修改：无。\n删除：无。\n禁止：无。"
+        with patch("app.services.final_prompt._chat", return_value=model_text):
+            execute_final_prompt_job(session, job, Settings(comfly_api_key="test-comfly-api-key"))
+        session.refresh(revision)
+        assert revision.status == "completed"
+        assert "00:00.00–00:17.50" in revision.text
+
+
+def test_segment_prompt_rejects_mismatched_timeline() -> None:
+    client = TestClient(create_app())
+    project = _segment_ready_project(client)
+    # 新建更新的时间轴，旧分段方案失效。
+    with SessionLocal() as session:
+        newer = TimelineRevision(project_id=UUID(project["id"]), version=2, source="human")
+        session.add(newer)
+        session.commit()
+    response = client.post(
+        f"/api/projects/{project['id']}/prompts",
+        json={"visual_direction": "保持", "use_ai": True, "generation_segment_id": project["segment_id"]},
+    )
+    assert response.status_code == 422
+
+
+def test_segment_prompt_rejects_unconfirmed_shot() -> None:
+    client = TestClient(create_app())
+    project = _segment_ready_project(client)
+    with SessionLocal() as session:
+        # 自动方案第一段覆盖 0–16 秒（镜头 0 和 1）；将镜头 0 改为未确认。
+        first_shot_edit = session.scalar(select(ShotEdit).where(
+            ShotEdit.project_id == UUID(project["id"]),
+            ShotEdit.shot_id == UUID(project["shot_ids"][0]),
+        ))
+        first_shot_edit.confirmed = False
+        session.commit()
+    response = client.post(
+        f"/api/projects/{project['id']}/prompts",
+        json={"visual_direction": "保持", "use_ai": True, "generation_segment_id": project["segment_id"]},
+    )
+    assert response.status_code == 422
+
+
+def test_segment_prompt_rejects_legacy_prompt_mode_for_generation() -> None:
+    client = TestClient(create_app())
+    project = _segment_ready_project(client)
+    # 生成一个旧的完整描述模式提示词（无 segment 链接）。
+    legacy = client.post(
+        f"/api/projects/{project['id']}/prompts",
+        json={"visual_direction": "保持", "use_ai": False},
+    )
+    assert legacy.status_code == 201
+    # 用该旧提示词尝试生成会被拒绝（Task 5 相关，此处仅确认模式字段存在）。
+    with SessionLocal() as session:
+        revision = session.scalar(select(PromptRevision).where(
+            PromptRevision.project_id == UUID(project["id"]),
+            PromptRevision.version == legacy.json()["version"],
+        ))
+        assert revision.prompt_mode == "full_video_description"

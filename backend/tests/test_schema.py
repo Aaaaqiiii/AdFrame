@@ -4,10 +4,10 @@ from alembic.config import Config
 from alembic.script import ScriptDirectory
 
 
-def test_alembic_has_one_head_at_reference_video_segments() -> None:
+def test_alembic_has_one_head_at_segment_edit_prompts() -> None:
     config = Config(str(Path(__file__).parents[1] / "alembic.ini"))
     script = ScriptDirectory.from_config(config)
-    assert script.get_heads() == ["0003_reference_video_segments"]
+    assert script.get_heads() == ["0004_segment_edit_prompts"]
 
 
 def test_application_does_not_create_production_schema(monkeypatch) -> None:

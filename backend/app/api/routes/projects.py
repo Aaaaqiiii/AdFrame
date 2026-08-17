@@ -12,7 +12,7 @@ from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
 from app.core.config import Settings
-from app.db.models import Asset, Job, Project, PromptRevision, Shot, ShotAISummary, ShotEdit, ShotEvidence, TimelineRevision
+from app.db.models import Asset, GenerationSegment, Job, Project, PromptRevision, Shot, ShotAISummary, ShotEdit, ShotEvidence, TimelineRevision
 from app.db.session import get_session
 from app.services.media import MediaToolUnavailableError, probe_video
 from app.services.tempfile_publisher import TempfilePublisher
@@ -190,6 +190,7 @@ class CreatePromptRequest(BaseModel):
     replace_product: bool = False
     replace_person: bool = False
     use_ai: bool = True
+    generation_segment_id: UUID | None = None
 
 
 class RefinePromptRequest(BaseModel):
@@ -230,6 +231,8 @@ class PromptRevisionSummary(BaseModel):
     text: str
     status: str
     source_timeline_revision_id: UUID | None
+    prompt_mode: str = "full_video_description"
+    generation_segment_id: UUID | None = None
     replace_product: bool
     replace_person: bool
     created_at: datetime
@@ -371,6 +374,7 @@ def list_prompt_revisions(
     project_id: UUID,
     current_timeline_only: bool = False,
     status_filter: str | None = Query(default=None, alias="status"),
+    generation_segment_id: UUID | None = None,
     session: Session = Depends(get_session),
 ) -> list[PromptRevision]:
     if session.get(Project, project_id) is None:
@@ -387,6 +391,8 @@ def list_prompt_revisions(
         if current is None:
             return []
         query = query.where(PromptRevision.source_timeline_revision_id == current.id)
+    if generation_segment_id is not None:
+        query = query.where(PromptRevision.generation_segment_id == generation_segment_id)
     return list(session.scalars(query.order_by(PromptRevision.version.desc())))
 
 
@@ -831,6 +837,20 @@ def create_prompt_revision(
         raise HTTPException(status_code=422, detail="请选择音频风格")
     revision = session.scalar(select(TimelineRevision).where(TimelineRevision.project_id == project_id).order_by(TimelineRevision.version.desc()))
     current_shots = list(session.scalars(select(Shot).where(Shot.timeline_revision_id == revision.id).order_by(Shot.position))) if revision else []
+    # 分段工作流：提示词必须绑定一个属于当前时间轴的生成片段。
+    prompt_mode = "full_video_description"
+    segment: GenerationSegment | None = None
+    if payload.generation_segment_id is not None:
+        if revision is None:
+            raise HTTPException(status_code=422, detail="请先确认时间轴")
+        segment = session.get(GenerationSegment, payload.generation_segment_id)
+        if segment is None or segment.project_id != project_id:
+            raise HTTPException(status_code=422, detail="生成片段不存在")
+        if segment.source_timeline_revision_id != revision.id:
+            raise HTTPException(status_code=422, detail="生成分段已过期，请重新确认分段")
+        prompt_mode = "reference_video_edit"
+        # 只读取该片段覆盖的镜头。
+        current_shots = [shot for shot in current_shots if shot.end_sec > segment.source_start_sec and shot.start_sec < segment.source_end_sec]
     if replace_product:
         _, conflicts = check_product_compatibility(product_profile or "", current_shots)
         if conflicts:
@@ -865,6 +885,8 @@ def create_prompt_revision(
         visual_direction=payload.visual_direction.strip(), audio_mode=payload.audio_mode,
         audio_style=payload.audio_style.strip(), replace_product=replace_product,
         replace_person=payload.replace_person, source_timeline_revision_id=revision.id if revision else None,
+        prompt_mode=prompt_mode,
+        generation_segment_id=segment.id if segment else None,
         status="queued" if payload.use_ai else "completed",
     )
     session.add(prompt_revision)
