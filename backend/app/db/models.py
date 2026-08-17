@@ -61,6 +61,29 @@ class Generation(Base):
     project: Mapped[Project] = relationship(back_populates="generations")
 
 
+class GenerationSegment(Base):
+    __tablename__ = "generation_segments"
+    __table_args__ = (
+        UniqueConstraint("project_id", "plan_version", "position"),
+        Index("ix_generation_segments_project_plan", "project_id", "plan_version"),
+    )
+
+    id: Mapped[UUID] = mapped_column(primary_key=True, default=uuid4)
+    project_id: Mapped[UUID] = mapped_column(ForeignKey("projects.id"))
+    plan_version: Mapped[int] = mapped_column(Integer)
+    position: Mapped[int] = mapped_column(Integer)
+    source_start_sec: Mapped[float] = mapped_column(Float)
+    source_end_sec: Mapped[float] = mapped_column(Float)
+    start_boundary_type: Mapped[str] = mapped_column(String(20))
+    end_boundary_type: Mapped[str] = mapped_column(String(20))
+    source_timeline_revision_id: Mapped[UUID] = mapped_column(ForeignKey("timeline_revisions.id"))
+    short_segment_accepted: Mapped[bool] = mapped_column(default=False)
+    clip_path: Mapped[str | None] = mapped_column(String(500), nullable=True)
+    public_url: Mapped[str | None] = mapped_column(String(1000), nullable=True)
+    public_url_expires_at: Mapped[str | None] = mapped_column(String(40), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(default=lambda: datetime.now(timezone.utc))
+
+
 class PromptRevision(Base):
     __tablename__ = "prompt_revisions"
     __table_args__ = (UniqueConstraint("project_id", "version"),)
