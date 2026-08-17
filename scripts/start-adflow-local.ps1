@@ -17,6 +17,13 @@ try {
 } catch {
     throw 'FFmpeg/FFprobe is installed but cannot be executed. Check its Windows permissions before starting AdFlow.'
 }
+Push-Location (Join-Path $root 'backend')
+try {
+    python -m alembic -c alembic.ini upgrade head
+    if ($LASTEXITCODE -ne 0) { throw "Database migration failed with exit code $LASTEXITCODE." }
+} finally {
+    Pop-Location
+}
 foreach ($port in @($ApiPort, $WebPort)) {
     if (Get-NetTCPConnection -LocalPort $port -State Listen -ErrorAction SilentlyContinue) {
         throw "Port $port is already in use. Choose another port, for example: -ApiPort 8012 -WebPort 5175"
