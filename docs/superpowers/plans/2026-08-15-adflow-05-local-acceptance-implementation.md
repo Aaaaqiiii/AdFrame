@@ -38,7 +38,7 @@
 - Consumes: queued/processing/retryable/uncertain generation rows and `run_once()`.
 - Produces: deterministic proof that database state survives new sessions and stale leases recover.
 
-- [ ] **Step 1: Write failing restart tests**
+- [x] **Step 1: Write failing restart tests**
 
 ```python
 def test_processing_task_survives_new_api_session(processing_generation) -> None:
@@ -67,7 +67,7 @@ def test_expired_generation_lease_is_claimed_after_worker_restart(processing_gen
 
 Add a test that `submission_uncertain` remains untouched across multiple `run_once()` calls, and a completed record returns the same `local_video_url` from a newly constructed `TestClient(create_app())`.
 
-- [ ] **Step 2: Run the recovery tests**
+- [x] **Step 2: Run the recovery tests**
 
 ```powershell
 Set-Location E:\工具-商用\backend
@@ -76,11 +76,11 @@ python -m pytest tests/test_generation_recovery.py tests/test_worker.py -q
 
 Expected: tests either fail on an interface mismatch or pass without production code changes; fix only real recovery defects.
 
-- [ ] **Step 3: Apply the exact recovery correction if a new test fails**
+- [x] **Step 3: Apply the exact recovery correction if a new test fails**
 
 If the stale-lease test fails, change only the lease predicate in `backend/app/worker.py` to accept `leased_at IS NULL OR leased_at <= now - 10 minutes`. If the uncertain-state test fails, remove `submission_uncertain` from the generation claim statuses. If the new-client local URL test fails, make `generation_response()` derive the URL from the persisted `result_path` and `Path.is_file()`. A failure outside these three invariants stops this task for diagnosis under `superpowers:systematic-debugging`; do not add another queue or cache.
 
-- [ ] **Step 4: Run full backend suite**
+- [x] **Step 4: Run full backend suite**
 
 ```powershell
 python -m pytest -q
@@ -88,7 +88,7 @@ python -m pytest -q
 
 Expected: PASS and 0 skipped on the real workstation.
 
-- [ ] **Step 5: Commit restart recovery coverage**
+- [x] **Step 5: Commit restart recovery coverage**
 
 ```powershell
 git add backend/tests/test_generation_recovery.py backend/tests/test_worker.py backend/app/worker.py backend/app/api/routes/generations.py backend/app/services/generation_jobs.py
@@ -105,7 +105,7 @@ git commit -m "test: prove generation recovery across restarts"
 - Consumes: `-ExistingCloneUrl` and `-FreshDatabaseUrl`, both PostgreSQL URLs supplied by the operator.
 - Produces: pre/post row counts and `alembic current` output at `0002_generation_closed_loop`.
 
-- [ ] **Step 1: Implement safe parameter and URL guards**
+- [x] **Step 1: Implement safe parameter and URL guards**
 
 ```powershell
 param(
@@ -120,7 +120,7 @@ foreach ($url in @($ExistingCloneUrl, $FreshDatabaseUrl)) {
 }
 ```
 
-- [ ] **Step 2: Capture existing-clone counts before migration**
+- [x] **Step 2: Capture existing-clone counts before migration**
 
 Invoke Python from `backend` with `DATABASE_URL` set only for that child process. Query exact counts for:
 
@@ -134,7 +134,7 @@ SELECT COUNT(*) FROM generations;
 
 Serialize counts to a temporary JSON file created under `[System.IO.Path]::GetTempPath()`.
 
-- [ ] **Step 3: Stamp and upgrade only the existing clone**
+- [x] **Step 3: Stamp and upgrade only the existing clone**
 
 If the clone lacks `alembic_version`, run:
 
@@ -148,7 +148,7 @@ if ($LASTEXITCODE -ne 0) { throw 'Alembic upgrade failed for existing clone.' }
 
 If it already has a revision, do not stamp; only upgrade. Re-query the five counts and throw on any difference. Verify the five new generation columns and three indexes via SQLAlchemy `inspect()`.
 
-- [ ] **Step 4: Upgrade the empty database from base**
+- [x] **Step 4: Upgrade the empty database from base**
 
 ```powershell
 $env:DATABASE_URL = $FreshDatabaseUrl
@@ -158,7 +158,7 @@ if ($LASTEXITCODE -ne 0) { throw 'Alembic upgrade failed for fresh database.' }
 
 Verify all core tables exist, the Alembic revision is `0002_generation_closed_loop`, and every core table count is zero. Clear `Env:DATABASE_URL` in `finally` and remove temporary count files.
 
-- [ ] **Step 5: Parse and execute the verification script**
+- [x] **Step 5: Parse and execute the verification script**
 
 ```powershell
 $tokens = $null; $errors = $null
@@ -174,7 +174,7 @@ E:\工具-商用\scripts\verify-adflow-migrations.ps1 -ExistingCloneUrl $existin
 
 Expected: both databases report head revision and the clone counts remain identical.
 
-- [ ] **Step 6: Commit migration verification**
+- [x] **Step 6: Commit migration verification**
 
 ```powershell
 git add scripts/verify-adflow-migrations.ps1
@@ -191,7 +191,7 @@ git commit -m "test: verify local postgres migrations safely"
 - Consumes: backup/start/verification scripts.
 - Produces: one operator path from existing install to six-step local app.
 
-- [ ] **Step 1: Write the runbook with executable commands**
+- [x] **Step 1: Write the runbook with executable commands**
 
 The runbook must contain these ordered sections and commands:
 
@@ -203,11 +203,11 @@ Set-Location E:\工具-商用
 
 Sections: prerequisites; verify FFmpeg/FFprobe/PostgreSQL; back up; verify non-empty dump; migration behavior; start; check `/api/health`; open `http://localhost:5174`; inspect Worker process; recover `submission_uncertain`; locate `data/media/{project_id}/generated/v{version}.mp4`; restore database backup if migration fails. State explicitly that media files are backed up separately and are never deleted by migration.
 
-- [ ] **Step 2: Update README to describe six steps**
+- [x] **Step 2: Update README to describe six steps**
 
 Replace any five-step or direct-generation text with: 上传素材、切分与校正、理解分镜、确认分镜事实、生成提示词、生成与结果. Link the runbook and design spec. Do not duplicate the full runbook.
 
-- [ ] **Step 3: Scan documentation for stale direct-submit instructions**
+- [x] **Step 3: Scan documentation for stale direct-submit instructions**
 
 ```powershell
 Get-ChildItem E:\工具-商用\README.md,E:\工具-商用\docs -Recurse -File -Include *.md |
@@ -216,7 +216,7 @@ Get-ChildItem E:\工具-商用\README.md,E:\工具-商用\docs -Recurse -File -I
 
 Expected: no active instruction contradicts the new flow; historical design documents may be labeled superseded instead of rewritten.
 
-- [ ] **Step 4: Commit operator documentation**
+- [x] **Step 4: Commit operator documentation**
 
 ```powershell
 git add README.md docs/runbooks/adflow-local-upgrade.md
@@ -232,7 +232,7 @@ git commit -m "docs: explain local generation upgrade and recovery"
 - Consumes: all prior plans.
 - Produces: exact passing counts attached to the implementation report.
 
-- [ ] **Step 1: Run backend tests in the executable FFmpeg environment**
+- [x] **Step 1: Run backend tests in the executable FFmpeg environment**
 
 ```powershell
 Set-Location E:\工具-商用\backend
@@ -241,7 +241,7 @@ python -m pytest -q
 
 Expected: failures 0, errors 0, skipped 0.
 
-- [ ] **Step 2: Run all frontend gates**
+- [x] **Step 2: Run all frontend gates**
 
 ```powershell
 Set-Location E:\工具-商用\frontend
@@ -252,7 +252,7 @@ npm.cmd run build
 
 Expected: all exit 0.
 
-- [ ] **Step 3: Start the app through the production local script**
+- [x] **Step 3: Start the app through the production local script**
 
 ```powershell
 Set-Location E:\工具-商用
