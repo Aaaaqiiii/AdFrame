@@ -28,6 +28,13 @@ class Settings(BaseSettings):
     comfly_vision_base_url: str = "https://ai.comfly.org"
     comfly_vision_model: str = "gpt-5.6-terra"
     openai_api_key: str = ""
+    provider_max_reference_seconds: float = 30.0
+    segment_safety_margin_seconds: float = 1.0
+    recommended_min_segment_seconds: float = 8.0
     worker_poll_seconds: int = 5
     enforce_license: bool = False
     cors_origin_regex: str = r"http://(localhost|127\.0\.0\.1):\d+"
+
+    @property
+    def effective_segment_limit_seconds(self) -> float:
+        return self.provider_max_reference_seconds - self.segment_safety_margin_seconds
