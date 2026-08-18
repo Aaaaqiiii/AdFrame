@@ -105,6 +105,7 @@ function App() {
   const [timelineSaving, setTimelineSaving] = useState(false)
   const [generationPlan, setGenerationPlan] = useState<GenerationSegmentPlan | null>(null)
   const [segmentBusy, setSegmentBusy] = useState(false)
+  const [selectedSegmentId, setSelectedSegmentId] = useState<string | null>(null)
   const [selectedIds, setSelectedIds] = useState<string[]>([])
   const [selectedBoundary, setSelectedBoundary] = useState<number | null>(null)
   const [playhead, setPlayhead] = useState(0)
@@ -179,15 +180,17 @@ function App() {
       })
       if (project.timeline.source === 'vision_hybrid' || project.timeline.source === 'ai') setAiRevisionId(project.timeline.revision_id)
       setTimelineConfirmed(project.timeline.source === 'human' || project.timeline.source === 'ai_restored')
-      // restore 顺序：timeline 设置后立即 GET 当前分段方案。
+      // restore 顺序：timeline 设置后立即 GET 当前分段方案，有方案时选择第一段。
       try {
         const plan = await getGenerationSegments(project.id)
         setGenerationPlan(plan)
-      } catch { setGenerationPlan(null) }
+        setSelectedSegmentId(plan.segments[0]?.id ?? null)
+      } catch { setGenerationPlan(null); setSelectedSegmentId(null) }
     } else {
       setTimeline(null)
       setTimelineConfirmed(false)
       setGenerationPlan(null)
+      setSelectedSegmentId(null)
     }
     await restorePromptVersions(project.id, undefined, true)
     return project
@@ -504,6 +507,7 @@ function App() {
     try {
       const plan = await autoPlanGenerationSegments(projectId)
       setGenerationPlan(plan)
+      setSelectedSegmentId(plan.segments[0]?.id ?? null)
       setNotice(plan.segments.length ? `已自动规划 ${plan.segments.length} 个生成片段。` : '自动规划未产生片段。')
     } catch (error) { setNotice(`自动规划失败：${errorMessage(error)}`) }
     finally { setSegmentBusy(false) }
@@ -515,6 +519,7 @@ function App() {
     try {
       const plan = await saveGenerationSegments(projectId, inputs)
       setGenerationPlan(plan)
+      setSelectedSegmentId(plan.segments[0]?.id ?? null)
       setNotice(`分段方案已保存为 v${plan.plan_version}。`)
     } catch (error) { setNotice(`保存分段失败：${errorMessage(error)}`) }
     finally { setSegmentBusy(false) }
@@ -649,7 +654,7 @@ function App() {
         {stage === 'materials' && <MaterialsStage mode={MODE} video={video} materials={materials} productIdentity={productIdentity} onVideo={(file) => void uploadVideo(file)} onImage={(kind, file) => void uploadImage(kind, file)} onProductImages={uploadProducts} onProductImageRename={renameProductImage} onProductName={(name) => setProductIdentity((current) => ({ ...current, name, confirmed: false }))} onProductSellingPoints={(sellingPoints) => setProductIdentity((current) => ({ ...current, sellingPoints, confirmed: false }))} onProductProfileSave={(confirmed) => void saveProductProfile(confirmed)} onRetry={(kind) => void retryProfile(kind)} onProfile={(kind, profile) => { setMaterials((old) => ({ ...old, [kind]: { ...old[kind], profile } })); if (kind === 'product') setProductIdentity((current) => ({ ...current, confirmed: false })) }} onSaveProfile={(kind) => void saveProfile(kind)} onContinue={() => void startGlobalFlow()} ready={materialsReady} blockingReason={materialsBlockingReason} />}
         {stage === 'analysis' && <AnalysisStage shots={shots} jobs={jobs} onOpenShots={() => { if (!projectId) return; void restoreProject(projectId).then(() => setStage('shots')).catch((error) => setNotice(`读取分镜事实失败：${errorMessage(error)}`)) }} />}
         {stage === 'timeline' && timeline && <TimelineEditor videoUrl={video.previewUrl} videoRatio={videoRatio} videoRef={videoRef} shots={shots} selectedIds={selectedIds} selectedBoundary={selectedBoundary} playhead={playhead} fps={fps} dirty={timelineDirty} saving={timelineSaving} canContinue={timelineConfirmed} onMetadata={(width, height) => { setVideoRatio(`${width} / ${height}`); const element = videoRef.current; if (element && Number.isFinite(element.duration) && element.duration > 0) setFps(25) }} onPlayhead={seekTimeline} onSelectShot={selectTimelineShot} onSelectBoundary={setSelectedBoundary} onMoveBoundary={moveTimelineBoundary} onSplit={splitAtPlayhead} onMerge={mergeSelected} onRestore={() => void restoreAi()} onSave={() => void saveHumanTimeline()} onContinue={() => void beginShotAnalysis()} />}
-        {stage === 'segments' && timeline && generationPlan && <GenerationSegmentsEditor planVersion={generationPlan.plan_version} segments={generationPlan.segments} shots={timeline.shots} durationSec={videoRef.current?.duration || shots[shots.length - 1]?.end_sec || 0} maxSegmentSeconds={generationPlan.max_segment_seconds} recommendedMinSeconds={generationPlan.recommended_min_seconds} busy={segmentBusy} onAutoPlan={() => void autoPlanSegments()} onSave={(inputs) => void saveSegmentPlan(inputs)} onRestoreAuto={() => { if (!timelineConfirmed) return; void autoPlanSegments() }} />}
+        {stage === 'segments' && timeline && generationPlan && <GenerationSegmentsEditor planVersion={generationPlan.plan_version} segments={generationPlan.segments} shots={timeline.shots} durationSec={videoRef.current?.duration || shots[shots.length - 1]?.end_sec || 0} maxSegmentSeconds={generationPlan.max_segment_seconds} recommendedMinSeconds={generationPlan.recommended_min_seconds} busy={segmentBusy} selectedSegmentId={selectedSegmentId} onSelectSegment={setSelectedSegmentId} onAutoPlan={() => void autoPlanSegments()} onSave={(inputs) => void saveSegmentPlan(inputs)} onRestoreAuto={() => { if (!timelineConfirmed) return; void autoPlanSegments() }} />}
         {stage === 'shots' && <ShotWorkspace shots={shots} selectedId={selectedShotId} jobs={jobs} edit={shotEdit} saving={shotSaving} mode={MODE} compatibility={null} onSelect={setSelectedShotId} onEdit={setShotEdit} onSave={(confirmed) => void saveCurrentShot(confirmed)} onAdoptAI={(id) => void adoptLatestAI(id)} onRetry={(id) => {
           // 重跑只产生新的 AI 总结，人工保存版本始终保留。
           if (!window.confirm('重新理解将产生一个新的 AI 总结版本，当前人工版本会继续保留。是否继续？')) return

@@ -1,4 +1,13 @@
-import { canSaveSegmentPlan, nearestShotBoundary, segmentDuration, segmentIssue } from '../generationSegments'
+import { useEffect, useState } from 'react'
+import {
+  canSaveSegmentPlan,
+  mergeSegments,
+  moveSegmentBoundary,
+  segmentDuration,
+  segmentIssue,
+  splitSegment,
+  toggleShortSegmentAccepted,
+} from '../generationSegments'
 import type { GenerationSegment, GenerationSegmentInput } from '../generationSegments'
 import type { TimelineShot } from '../api'
 
@@ -10,6 +19,8 @@ type Props = {
   maxSegmentSeconds: number
   recommendedMinSeconds: number
   busy: boolean
+  selectedSegmentId: string | null
+  onSelectSegment: (id: string) => void
   onAutoPlan: () => void
   onSave: (inputs: GenerationSegmentInput[]) => void
   onRestoreAuto: () => void
@@ -22,87 +33,39 @@ const boundaryLabel: Record<GenerationSegment['start_boundary_type'], string> = 
 }
 
 export function GenerationSegmentsEditor(p: Props) {
-  const shotBoundaries = [0, ...p.shots.map((shot) => shot.end_sec), p.durationSec]
-  const canSave = canSaveSegmentPlan(p.segments, p.durationSec, p.maxSegmentSeconds, p.recommendedMinSeconds)
+  const [draft, setDraft] = useState<GenerationSegmentInput[]>([])
+  const [dirty, setDirty] = useState(false)
+  const [allowInsideShot, setAllowInsideShot] = useState(false)
 
-  function snapshotInputs(): GenerationSegmentInput[] {
-    return p.segments.map((segment) => ({
-      source_start_sec: segment.source_start_sec,
-      source_end_sec: segment.source_end_sec,
-      start_boundary_type: segment.start_boundary_type,
-      end_boundary_type: segment.end_boundary_type,
-      short_segment_accepted: segment.short_segment_accepted,
-    }))
-  }
-
-  // 用快照构造“增加切点”后的临时方案：在最长段中点最近的合法分镜边界处切开。
-  function addCut(): void {
-    const longest = [...p.segments].sort((a, b) => segmentDuration(b) - segmentDuration(a))[0]
-    if (!longest) return
-    const mid = (longest.source_start_sec + longest.source_end_sec) / 2
-    const snapped = nearestShotBoundary(mid, shotBoundaries.filter((b) => b > longest.source_start_sec + 0.001 && b < longest.source_end_sec - 0.001))
-    if (snapped <= longest.source_start_sec || snapped >= longest.source_end_sec) return
-    const next: GenerationSegmentInput[] = []
-    for (const segment of p.segments) {
-      if (segment.id === longest.id) {
-        next.push({
-          source_start_sec: segment.source_start_sec,
-          source_end_sec: snapped,
-          start_boundary_type: segment.start_boundary_type,
-          end_boundary_type: segment.source_end_sec === snapped ? segment.end_boundary_type : 'shot_boundary',
-          short_segment_accepted: segment.short_segment_accepted,
-        })
-        next.push({
-          source_start_sec: snapped,
-          source_end_sec: segment.source_end_sec,
-          start_boundary_type: 'shot_boundary',
-          end_boundary_type: segment.end_boundary_type,
-          short_segment_accepted: false,
-        })
-      } else {
-        next.push({
-          source_start_sec: segment.source_start_sec,
-          source_end_sec: segment.source_end_sec,
-          start_boundary_type: segment.start_boundary_type,
-          end_boundary_type: segment.end_boundary_type,
-          short_segment_accepted: segment.short_segment_accepted,
-        })
-      }
-    }
-    p.onSave(next)
-  }
-
-  function removeCut(index: number): void {
-    if (p.segments.length <= 1) return
-    const next = p.segments.filter((_, i) => i !== index)
-    const rebuilt: GenerationSegmentInput[] = next.map((segment, i) => ({
-      source_start_sec: segment.source_start_sec,
-      source_end_sec: segment.source_end_sec,
-      start_boundary_type: i === 0 ? 'video_edge' : segment.start_boundary_type,
-      end_boundary_type: i === next.length - 1 ? 'video_edge' : segment.end_boundary_type,
-      short_segment_accepted: segment.short_segment_accepted,
-    }))
-    p.onSave(rebuilt)
-  }
-
-  function moveBoundary(index: number, requested: number): void {
-    const next = p.segments.map((segment) => ({ ...segment }))
-    const current = next[index]
-    const neighbor = next[index + 1]
-    if (!current || !neighbor) return
-    const snapped = nearestShotBoundary(requested, shotBoundaries.filter((b) => b > current.source_start_sec + 0.001 && b < neighbor.source_end_sec - 0.001))
-    if (snapped <= current.source_start_sec || snapped >= neighbor.source_end_sec) return
-    current.source_end_sec = snapped
-    current.end_boundary_type = 'shot_boundary'
-    neighbor.source_start_sec = snapped
-    neighbor.start_boundary_type = 'shot_boundary'
-    p.onSave(next.map((segment) => ({
+  // 后端方案变化时重建本地 draft（含恢复自动方案）。
+  useEffect(() => {
+    setDraft(p.segments.map((segment) => ({
       source_start_sec: segment.source_start_sec,
       source_end_sec: segment.source_end_sec,
       start_boundary_type: segment.start_boundary_type,
       end_boundary_type: segment.end_boundary_type,
       short_segment_accepted: segment.short_segment_accepted,
     })))
+    setDirty(false)
+  }, [p.segments])
+
+  const shotBoundaries = [0, ...p.shots.map((shot) => shot.end_sec), p.durationSec]
+  const canSave = canSaveSegmentPlan(draft, p.durationSec, p.maxSegmentSeconds, p.recommendedMinSeconds)
+
+  function update(next: GenerationSegmentInput[]) {
+    setDraft(next)
+    setDirty(true)
+  }
+
+  function addCut(): void {
+    if (!draft.length) return
+    const longestIndex = draft
+      .map((segment, index) => ({ segment, index }))
+      .sort((a, b) => segmentDuration(b.segment) - segmentDuration(a.segment))[0]?.index ?? -1
+    if (longestIndex < 0) return
+    const longest = draft[longestIndex]
+    const mid = (longest.source_start_sec + longest.source_end_sec) / 2
+    update(splitSegment(draft, longestIndex, mid, shotBoundaries, p.durationSec, allowInsideShot))
   }
 
   return <section className="stage-content segment-stage">
@@ -116,17 +79,18 @@ export function GenerationSegmentsEditor(p: Props) {
     </div>
     <div className="segment-actions">
       <button type="button" className="button secondary" disabled={p.busy} onClick={p.onAutoPlan}>自动规划</button>
-      <button type="button" className="button secondary" disabled={p.busy || !p.segments.length} onClick={addCut}>增加切点</button>
-      <button type="button" className="button secondary" disabled={p.busy || !p.segments.length} onClick={() => p.onSave(snapshotInputs())}>保存分段</button>
+      <button type="button" className="button secondary" disabled={p.busy || !draft.length} onClick={addCut}>增加切点</button>
       <button type="button" className="button secondary" disabled={p.busy || p.planVersion === 0} onClick={p.onRestoreAuto}>恢复自动方案</button>
+      <label className="segment-inside-toggle"><input type="checkbox" checked={allowInsideShot} onChange={(event) => setAllowInsideShot(event.target.checked)} />允许镜头内部切分</label>
     </div>
     <div className="segment-list">
-      {!p.segments.length && <div className="segment-empty">点击“自动规划”生成分段方案。</div>}
-      {p.segments.map((segment, index) => {
+      {!draft.length && <div className="segment-empty">点击“自动规划”生成分段方案。</div>}
+      {draft.map((segment, index) => {
         const duration = segmentDuration(segment)
         const issue = segmentIssue(segment, p.durationSec, p.maxSegmentSeconds, p.recommendedMinSeconds)
         const coveredShots = p.shots.filter((shot) => shot.start_sec < segment.source_end_sec && shot.end_sec > segment.source_start_sec)
-        return <div key={segment.id} className="segment-card">
+        const selected = p.selectedSegmentId === p.segments[index]?.id
+        return <div key={index} className={`segment-card${selected ? ' selected' : ''}`} onClick={() => { const id = p.segments[index]?.id; if (id) p.onSelectSegment(id) }}>
           <div className="segment-card-head">
             <strong>片段 {index + 1}</strong>
             <span>{segment.source_start_sec.toFixed(2)}s – {segment.source_end_sec.toFixed(2)}s · {duration.toFixed(2)}s</span>
@@ -137,17 +101,20 @@ export function GenerationSegmentsEditor(p: Props) {
           <div className="segment-card-shots">
             分镜 {coveredShots.length ? coveredShots.map((shot, i) => <span key={shot.id}>{p.shots.indexOf(shot) + 1}{i < coveredShots.length - 1 ? '、' : ''}</span>) : '无'}
           </div>
-          {index < p.segments.length - 1 && <div className="segment-boundary-move">
-            <label>切点 <input type="number" step="0.01" min={segment.source_start_sec + 0.01} max={p.segments[index + 1].source_end_sec - 0.01} value={segment.source_end_sec} onChange={(event) => moveBoundary(index, Number(event.target.value))} /></label>
-            <span>吸附到最近分镜边界</span>
-            <button type="button" className="button link" onClick={() => removeCut(index)}>删除此切点</button>
+          {issue?.code === 'short_segment' && <div className="segment-short-accept">
+            <label><input type="checkbox" checked={Boolean(segment.short_segment_accepted)} onChange={() => update(toggleShortSegmentAccepted(draft, index))} />我确认保留此短段</label>
+          </div>}
+          {index < draft.length - 1 && <div className="segment-boundary-move" onClick={(event) => event.stopPropagation()}>
+            <label>切点 <input type="number" step="0.01" min={segment.source_start_sec + 0.01} max={draft[index + 1].source_end_sec - 0.01} value={segment.source_end_sec} onChange={(event) => update(moveSegmentBoundary(draft, index, Number(event.target.value), shotBoundaries, p.durationSec, allowInsideShot))} /></label>
+            <span>{allowInsideShot ? '允许镜头内部切分' : '吸附到最近分镜边界'}</span>
+            <button type="button" className="button link" onClick={() => update(mergeSegments(draft, index, p.durationSec))}>合并此切点</button>
           </div>}
         </div>
       })}
     </div>
     <div className="segment-save-bar">
-      <span>{canSave ? '分段方案合法，可保存。' : '分段方案不合法：存在空缺、重叠、超长或未确认短段。'}</span>
-      <button type="button" className="button primary" disabled={!canSave || p.busy} onClick={() => p.onSave(snapshotInputs())}>保存分段方案</button>
+      <span>{dirty ? (canSave ? '有未保存修改，分段方案当前合法。' : '分段方案不合法：存在空缺、重叠、超长或未确认短段。') : '分段方案已是最新。'}</span>
+      <button type="button" className="button primary" disabled={!dirty || !canSave || p.busy} onClick={() => p.onSave(draft)}>保存分段方案</button>
     </div>
   </section>
 }

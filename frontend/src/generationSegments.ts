@@ -83,3 +83,100 @@ export function nearestShotBoundary(value: number, boundaries: number[]): number
   }
   return nearest
 }
+
+export function boundaryTypeAt(value: number, shotBoundaries: number[], durationSec: number): BoundaryType {
+  // 视频边缘优先；其次真实分镜边界；都不是则为镜头内部。
+  if (Math.abs(value) <= EPSILON || Math.abs(value - durationSec) <= EPSILON) return 'video_edge'
+  if (shotBoundaries.some((boundary) => Math.abs(value - boundary) <= EPSILON)) return 'shot_boundary'
+  return 'inside_shot'
+}
+
+export function splitSegment(
+  segments: GenerationSegmentInput[],
+  targetIndex: number,
+  at: number,
+  shotBoundaries: number[],
+  durationSec: number,
+  allowInsideShot: boolean,
+): GenerationSegmentInput[] {
+  if (targetIndex < 0 || targetIndex >= segments.length) return segments
+  const target = segments[targetIndex]
+  if (at <= target.source_start_sec + EPSILON || at >= target.source_end_sec - EPSILON) return segments
+  let cut = at
+  let cutType: BoundaryType = 'shot_boundary'
+  if (allowInsideShot) {
+    cutType = boundaryTypeAt(at, shotBoundaries, durationSec)
+  } else {
+    const candidates = shotBoundaries.filter((b) => b > target.source_start_sec + EPSILON && b < target.source_end_sec - EPSILON)
+    if (!candidates.length) return segments  // 无合法分镜边界，不允许伪标 shot_boundary。
+    const snapped = nearestShotBoundary(at, candidates)
+    if (snapped <= target.source_start_sec || snapped >= target.source_end_sec) return segments
+    cut = snapped
+  }
+  const next = [...segments]
+  next.splice(targetIndex, 1,
+    { ...target, source_end_sec: cut, end_boundary_type: cutType },
+    { ...target, source_start_sec: cut, start_boundary_type: cutType, short_segment_accepted: false },
+  )
+  return next
+}
+
+export function mergeSegments(
+  segments: GenerationSegmentInput[],
+  index: number,
+  durationSec: number,
+): GenerationSegmentInput[] {
+  // 合并 index 与 index+1 两段，保留两端外侧边界类型；内部切点消失。
+  if (index < 0 || index + 1 >= segments.length) return segments
+  const left = segments[index]
+  const right = segments[index + 1]
+  const merged: GenerationSegmentInput = {
+    source_start_sec: left.source_start_sec,
+    source_end_sec: right.source_end_sec,
+    start_boundary_type: left.source_start_sec <= EPSILON ? 'video_edge' : left.start_boundary_type,
+    end_boundary_type: Math.abs(right.source_end_sec - durationSec) <= EPSILON ? 'video_edge' : right.end_boundary_type,
+    short_segment_accepted: left.short_segment_accepted || right.short_segment_accepted,
+  }
+  const next = [...segments]
+  next.splice(index, 2, merged)
+  return next
+}
+
+export function moveSegmentBoundary(
+  segments: GenerationSegmentInput[],
+  index: number,
+  requested: number,
+  shotBoundaries: number[],
+  durationSec: number,
+  allowInsideShot: boolean,
+): GenerationSegmentInput[] {
+  if (index < 0 || index + 1 >= segments.length) return segments
+  const current = segments[index]
+  const neighbor = segments[index + 1]
+  let cut = requested
+  let cutType: BoundaryType = 'shot_boundary'
+  if (allowInsideShot) {
+    cutType = boundaryTypeAt(requested, shotBoundaries, durationSec)
+  } else {
+    const candidates = shotBoundaries.filter((b) => b > current.source_start_sec + EPSILON && b < neighbor.source_end_sec - EPSILON)
+    if (!candidates.length) return segments  // 无合法分镜边界，不允许伪标 shot_boundary。
+    const snapped = nearestShotBoundary(requested, candidates)
+    if (snapped <= current.source_start_sec || snapped >= neighbor.source_end_sec) return segments
+    cut = snapped
+  }
+  if (cut <= current.source_start_sec + EPSILON || cut >= neighbor.source_end_sec - EPSILON) return segments
+  const next = [...segments]
+  next[index] = { ...current, source_end_sec: cut, end_boundary_type: cutType }
+  next[index + 1] = { ...neighbor, source_start_sec: cut, start_boundary_type: cutType }
+  return next
+}
+
+export function toggleShortSegmentAccepted(
+  segments: GenerationSegmentInput[],
+  index: number,
+): GenerationSegmentInput[] {
+  if (index < 0 || index >= segments.length) return segments
+  const next = [...segments]
+  next[index] = { ...next[index], short_segment_accepted: !next[index].short_segment_accepted }
+  return next
+}

@@ -423,3 +423,7 @@ button, .button { border: 0; font: inherit; cursor: pointer; }
 .segment-boundary-move input { width: 90px; padding: 4px 8px; border: 1px solid var(--line); border-radius: 6px; }
 .segment-save-bar { padding: 14px 30px; display: flex; align-items: center; justify-content: space-between; gap: 12px; }
 .segment-save-bar span { color: var(--muted); font-size: 12px; }
+.segment-card.selected { border-color: var(--primary, #ef6b2e); box-shadow: 0 0 0 1px var(--primary, #ef6b2e); cursor: pointer; }
+.segment-short-accept { margin-top: 8px; font-size: 12px; display: flex; align-items: center; gap: 6px; }
+.segment-inside-toggle { display: inline-flex; align-items: center; gap: 6px; font-size: 12px; color: var(--muted); margin-left: auto; }
+.segment-actions .segment-inside-toggle { margin-left: auto; }
