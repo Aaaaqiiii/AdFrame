@@ -170,10 +170,26 @@ def test_page_two_collects_product_images_and_forces_replacement() -> None:
         f"/api/projects/{project['id']}/shots/{timeline['shots'][0]['id']}/edit",
         json={"action": "展示", "confirmed": True},
     )
+    from app.services.final_prompt import build_full_prompt_prefix
+    from app.api.routes.projects import _combined_reference_profile
+    with SessionLocal() as session:
+        assets = session.scalars(select(Asset).where(
+            Asset.project_id == UUID(project["id"]), Asset.kind == "product_reference_image",
+        ).order_by(Asset.id)).all()
+        product_profile = _combined_reference_profile(assets) or ""
+        purposes = []
+        for asset in assets:
+            structure = load_structure(asset)
+            name = str(structure.get("display_name") or structure.get("view_label") or "其他").strip()
+            note = str(structure.get("note") or "").strip()
+            purposes.append(f"{name}：锁定该角度结构" + (f"（{note}）" if note else ""))
     full_text = (
-        "全局规则：原参考视频是时间轴、动作、构图、运镜、节奏和镜头顺序的最高优先级参考。\n"
-        "目标产品必须匹配已确认产品档案：目标产品视角 1\n"
-        "产品参考图用途：\n- front：锁定该角度结构\n- right：锁定该角度结构\n\n"
+        build_full_prompt_prefix(
+            project_mode="replace_product", product_profile=product_profile,
+            product_image_purposes=purposes,
+            people_reference=None, background_reference=None,
+            audio_mode="keep_original", audio_style="",
+        ) + "\n\n"
         "00:00.00–00:03.00\n保持：a\n修改：无。\n删除：无。\n禁止：无。"
     )
     saved = client.post(

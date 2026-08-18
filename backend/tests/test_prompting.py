@@ -73,11 +73,13 @@ def test_prompt_revisions_are_saved_with_audio_choice() -> None:
         f"/api/projects/{project['id']}/shots/{timeline['shots'][0]['id']}/edit",
         json={"action": "展示", "confirmed": True},
     )
-    text = (
-        "全局规则：原参考视频是时间轴、动作、构图、运镜、节奏和镜头顺序的最高优先级参考。\n"
-        "保持原产品不变，禁止替换、删除或重新设计原产品。\n\n"
-        "00:00.00–00:03.00\n保持：a\n修改：无。\n删除：无。\n禁止：无。"
+    from app.services.final_prompt import build_full_prompt_prefix
+    prefix = build_full_prompt_prefix(
+        project_mode="preserve_product", product_profile="", product_image_purposes=[],
+        people_reference=None, background_reference=None,
+        audio_mode="add_style", audio_style="轻盈钢琴",
     )
+    text = prefix + "\n\n" + "00:00.00–00:03.00\n保持：a\n修改：无。\n删除：无。\n禁止：无。"
     response = client.post(
         f"/api/projects/{project['id']}/prompts",
         json={

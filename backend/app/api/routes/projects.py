@@ -13,7 +13,7 @@ from sqlalchemy.orm import Session
 
 from app.core.config import Settings
 from app.db.models import Asset, GenerationSegment, Job, Project, PromptRevision, Shot, ShotAISummary, ShotEdit, ShotEvidence, TimelineRevision
-from app.services.final_prompt import actionable_segment_text, expected_segment_labels, missing_segment_prompt_blocks
+from app.services.final_prompt import actionable_segment_text, build_full_prompt_prefix, expected_segment_labels, missing_segment_prompt_blocks
 from app.services.full_prompt import FullPromptValidationError, parse_full_prompt, validate_full_prompt
 from app.db.session import get_session
 from app.services.media import MediaToolUnavailableError, probe_video
@@ -874,6 +874,31 @@ def create_prompt_revision(
             })
     if replace_product and (not product_profile or _combined_analysis_status(product_assets) != "succeeded" or not _product_profile_confirmed(product_assets)):
         raise HTTPException(status_code=422, detail="选择替换产品前，请先上传并确认产品图片档案")
+    # 服务端确定性前缀：用当前已确认资料生成，人工保存严格比对、AI 入队时冻结。
+    product_purpose_lines = []
+    if replace_product:
+        for asset in product_assets:
+            structure = load_structure(asset)
+            name = str(structure.get("display_name") or structure.get("view_label") or "其他").strip()
+            note = str(structure.get("note") or "").strip()
+            product_purpose_lines.append(f"{name}：锁定该角度结构" + (f"（{note}）" if note else ""))
+    people_reference = None
+    person_asset = _reference_image(session, project_id, "person_reference_image")
+    if person_asset and person_asset.profile_text:
+        people_reference = person_asset.profile_text.strip()
+    background_reference = None
+    background_asset = _reference_image(session, project_id, "background_reference_image")
+    if background_asset and background_asset.profile_text:
+        background_reference = background_asset.profile_text.strip()
+    expected_prefix = build_full_prompt_prefix(
+        project_mode=project.mode,
+        product_profile=product_profile,
+        product_image_purposes=product_purpose_lines,
+        people_reference=people_reference,
+        background_reference=background_reference,
+        audio_mode=payload.audio_mode,
+        audio_style=payload.audio_style.strip(),
+    )
     version = (session.scalar(
         select(func.max(PromptRevision.version)).where(PromptRevision.project_id == project_id)
     ) or 0) + 1
@@ -892,36 +917,24 @@ def create_prompt_revision(
                 "has_product": bool(shot.product_interaction),
             })
     # AI生成放到Worker，避免浏览器等待数分钟后超时；人工版本仍立即保存。
-    text = "" if payload.use_ai else payload.visual_direction.strip()
+    # AI 入队时冻结服务端确定性前缀到 text，Worker 使用该快照，完成后再替换为完整提示词。
+    text = expected_prefix if payload.use_ai else payload.visual_direction.strip()
     if not payload.use_ai and prompt_mode == "full_reference_video_edit":
         # 人工保存：预期绝对时间标签来自数据库当前 Shot，而非待验证文本自身。
         if revision is None:
             raise HTTPException(status_code=422, detail="请先确认时间轴")
         shot_ranges = [(shot.start_sec, shot.end_sec) for shot in session.scalars(select(Shot).where(Shot.timeline_revision_id == revision.id).order_by(Shot.position))]
         try:
-            validate_full_prompt(text, shot_ranges)
+            document = validate_full_prompt(text, shot_ranges)
         except FullPromptValidationError as exc:
             raise HTTPException(status_code=422, detail=str(exc)) from exc
-        # 确定性前缀必须包含模式锁定与产品规则。
+        # 确定性前缀必须与数据库当前已确认资料生成的 expected_prefix 严格一致（换行归一化后）。
+        if document.global_prefix != expected_prefix:
+            raise HTTPException(status_code=422, detail="完整提示词的确定性前缀与当前已确认资料不一致，请重新生成或修正前缀")
         if project.mode == "preserve_product":
-            if "保持原产品不变" not in text:
-                raise HTTPException(status_code=422, detail="完整提示词缺少原产品锁定规则")
             # 只对修改/删除正文执行替换检测。
             if contains_product_replacement(_actionable_bodies(text)):
                 raise HTTPException(status_code=422, detail="保留产品模式的提示词不能替换产品。")
-        else:
-            if "目标产品必须匹配已确认产品档案" not in text or not product_profile:
-                raise HTTPException(status_code=422, detail="完整提示词缺少目标产品档案")
-            if "产品参考图用途" not in text:
-                raise HTTPException(status_code=422, detail="完整提示词缺少产品图用途规则")
-            purpose_names = []
-            for asset in product_assets:
-                structure = load_structure(asset)
-                name = str(structure.get("display_name") or structure.get("view_label") or "其他").strip()
-                purpose_names.append(name)
-            for name in purpose_names:
-                if name not in text:
-                    raise HTTPException(status_code=422, detail=f"完整提示词缺少产品图用途：{name}")
     prompt_revision = PromptRevision(
         project_id=project_id, version=version, text=text,
         visual_direction=payload.visual_direction.strip(), audio_mode=payload.audio_mode,

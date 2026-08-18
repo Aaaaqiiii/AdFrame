@@ -993,15 +993,26 @@ def _full_prompt_project(client: TestClient, mode: str = "preserve_product") -> 
             ))
         session.commit()
         revision_id = str(revision.id)
-    return {"id": project["id"], "revision_id": revision_id, "mode": mode}
+    return {
+        "id": project["id"], "revision_id": revision_id, "mode": mode,
+        "product_profile": "核心卖点：轻薄、不黏腻" if mode == "replace_product" else "",
+        "product_image_purposes": ["正面：锁定该角度结构（注意瓶盖）"] if mode == "replace_product" else [],
+        "people_reference": None, "background_reference": None,
+        "audio_mode": "keep_original", "audio_style": "",
+    }
 
 
 def _full_prompt_text(project: dict) -> str:
-    prefix = "全局规则：原参考视频是时间轴、动作、构图、运镜、节奏和镜头顺序的最高优先级参考。\n"
-    if project["mode"] == "replace_product":
-        prefix += "目标产品必须匹配已确认产品档案：核心卖点：轻薄、不黏腻\n产品参考图用途：\n- 正面：锁定该角度结构（注意瓶盖）\n"
-    else:
-        prefix += "保持原产品不变，禁止替换、删除或重新设计原产品。\n"
+    from app.services.final_prompt import build_full_prompt_prefix
+    prefix = build_full_prompt_prefix(
+        project_mode=project["mode"],
+        product_profile=project["product_profile"],
+        product_image_purposes=project["product_image_purposes"],
+        people_reference=project.get("people_reference"),
+        background_reference=project.get("background_reference"),
+        audio_mode=project.get("audio_mode", "keep_original"),
+        audio_style=project.get("audio_style", ""),
+    )
     return (
         prefix + "\n"
         "00:00.00–00:04.00\n保持：人物身份、动作节奏、手部位置、背景、构图、镜头运动不变。\n修改：无。\n删除：无。\n禁止：不得新增文字或改变动作。\n\n"
@@ -1034,7 +1045,10 @@ def test_full_prompt_ai_creation_queues_full_reference_video_edit() -> None:
         assert revision is not None
         assert revision.prompt_mode == "full_reference_video_edit"
         assert revision.generation_segment_id is None
-        assert revision.text == ""
+        # 排队时冻结确定性前缀（非空），Worker 完成后替换为完整提示词。
+        expected_prefix = _full_prompt_text(project).split("00:00.00–00:04.00")[0].rstrip()
+        assert revision.text == expected_prefix
+        assert revision.text.startswith("原参考视频是时间轴")
 
 
 def test_full_prompt_manual_save_accepts_all_blocks_and_prefix() -> None:
@@ -1060,7 +1074,7 @@ def test_full_prompt_manual_save_accepts_all_blocks_and_prefix() -> None:
 @pytest.mark.parametrize("mutate", [
     lambda text: text.replace("00:04.00–00:09.50", ""),  # 删掉整个第二块
     lambda text: text.replace("删除：无", ""),  # 删栏目
-    lambda text: text.replace("目标产品必须匹配已确认产品档案：核心卖点：轻薄、不黏腻", ""),  # 删产品档案
+    lambda text: text.replace("核心卖点：轻薄、不黏腻", "虚构卖点：不是真实的"),  # 篡改产品档案
     lambda text: text.replace("产品参考图用途", "参考资料"),  # 删用途规则
 ])
 def test_full_prompt_manual_save_rejects_incomplete(mutate) -> None:
@@ -1105,6 +1119,78 @@ def test_full_prompt_legacy_segment_revisions_remain_readable() -> None:
         revision = session.get(PromptRevision, old_id)
         assert revision.prompt_mode == "reference_video_edit"
         assert revision.text == "00:00.00–00:08.00\n保持：a\n修改：无。\n删除：无。\n禁止：无。"
+
+
+def test_full_prompt_gpt_receives_frozen_prefix_context() -> None:
+    """GPT 首次生成必须收到含产品档案与图片用途的确定性前缀上下文。"""
+    from app.services.final_prompt import execute_final_prompt_job
+    client = TestClient(create_app())
+    project = _full_prompt_project(client, mode="replace_product")
+    response = client.post(
+        f"/api/projects/{project['id']}/prompts",
+        json={"visual_direction": "只修改产品", "use_ai": True, "replace_product": True},
+    )
+    assert response.status_code == 202
+    with SessionLocal() as session:
+        revision = session.scalar(select(PromptRevision).where(
+            PromptRevision.project_id == UUID(project["id"]),
+            PromptRevision.version == response.json()["version"],
+        ))
+        job = session.scalar(select(Job).where(
+            Job.project_id == UUID(project["id"]),
+            Job.kind == "final_prompt_generation",
+            Job.provider_input_id == str(revision.id),
+        ))
+        captured = {}
+        def fake_chat(settings, messages, **kw):
+            captured["user"] = messages[1]["content"]
+            return "00:00.00–00:04.00\n保持：a\n修改：无。\n删除：无。\n禁止：无。\n\n00:04.00–00:09.50\n保持：b\n修改：无。\n删除：无。\n禁止：无。"
+        with patch("app.services.final_prompt._chat", side_effect=fake_chat):
+            execute_final_prompt_job(session, job, Settings(comfly_api_key="test-comfly-api-key"))
+        # GPT 输入必须包含冻结前缀（含产品档案与用途）。
+        assert "目标产品必须匹配已确认产品档案" in captured["user"]
+        assert "产品参考图用途" in captured["user"]
+        assert "正面" in captured["user"]
+        assert "原参考视频是时间轴" in captured["user"]
+
+
+def test_full_prompt_queued_prefix_is_frozen_against_product_edits() -> None:
+    """排队后修改产品档案，Worker 仍使用排队时冻结的确定性前缀。"""
+    from app.services.final_prompt import execute_final_prompt_job
+    client = TestClient(create_app())
+    project = _full_prompt_project(client, mode="replace_product")
+    response = client.post(
+        f"/api/projects/{project['id']}/prompts",
+        json={"visual_direction": "只修改产品", "use_ai": True, "replace_product": True},
+    )
+    assert response.status_code == 202
+    # 排队后修改产品档案。
+    with SessionLocal() as session:
+        asset = session.scalar(select(Asset).where(
+            Asset.project_id == UUID(project["id"]), Asset.kind == "product_reference_image",
+        ))
+        asset.profile_text = "排队后修改的新卖点"
+        session.commit()
+    with SessionLocal() as session:
+        revision = session.scalar(select(PromptRevision).where(
+            PromptRevision.project_id == UUID(project["id"]),
+            PromptRevision.version == response.json()["version"],
+        ))
+        job = session.scalar(select(Job).where(
+            Job.project_id == UUID(project["id"]),
+            Job.kind == "final_prompt_generation",
+            Job.provider_input_id == str(revision.id),
+        ))
+        frozen = revision.text
+        def fake_chat(settings, messages, **kw):
+            return "00:00.00–00:04.00\n保持：a\n修改：无。\n删除：无。\n禁止：无。\n\n00:04.00–00:09.50\n保持：b\n修改：无。\n删除：无。\n禁止：无。"
+        with patch("app.services.final_prompt._chat", side_effect=fake_chat):
+            execute_final_prompt_job(session, job, Settings(comfly_api_key="test-comfly-api-key"))
+        session.refresh(revision)
+        assert revision.status == "completed"
+        # 最终版本使用排队时的冻结前缀，而非排队后修改的档案。
+        assert "排队后修改的新卖点" not in revision.text
+        assert frozen in revision.text
 
 
 def test_full_prompt_worker_repairs_missing_column_per_block() -> None:

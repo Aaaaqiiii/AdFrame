@@ -176,7 +176,8 @@ def test_page_two_applies_target_product_to_every_product_shot() -> None:
 
     assert response.status_code == 202
     assert response.json()["status"] == "queued"
-    assert response.json()["text"] == ""
+    # AI 入队返回冻结的确定性前缀（非空），Worker 完成后再替换为完整提示词。
+    assert response.json()["text"].startswith("原参考视频是时间轴")
     with SessionLocal() as session:
         revision = session.scalar(select(PromptRevision).where(
             PromptRevision.project_id == UUID(project["id"]),
@@ -283,13 +284,17 @@ def test_replace_mode_forces_replacement_when_client_sends_false() -> None:
         json={"product": "原产品", "confirmed": True},
     )
 
+    from app.services.final_prompt import build_full_prompt_prefix
+    prefix = build_full_prompt_prefix(
+        project_mode="replace_product", product_profile="已确认盒装产品",
+        product_image_purposes=["other：锁定该角度结构"], people_reference=None,
+        background_reference=None, audio_mode="keep_original", audio_style="",
+    )
     response = client.post(
         f"/api/projects/{project['id']}/prompts",
         json={
             "visual_direction": (
-                "全局规则：原参考视频是时间轴、动作、构图、运镜、节奏和镜头顺序的最高优先级参考。\n"
-                "目标产品必须匹配已确认产品档案：已确认盒装产品\n"
-                "产品参考图用途：\n- other：锁定该角度结构\n\n"
+                prefix + "\n\n"
                 "00:00.00–00:03.00\n保持：a\n修改：无。\n删除：无。\n禁止：无。"
             ),
             "replace_product": False,
@@ -368,7 +373,7 @@ def test_final_prompt_worker_rejects_replacement_output_in_preserve_mode() -> No
                 assert "保留产品模式" in str(error)
             else:
                 assert False, "preserve-mode worker must reject replacement output"
-        assert revision.text == ""
+        assert revision.text.startswith("原参考视频是时间轴")
         assert revision.status == "queued"
         assert job.status == "queued"
 
@@ -444,7 +449,8 @@ def test_run_once_discards_unsafe_final_prompt_before_retry_commit() -> None:
         ))
         assert revision is not None
         assert job is not None
-        assert revision.text == ""
+        # 拒绝后保持排队时冻结的确定性前缀，绝不标记 completed。
+        assert revision.text.startswith("原参考视频是时间轴")
         assert revision.status != "completed"
         assert revision.status in {"retryable", "failed"}
         assert job.status == revision.status

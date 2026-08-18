@@ -86,7 +86,7 @@ def build_full_prompt_prefix(
         lines.append(f"人物必须匹配已确认人物参考：{people_reference}")
     if background_reference:
         lines.append(f"背景必须匹配已确认背景参考：{background_reference}")
-    lines.append(audio_style if audio_mode == "add_style" else "保持原 BGM，不增加音频描述")
+    lines.append(audio_style if audio_mode == "add_style" else "不要求 Seedance 生成新音频；分段参考片段不携带原音频，不宣称保留原 BGM。")
     lines.append("禁止新增字幕、贴纸、水印、乱码和不存在包装文字。")
     lines.append("不得新增未确认场景、动作、人物或产品功效。")
     return "\n".join(lines)
@@ -117,6 +117,8 @@ def generate_full_edit_prompt(
             "栏目正文可写“无”，但不能缺少栏目或时间块。"
         )},
         {"role": "user", "content": (
+            "服务端确定性全局前缀（只读约束，不得改写，必须严格遵循）：\n"
+            f"{deterministic_prefix}\n\n"
             f"改编要求：{visual_direction}\n"
             f"预期绝对时间块（必须全部覆盖、顺序一致）：\n{chr(10).join(expected_labels)}\n"
             "分镜事实：\n" + json.dumps(shot_slices, ensure_ascii=False)
@@ -146,7 +148,11 @@ def generate_full_edit_prompt(
             if block_text is None or not all(h in block_text for h in ("保持：", "修改：", "删除：", "禁止：")):
                 repair = _chat(settings, [
                     {"role": "system", "content": "你负责补全一个镜头编辑指令块。必须以指定绝对时间范围开头，包含 保持/修改/删除/禁止 四栏目，只输出这个块。"},
-                    {"role": "user", "content": f"请补全块：{label}\n" + json.dumps(shot_slices[index], ensure_ascii=False)},
+                    {"role": "user", "content": (
+                        "服务端确定性全局前缀（只读约束，不得改写）：\n"
+                        f"{deterministic_prefix}\n\n"
+                        f"请补全块：{label}\n" + json.dumps(shot_slices[index], ensure_ascii=False)
+                    )},
                 ], max_tokens=4000)
                 # 补全返回通常以标签开头；剥离标签只保留四栏目正文。
                 if repair.startswith(label):
@@ -470,20 +476,14 @@ def execute_final_prompt_job(session: Session, job: Job, settings: Settings | No
             note = str(structure.get("note") or "").strip()
             product_purpose_lines.append(f"{name}：锁定该角度结构" + (f"（{note}）" if note else ""))
     if revision.prompt_mode == "full_reference_video_edit":
-        # 完整提示词：使用冻结时间轴全部已确认镜头，服务端确定性前缀。
+        # 完整提示词：使用冻结时间轴全部已确认镜头。
         if not shots:
             raise ValueError("当前时间轴没有已确认镜头")
-        people_reference = profile("person_reference_image") or None
-        background_reference = profile("background_reference_image") or None
-        deterministic_prefix = build_full_prompt_prefix(
-            project_mode=project.mode,
-            product_profile=product_profile,
-            product_image_purposes=product_purpose_lines,
-            people_reference=people_reference,
-            background_reference=background_reference,
-            audio_mode=revision.audio_mode,
-            audio_style=revision.audio_style,
-        )
+        # 确定性前缀来自排队时冻结的快照（revision.text），不重新读取当前产品/人物/背景资料。
+        frozen_prefix = (revision.text or "").strip()
+        if not frozen_prefix:
+            raise ValueError("排队版本缺少冻结的确定性前缀")
+        deterministic_prefix = frozen_prefix
         generated_text = generate_full_edit_prompt(
             settings=settings,
             shot_slices=shots,
