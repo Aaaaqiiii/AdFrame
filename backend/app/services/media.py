@@ -95,11 +95,32 @@ def clip_video(source: Path, destination: Path, start_sec: float, end_sec: float
 
 
 def ensure_segment_clip(source: Path, destination: Path, start_sec: float, end_sec: float, max_sec: float) -> Path:
-    """Create or reuse a persistent segment clip, reusing clip_video() without changing codec/audio flags."""
+    """Create or reuse a persistent segment clip, reusing clip_video() without changing codec/audio flags.
+
+    - 缓存不存在：正常裁切。
+    - 缓存可探测：直接复用。
+    - 缓存探测显示损坏/未写完整：删除并重新裁切。
+    - FFmpeg/FFprobe 工具不可用：保留原异常，不误删文件。
+    """
+    def _probe(path: Path) -> VideoMetadata:
+        try:
+            return probe_video(path)
+        except MediaToolUnavailableError:
+            # 工具缺失时原样抛出，绝不删除缓存。
+            raise
+        except (subprocess.CalledProcessError, json.JSONDecodeError, StopIteration, KeyError, ValueError):
+            # 媒体损坏或解析失败：删除坏缓存并重新裁切。
+            path.unlink(missing_ok=True)
+            raise
+
     if destination.is_file():
-        metadata = probe_video(destination)
+        try:
+            metadata = _probe(destination)
+        except (subprocess.CalledProcessError, json.JSONDecodeError, StopIteration, KeyError, ValueError):
+            # 损坏缓存已删除，回退到全新裁切。
+            metadata = _probe(clip_video(source, destination, start_sec, end_sec))
     else:
-        metadata = probe_video(clip_video(source, destination, start_sec, end_sec))
+        metadata = _probe(clip_video(source, destination, start_sec, end_sec))
     if metadata.duration_sec > max_sec:
         destination.unlink(missing_ok=True)
         raise ValueError("生成片段超过供应商安全时长")
