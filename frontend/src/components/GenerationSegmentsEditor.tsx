@@ -1,10 +1,13 @@
-import { useEffect, useState } from 'react'
+import { useEffect, useRef, useState } from 'react'
 import {
   canSaveSegmentPlan,
+  isShortSegmentCandidate,
   mergeSegments,
   moveSegmentBoundary,
   segmentDuration,
   segmentIssue,
+  segmentStructureMatches,
+  shouldResetDraft,
   splitSegment,
   toggleShortSegmentAccepted,
 } from '../generationSegments'
@@ -37,8 +40,13 @@ export function GenerationSegmentsEditor(p: Props) {
   const [dirty, setDirty] = useState(false)
   const [allowInsideShot, setAllowInsideShot] = useState(false)
 
-  // 后端方案变化时重建本地 draft（含恢复自动方案）。
+  // 只在稳定方案身份（plan_version）变化时重建 draft；同一不可变方案的重复 GET
+  // （轮询期间 restoreProject 会产生新数组引用）不得清空用户未保存草稿。
+  const planIdentity = p.planVersion
+  const lastPlanIdentity = useRef<number | null>(null)
   useEffect(() => {
+    if (!shouldResetDraft(planIdentity, lastPlanIdentity.current)) return
+    lastPlanIdentity.current = planIdentity
     setDraft(p.segments.map((segment) => ({
       source_start_sec: segment.source_start_sec,
       source_end_sec: segment.source_end_sec,
@@ -47,10 +55,13 @@ export function GenerationSegmentsEditor(p: Props) {
       short_segment_accepted: segment.short_segment_accepted,
     })))
     setDirty(false)
-  }, [p.segments])
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [planIdentity])
 
   const shotBoundaries = [0, ...p.shots.map((shot) => shot.end_sec), p.durationSec]
   const canSave = canSaveSegmentPlan(draft, p.durationSec, p.maxSegmentSeconds, p.recommendedMinSeconds)
+  // 草稿与后端持久化方案结构不一致（段数或边界不同）时，按旧索引选中后端 segment 不再安全。
+  const structurallyDirty = dirty && !segmentStructureMatches(draft, p.segments)
 
   function update(next: GenerationSegmentInput[]) {
     setDraft(next)
@@ -89,8 +100,11 @@ export function GenerationSegmentsEditor(p: Props) {
         const duration = segmentDuration(segment)
         const issue = segmentIssue(segment, p.durationSec, p.maxSegmentSeconds, p.recommendedMinSeconds)
         const coveredShots = p.shots.filter((shot) => shot.start_sec < segment.source_end_sec && shot.end_sec > segment.source_start_sec)
-        const selected = p.selectedSegmentId === p.segments[index]?.id
-        return <div key={index} className={`segment-card${selected ? ' selected' : ''}`} onClick={() => { const id = p.segments[index]?.id; if (id) p.onSelectSegment(id) }}>
+        const persisted = p.segments[index]
+        const selected = Boolean(persisted) && p.selectedSegmentId === persisted.id
+        const isShortCandidate = isShortSegmentCandidate(segment, p.durationSec, p.recommendedMinSeconds)
+        const clickable = Boolean(persisted) && !structurallyDirty
+        return <div key={index} className={`segment-card${selected ? ' selected' : ''}${clickable ? '' : ' not-selectable'}`} onClick={() => { if (clickable && persisted) p.onSelectSegment(persisted.id) }}>
           <div className="segment-card-head">
             <strong>片段 {index + 1}</strong>
             <span>{segment.source_start_sec.toFixed(2)}s – {segment.source_end_sec.toFixed(2)}s · {duration.toFixed(2)}s</span>
@@ -101,9 +115,10 @@ export function GenerationSegmentsEditor(p: Props) {
           <div className="segment-card-shots">
             分镜 {coveredShots.length ? coveredShots.map((shot, i) => <span key={shot.id}>{p.shots.indexOf(shot) + 1}{i < coveredShots.length - 1 ? '、' : ''}</span>) : '无'}
           </div>
-          {issue?.code === 'short_segment' && <div className="segment-short-accept">
+          {isShortCandidate && <div className="segment-short-accept">
             <label><input type="checkbox" checked={Boolean(segment.short_segment_accepted)} onChange={() => update(toggleShortSegmentAccepted(draft, index))} />我确认保留此短段</label>
           </div>}
+          {structurallyDirty && !isShortCandidate && <div className="segment-short-accept muted">请先保存草稿以继续选择此分段。</div>}
           {index < draft.length - 1 && <div className="segment-boundary-move" onClick={(event) => event.stopPropagation()}>
             <label>切点 <input type="number" step="0.01" min={segment.source_start_sec + 0.01} max={draft[index + 1].source_end_sec - 0.01} value={segment.source_end_sec} onChange={(event) => update(moveSegmentBoundary(draft, index, Number(event.target.value), shotBoundaries, p.durationSec, allowInsideShot))} /></label>
             <span>{allowInsideShot ? '允许镜头内部切分' : '吸附到最近分镜边界'}</span>

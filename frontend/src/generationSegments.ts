@@ -114,8 +114,9 @@ export function splitSegment(
     cut = snapped
   }
   const next = [...segments]
+  // 分割改变了左段右边界与右段左边界，两段都需重新确认短段。
   next.splice(targetIndex, 1,
-    { ...target, source_end_sec: cut, end_boundary_type: cutType },
+    { ...target, source_end_sec: cut, end_boundary_type: cutType, short_segment_accepted: false },
     { ...target, source_start_sec: cut, start_boundary_type: cutType, short_segment_accepted: false },
   )
   return next
@@ -135,7 +136,8 @@ export function mergeSegments(
     source_end_sec: right.source_end_sec,
     start_boundary_type: left.source_start_sec <= EPSILON ? 'video_edge' : left.start_boundary_type,
     end_boundary_type: Math.abs(right.source_end_sec - durationSec) <= EPSILON ? 'video_edge' : right.end_boundary_type,
-    short_segment_accepted: left.short_segment_accepted || right.short_segment_accepted,
+    // 合并产生新边界，短段确认必须重新确认。
+    short_segment_accepted: false,
   }
   const next = [...segments]
   next.splice(index, 2, merged)
@@ -166,8 +168,9 @@ export function moveSegmentBoundary(
   }
   if (cut <= current.source_start_sec + EPSILON || cut >= neighbor.source_end_sec - EPSILON) return segments
   const next = [...segments]
-  next[index] = { ...current, source_end_sec: cut, end_boundary_type: cutType }
-  next[index + 1] = { ...neighbor, source_start_sec: cut, start_boundary_type: cutType }
+  // 边界移动改变了相邻两段，短段确认都需重新确认。
+  next[index] = { ...current, source_end_sec: cut, end_boundary_type: cutType, short_segment_accepted: false }
+  next[index + 1] = { ...neighbor, source_start_sec: cut, start_boundary_type: cutType, short_segment_accepted: false }
   return next
 }
 
@@ -179,4 +182,34 @@ export function toggleShortSegmentAccepted(
   const next = [...segments]
   next[index] = { ...next[index], short_segment_accepted: !next[index].short_segment_accepted }
   return next
+}
+
+export function shouldResetDraft(planIdentity: number, lastIdentity: number | null): boolean {
+  // 只在稳定方案身份变化时重置草稿；同一不可变方案的重复 GET 不重置。
+  return lastIdentity === null || lastIdentity !== planIdentity
+}
+
+export function isShortSegmentCandidate(
+  segment: Pick<GenerationSegmentInput, 'source_start_sec' | 'source_end_sec'>,
+  durationSec: number,
+  minSec: number,
+): boolean {
+  // 实际时长小于推荐下限且不是完整短视频 → 持续显示确认控件（与确认状态无关）。
+  const duration = segmentDuration(segment)
+  if (duration >= minSec - EPSILON) return false
+  const coversFullSource = segment.source_start_sec <= EPSILON && Math.abs(segment.source_end_sec - durationSec) <= EPSILON
+  return !coversFullSource
+}
+
+export function segmentStructureMatches(
+  draft: GenerationSegmentInput[],
+  persisted: GenerationSegment[],
+): boolean {
+  if (draft.length !== persisted.length) return false
+  return draft.every((segment, index) => {
+    const other = persisted[index]
+    return Boolean(other)
+      && Math.abs(segment.source_start_sec - other.source_start_sec) <= EPSILON
+      && Math.abs(segment.source_end_sec - other.source_end_sec) <= EPSILON
+  })
 }
