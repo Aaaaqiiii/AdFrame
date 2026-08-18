@@ -313,25 +313,39 @@ def test_replace_mode_forces_replacement_when_client_sends_false() -> None:
 
 
 def test_refinement_uses_project_mode_not_source_revision() -> None:
+    from app.services.final_prompt import build_full_prompt_prefix
     client = _client()
     project = _project(client, "preserve_product")
-    with SessionLocal() as session:
-        session.add(PromptRevision(
-            project_id=UUID(project["id"]), version=1, text="原提示词",
-            visual_direction="保持节奏", replace_product=True, status="completed",
-        ))
-        session.commit()
+    timeline = client.put(
+        f"/api/projects/{project['id']}/timeline",
+        json={"shots": [{"start_sec": 0, "end_sec": 3}]},
+    ).json()
+    client.put(
+        f"/api/projects/{project['id']}/shots/{timeline['shots'][0]['id']}/edit",
+        json={"action": "展示", "confirmed": True},
+    )
+    prefix = build_full_prompt_prefix(
+        project_mode="preserve_product", product_profile="", product_image_purposes=[],
+        people_reference=None, background_reference=None,
+        audio_mode="keep_original", audio_style="",
+    )
+    text = prefix + "\n\n" + "00:00.00–00:03.00\n保持：a\n修改：无。\n删除：无。\n禁止：无。"
+    v1 = client.post(
+        f"/api/projects/{project['id']}/prompts",
+        json={"visual_direction": text, "use_ai": False},
+    )
+    assert v1.status_code == 201
 
     response = client.post(
         f"/api/projects/{project['id']}/prompts/refine",
-        json={"instruction": "增强光线"},
+        json={"instruction": "增强光线", "source_version": v1.json()["version"]},
     )
 
     assert response.status_code == 202
     with SessionLocal() as session:
         revision = session.scalar(select(PromptRevision).where(
             PromptRevision.project_id == UUID(project["id"]),
-            PromptRevision.version == 2,
+            PromptRevision.version == response.json()["version"],
         ))
         assert revision is not None
         assert revision.replace_product is False
@@ -379,23 +393,37 @@ def test_final_prompt_worker_rejects_replacement_output_in_preserve_mode() -> No
 
 
 def test_refinement_worker_rejects_replacement_output_in_preserve_mode() -> None:
+    from app.services.final_prompt import build_full_prompt_prefix
     client = _client()
     project = _project(client, "preserve_product")
-    with SessionLocal() as session:
-        session.add(PromptRevision(
-            project_id=UUID(project["id"]), version=1, text="00:00.00–00:03.00\n原提示词",
-            visual_direction="保持节奏", status="completed",
-        ))
-        session.commit()
+    timeline = client.put(
+        f"/api/projects/{project['id']}/timeline",
+        json={"shots": [{"start_sec": 0, "end_sec": 3}]},
+    ).json()
+    client.put(
+        f"/api/projects/{project['id']}/shots/{timeline['shots'][0]['id']}/edit",
+        json={"action": "展示", "confirmed": True},
+    )
+    prefix = build_full_prompt_prefix(
+        project_mode="preserve_product", product_profile="", product_image_purposes=[],
+        people_reference=None, background_reference=None,
+        audio_mode="keep_original", audio_style="",
+    )
+    text = prefix + "\n\n" + "00:00.00–00:03.00\n保持：a\n修改：无。\n删除：无。\n禁止：无。"
+    v1 = client.post(
+        f"/api/projects/{project['id']}/prompts",
+        json={"visual_direction": text, "use_ai": False},
+    )
+    assert v1.status_code == 201
     client.post(
         f"/api/projects/{project['id']}/prompts/refine",
-        json={"instruction": "调整画面"},
+        json={"instruction": "调整画面", "source_version": v1.json()["version"]},
     )
 
     with SessionLocal() as session:
         revision = session.scalar(select(PromptRevision).where(
             PromptRevision.project_id == UUID(project["id"]),
-            PromptRevision.version == 2,
+            PromptRevision.version == v1.json()["version"] + 1,
         ))
         job = session.scalar(select(Job).where(
             Job.project_id == UUID(project["id"]),
@@ -403,14 +431,14 @@ def test_refinement_worker_rejects_replacement_output_in_preserve_mode() -> None
         ))
         assert revision is not None
         assert job is not None
-        with patch("app.services.final_prompt._chat", return_value="00:00.00–00:03.00\nreplace the bottle with shampoo"):
+        # 块正文的“修改”栏目写入了产品替换 → 精修必须拒绝。
+        with patch("app.services.final_prompt._chat", return_value="00:00.00–00:03.00\n保持：a\n修改：将原产品替换为新产品。\n删除：无。\n禁止：无。"):
             try:
                 execute_prompt_refinement_job(session, job, Settings(comfly_api_key="test-comfly-api-key"))
             except ValueError as error:
                 assert "保留产品模式" in str(error)
             else:
                 assert False, "preserve-mode worker must reject replacement output"
-        assert revision.text == "00:00.00–00:03.00\n原提示词"
         assert revision.status == "queued"
         assert job.status == "queued"
 

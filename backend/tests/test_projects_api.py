@@ -341,18 +341,24 @@ def test_prompt_history_missing_project_returns_not_found() -> None:
 
 def test_refinement_queues_selected_completed_version_snapshot() -> None:
     client = TestClient(create_app())
-    project = client.post("/api/projects", json={"name": "refinement snapshot"}).json()
+    project = _full_prompt_project(client)
+    source_text = _full_prompt_text(project)
+    source_v2 = source_text.replace("镜头二保持正文", "镜头二保持正文（第二版）")
+    # 直插两个 completed full 源版本，选择 v1 精修。
     with SessionLocal() as session:
+        revision = session.scalar(select(TimelineRevision).where(TimelineRevision.project_id == UUID(project["id"])))
         session.add_all([
             PromptRevision(
                 project_id=UUID(project["id"]), version=1,
-                text="00:00.00–00:03.00\nfirst source",
-                visual_direction="first", status="completed",
+                text=source_text, visual_direction="first", status="completed",
+                prompt_mode="full_reference_video_edit", generation_segment_id=None,
+                source_timeline_revision_id=revision.id,
             ),
             PromptRevision(
                 project_id=UUID(project["id"]), version=2,
-                text="00:00.00–00:03.00\nsecond source",
-                visual_direction="second", status="completed",
+                text=source_v2, visual_direction="second", status="completed",
+                prompt_mode="full_reference_video_edit", generation_segment_id=None,
+                source_timeline_revision_id=revision.id,
             ),
         ])
         session.commit()
@@ -371,7 +377,8 @@ def test_refinement_queues_selected_completed_version_snapshot() -> None:
             PromptRevision.version == selected.json()["version"],
         ))
         assert queued is not None
-        assert queued.text == "00:00.00–00:03.00\nfirst source"
+        assert queued.text == source_text
+        assert queued.prompt_mode == "full_reference_video_edit"
 
     latest = client.post(
         f"/api/projects/{project['id']}/prompts/refine",
@@ -385,7 +392,7 @@ def test_refinement_queues_selected_completed_version_snapshot() -> None:
             PromptRevision.version == latest.json()["version"],
         ))
         assert queued is not None
-        assert queued.text == "00:00.00–00:03.00\nsecond source"
+        assert queued.text == source_v2
         for job in session.scalars(select(Job).where(
             Job.project_id == UUID(project["id"]),
             Job.kind == "prompt_refinement",
@@ -737,7 +744,7 @@ def test_segment_refinement_missing_block_fails_not_completed() -> None:
         # 精修结果删掉了第一个时间块和“禁止”栏目。
         broken = "00:04.00–00:09.50\n保持：b\n修改：无。\n删除：无。"
         from app.services.final_prompt import execute_prompt_refinement_job
-        with patch("app.services.final_prompt.refine_prompt", return_value=broken):
+        with patch("app.services.final_prompt._chat", return_value=broken):
             try:
                 execute_prompt_refinement_job(session, job, Settings(comfly_api_key="test-comfly-api-key"))
             except ValueError as error:
@@ -941,9 +948,9 @@ def test_replace_segment_refinement_restores_deterministic_prefix() -> None:
             Job.provider_input_id == str(new_revision.id),
         ))
         from app.services.final_prompt import execute_prompt_refinement_job
-        # GPT 返回含源前缀的完整精修文本（legacy 路径直接保留）。
-        full = _full_prompt_text(project).replace("镜头二保持正文", "镜头二保持正文，增强光线")
-        with patch("app.services.final_prompt.refine_prompt", return_value=full):
+        # GPT 返回块正文（无前缀，前缀由 transform 从源版本恢复）。
+        blocks = _full_prompt_text(project).split("00:00.00–00:04.00")[1].replace("镜头二保持正文", "镜头二保持正文，增强光线")
+        with patch("app.services.final_prompt._chat", return_value="00:00.00–00:04.00" + blocks):
             execute_prompt_refinement_job(session, job, Settings(comfly_api_key="test-comfly-api-key"))
         session.refresh(new_revision)
         assert new_revision.status == "completed"
@@ -1260,3 +1267,223 @@ def test_full_prompt_ai_creation_rejects_unconfirmed_shot() -> None:
     with SessionLocal() as session:
         jobs = session.scalars(select(Job).where(Job.project_id == UUID(project["id"]), Job.kind == "final_prompt_generation")).all()
         assert jobs == []
+
+
+def test_full_prompt_refinement_restores_exact_source_prefix() -> None:
+    """完整提示词精修：GPT 改写前缀时，最终版本仍从源版本原样恢复前缀，且模式保持。"""
+    from app.services.final_prompt import execute_prompt_refinement_job
+    client = TestClient(create_app())
+    project = _full_prompt_project(client)
+    v1 = client.post(
+        f"/api/projects/{project['id']}/prompts",
+        json={"visual_direction": _full_prompt_text(project), "use_ai": False},
+    )
+    assert v1.status_code == 201
+    source_text = _full_prompt_text(project)
+    source_prefix = source_text.split("00:00.00–00:04.00")[0].rstrip()
+    refined = client.post(
+        f"/api/projects/{project['id']}/prompts/refine",
+        json={"instruction": "增强光线", "source_version": v1.json()["version"]},
+    )
+    assert refined.status_code == 202
+    with SessionLocal() as session:
+        new_revision = session.scalar(select(PromptRevision).where(
+            PromptRevision.project_id == UUID(project["id"]),
+            PromptRevision.version == refined.json()["version"],
+        ))
+        job = session.scalar(select(Job).where(
+            Job.project_id == UUID(project["id"]),
+            Job.kind == "prompt_refinement",
+            Job.provider_input_id == str(new_revision.id),
+        ))
+        # GPT 恶意改写前缀，只返回改写的块正文。
+        malicious = (
+            "全局规则：GPT 改写的假前缀。\n\n"
+            "00:00.00–00:04.00\n保持：a\n修改：增强光线。\n删除：无。\n禁止：无。\n\n"
+            "00:04.00–00:09.50\n保持：b\n修改：无。\n删除：无。\n禁止：无。"
+        )
+        with patch("app.services.final_prompt._chat", return_value=malicious):
+            execute_prompt_refinement_job(session, job, Settings(comfly_api_key="test-comfly-api-key"))
+        session.refresh(new_revision)
+        assert new_revision.status == "completed"
+        assert new_revision.prompt_mode == "full_reference_video_edit"
+        assert new_revision.generation_segment_id is None
+        # 前缀从源版本原样恢复，GPT 假前缀被丢弃。
+        assert new_revision.text.startswith(source_prefix)
+        assert "GPT 改写的假前缀" not in new_revision.text
+        assert "00:00.00–00:04.00" in new_revision.text
+        assert "00:04.00–00:09.50" in new_revision.text
+
+
+def test_full_prompt_refinement_keeps_block_count_and_order() -> None:
+    """完整提示词精修：时间标签、块数量、顺序、四栏目必须保持。"""
+    from app.services.final_prompt import execute_prompt_refinement_job
+    client = TestClient(create_app())
+    project = _full_prompt_project(client)
+    v1 = client.post(
+        f"/api/projects/{project['id']}/prompts",
+        json={"visual_direction": _full_prompt_text(project), "use_ai": False},
+    )
+    refined = client.post(
+        f"/api/projects/{project['id']}/prompts/refine",
+        json={"instruction": "增强光线", "source_version": v1.json()["version"]},
+    )
+    with SessionLocal() as session:
+        new_revision = session.scalar(select(PromptRevision).where(
+            PromptRevision.project_id == UUID(project["id"]),
+            PromptRevision.version == refined.json()["version"],
+        ))
+        job = session.scalar(select(Job).where(
+            Job.project_id == UUID(project["id"]),
+            Job.kind == "prompt_refinement",
+            Job.provider_input_id == str(new_revision.id),
+        ))
+        broken = "00:04.00–00:09.50\n保持：b\n修改：无。\n删除：无。\n禁止：无。"  # 缺第一块
+        with patch("app.services.final_prompt._chat", return_value=broken):
+            try:
+                execute_prompt_refinement_job(session, job, Settings(comfly_api_key="test-comfly-api-key"))
+            except ValueError as error:
+                assert "不完整" in str(error)
+            else:
+                assert False, "缺块精修必须失败"
+        session.refresh(new_revision)
+        assert new_revision.status != "completed"
+
+
+def test_optimize_selling_points_creates_new_version_and_job() -> None:
+    """卖点优化创建新的 queued 版本与 Job，不覆盖源版本。"""
+    client = TestClient(create_app())
+    project = _full_prompt_project(client, mode="replace_product")
+    v1 = client.post(
+        f"/api/projects/{project['id']}/prompts",
+        json={"visual_direction": _full_prompt_text(project), "use_ai": False},
+    )
+    assert v1.status_code == 201
+    optimized = client.post(
+        f"/api/projects/{project['id']}/prompts/optimize-selling-points",
+        json={"source_version": v1.json()["version"]},
+    )
+    assert optimized.status_code == 202
+    with SessionLocal() as session:
+        new_revision = session.scalar(select(PromptRevision).where(
+            PromptRevision.project_id == UUID(project["id"]),
+            PromptRevision.version == optimized.json()["version"],
+        ))
+        job = session.scalar(select(Job).where(
+            Job.project_id == UUID(project["id"]),
+            Job.kind == "prompt_selling_point_optimization",
+            Job.provider_input_id == str(new_revision.id),
+        ))
+        assert new_revision is not None
+        assert new_revision.status == "queued"
+        assert new_revision.prompt_mode == "full_reference_video_edit"
+        assert new_revision.generation_segment_id is None
+        # 新版本 text 冻结源版本全文（快照）。
+        assert new_revision.text == _full_prompt_text(project)
+        assert job is not None
+        assert job.status == "queued"
+    # 源版本保持不变。
+    history = client.get(f"/api/projects/{project['id']}/prompts")
+    versions = [item["version"] for item in history.json()]
+    assert 1 in versions and 2 in versions
+
+
+def test_optimize_selling_points_rejects_invalid_source() -> None:
+    """卖点优化：非完成源/旧时间轴/缺源 → 422 不创建版本或任务。"""
+    client = TestClient(create_app())
+    project = _full_prompt_project(client, mode="replace_product")
+    # 无源版本。
+    resp = client.post(
+        f"/api/projects/{project['id']}/prompts/optimize-selling-points",
+        json={"source_version": 99},
+    )
+    assert resp.status_code == 422
+    with SessionLocal() as session:
+        jobs = session.scalars(select(Job).where(
+            Job.project_id == UUID(project["id"]), Job.kind == "prompt_selling_point_optimization",
+        )).all()
+        assert jobs == []
+
+
+def test_selling_point_optimization_worker_restores_prefix_and_keeps_blocks() -> None:
+    """卖点优化 worker：恢复源前缀、保持块结构、只改修改栏目。"""
+    from app.services.final_prompt import execute_selling_point_optimization_job
+    client = TestClient(create_app())
+    project = _full_prompt_project(client, mode="replace_product")
+    v1 = client.post(
+        f"/api/projects/{project['id']}/prompts",
+        json={"visual_direction": _full_prompt_text(project), "use_ai": False},
+    )
+    assert v1.status_code == 201
+    source_prefix = _full_prompt_text(project).split("00:00.00–00:04.00")[0].rstrip()
+    optimized = client.post(
+        f"/api/projects/{project['id']}/prompts/optimize-selling-points",
+        json={"source_version": v1.json()["version"]},
+    )
+    assert optimized.status_code == 202
+    with SessionLocal() as session:
+        new_revision = session.scalar(select(PromptRevision).where(
+            PromptRevision.project_id == UUID(project["id"]),
+            PromptRevision.version == optimized.json()["version"],
+        ))
+        job = session.scalar(select(Job).where(
+            Job.project_id == UUID(project["id"]),
+            Job.kind == "prompt_selling_point_optimization",
+            Job.provider_input_id == str(new_revision.id),
+        ))
+        blocks = (
+            "00:00.00–00:04.00\n保持：a\n修改：突出轻薄质感，光线柔和。\n删除：无。\n禁止：无。\n\n"
+            "00:04.00–00:09.50\n保持：b\n修改：无。\n删除：无。\n禁止：无。"
+        )
+        with patch("app.services.final_prompt._chat", return_value=blocks):
+            execute_selling_point_optimization_job(session, job, Settings(comfly_api_key="test-comfly-api-key"))
+        session.refresh(new_revision)
+        assert new_revision.status == "completed"
+        assert new_revision.text.startswith(source_prefix)
+        assert "突出轻薄质感" in new_revision.text
+        assert "00:00.00–00:04.00" in new_revision.text
+        assert "00:04.00–00:09.50" in new_revision.text
+    # 源版本未被覆盖。
+    with SessionLocal() as session:
+        source = session.scalar(select(PromptRevision).where(
+            PromptRevision.project_id == UUID(project["id"]),
+            PromptRevision.version == v1.json()["version"],
+        ))
+        assert source.text == _full_prompt_text(project)
+        assert source.status == "completed"
+
+
+def test_selling_point_optimization_invalid_structure_fails_not_completed() -> None:
+    """卖点优化结构失败（缺块/虚构卖点）不得标记 completed。"""
+    from app.services.final_prompt import execute_selling_point_optimization_job
+    client = TestClient(create_app())
+    project = _full_prompt_project(client, mode="replace_product")
+    v1 = client.post(
+        f"/api/projects/{project['id']}/prompts",
+        json={"visual_direction": _full_prompt_text(project), "use_ai": False},
+    )
+    optimized = client.post(
+        f"/api/projects/{project['id']}/prompts/optimize-selling-points",
+        json={"source_version": v1.json()["version"]},
+    )
+    with SessionLocal() as session:
+        new_revision = session.scalar(select(PromptRevision).where(
+            PromptRevision.project_id == UUID(project["id"]),
+            PromptRevision.version == optimized.json()["version"],
+        ))
+        job = session.scalar(select(Job).where(
+            Job.project_id == UUID(project["id"]),
+            Job.kind == "prompt_selling_point_optimization",
+            Job.provider_input_id == str(new_revision.id),
+        ))
+        # 缺第二块。
+        broken = "00:00.00–00:04.00\n保持：a\n修改：无。\n删除：无。\n禁止：无。"
+        with patch("app.services.final_prompt._chat", return_value=broken):
+            try:
+                execute_selling_point_optimization_job(session, job, Settings(comfly_api_key="test-comfly-api-key"))
+            except ValueError as error:
+                assert "不完整" in str(error)
+            else:
+                assert False, "缺块卖点优化必须失败"
+        session.refresh(new_revision)
+        assert new_revision.status != "completed"

@@ -7,7 +7,7 @@ from uuid import UUID, uuid4
 
 from fastapi import APIRouter, Depends, File, Form, HTTPException, Query, Response, UploadFile, status
 from fastapi.responses import FileResponse
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field
 from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
@@ -976,6 +976,12 @@ def refine_prompt_revision(
     source = session.scalar(source_query)
     if source is None:
         raise HTTPException(status_code=422, detail="请先生成或保存一份完整提示词")
+    # 精修只接受已完成的完整提示词。
+    if source.prompt_mode != "full_reference_video_edit":
+        raise HTTPException(status_code=422, detail="只能精修完整视频编辑提示词")
+    current_revision = session.scalar(select(TimelineRevision).where(TimelineRevision.project_id == project_id).order_by(TimelineRevision.version.desc()))
+    if current_revision is None or source.source_timeline_revision_id != current_revision.id:
+        raise HTTPException(status_code=422, detail="提示词来自旧时间轴，请重新生成提示词")
     version = (session.scalar(select(func.max(PromptRevision.version)).where(PromptRevision.project_id == project_id)) or 0) + 1
     revision = PromptRevision(
         project_id=project_id, version=version, text=source.text,
@@ -988,6 +994,60 @@ def refine_prompt_revision(
     session.add(revision)
     session.flush()
     session.add(Job(project_id=project_id, kind="prompt_refinement", status="queued", provider="comfly_gpt_5_6", provider_input_id=str(revision.id)))
+    session.commit()
+    return PromptResponse(version=version, text="", status="queued")
+
+
+class OptimizeSellingPointsRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    source_version: int = Field(ge=1)
+
+
+@router.post(
+    "/{project_id}/prompts/optimize-selling-points",
+    response_model=PromptResponse,
+    status_code=status.HTTP_202_ACCEPTED,
+)
+def optimize_prompt_selling_points(
+    project_id: UUID,
+    payload: OptimizeSellingPointsRequest,
+    session: Session = Depends(get_session),
+) -> PromptResponse:
+    """基于选定的完整提示词创建卖点优化的新版本，源版本保持不变。"""
+    project = session.get(Project, project_id)
+    if project is None:
+        raise HTTPException(status_code=404, detail="项目不存在")
+    source = session.scalar(select(PromptRevision).where(
+        PromptRevision.project_id == project_id,
+        PromptRevision.version == payload.source_version,
+        PromptRevision.status == "completed",
+        PromptRevision.text != "",
+    ))
+    if source is None:
+        raise HTTPException(status_code=422, detail="请选择一份已完成的完整提示词")
+    if source.prompt_mode != "full_reference_video_edit":
+        raise HTTPException(status_code=422, detail="只能优化完整视频编辑提示词")
+    current_revision = session.scalar(select(TimelineRevision).where(TimelineRevision.project_id == project_id).order_by(TimelineRevision.version.desc()))
+    if current_revision is None or source.source_timeline_revision_id != current_revision.id:
+        raise HTTPException(status_code=422, detail="提示词来自旧时间轴，请重新生成提示词")
+    # 替换产品模式：卖点优化需要目标产品档案与确认仍有效。
+    if project.mode == "replace_product":
+        product_assets = confirmed_target_product_assets(session, project)
+        if not product_assets or not _product_profile_confirmed(product_assets):
+            raise HTTPException(status_code=422, detail="卖点优化前请先确认目标产品档案")
+    version = (session.scalar(select(func.max(PromptRevision.version)).where(PromptRevision.project_id == project_id)) or 0) + 1
+    revision = PromptRevision(
+        project_id=project_id, version=version, text=source.text,
+        visual_direction="根据已确认产品卖点优化各镜头的产品表现",
+        audio_mode=source.audio_mode, audio_style=source.audio_style,
+        replace_product=project.mode == "replace_product", replace_person=source.replace_person,
+        source_timeline_revision_id=source.source_timeline_revision_id,
+        prompt_mode=source.prompt_mode, generation_segment_id=None,
+        status="queued",
+    )
+    session.add(revision)
+    session.flush()
+    session.add(Job(project_id=project_id, kind="prompt_selling_point_optimization", status="queued", provider="comfly_gpt_5_6", provider_input_id=str(revision.id)))
     session.commit()
     return PromptResponse(version=version, text="", status="queued")
 

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import time
+from typing import Sequence
 from uuid import UUID
 
 import requests
@@ -425,6 +426,57 @@ def refine_prompt(current_prompt: str, instruction: str, settings: Settings | No
     return revised
 
 
+def transform_full_prompt(
+    *,
+    settings: Settings,
+    source_text: str,
+    instruction: str,
+    expected_shot_ranges: list[tuple[float, float]],
+    required_prefixes: Sequence[str],
+    project_mode: str,
+) -> str:
+    """精修与卖点优化共用的完整提示词变换管线。
+
+    1. 解析并校验源版本。
+    2. 冻结源版本的确切确定性前缀。
+    3. 只把时间块正文 + 指令发给 GPT。
+    4. 丢弃 GPT 返回的任何模型前缀，恢复冻结前缀。
+    5. 校验每个预期绝对块与四栏目。
+    6. 保留模式只对可执行 修改/删除 正文做替换检测。
+    7. 返回合法完整提示词，或抛 ValueError。
+    """
+    source_document = validate_full_prompt(source_text, expected_shot_ranges, required_prefixes=required_prefixes)
+    source_prefix = source_document.global_prefix
+    # 源正文（仅时间块部分）。
+    source_body = source_text[source_text.index("00:"):].rstrip() if "00:" in source_text else ""
+    labels = expected_full_prompt_labels(expected_shot_ranges)
+    # 只发送时间块正文给 GPT，避免模型改写前缀。
+    revised = _chat(settings, [
+        {"role": "system", "content": (
+            "你是广告视频编辑指令作者。只允许修改下方时间块的 保持/修改/删除/禁止 正文。"
+            "不得改变时间标签、分镜数量或顺序。不得添加字幕、贴纸、浮层或水印。"
+            "不得虚构用户未提供的功效、认证、成分、数据、包装文字、场景或人物动作。"
+            "不得在正文中输出任何全局前缀行。只返回完整的时间块正文。"
+            f"{instruction.strip()}"
+        )},
+        {"role": "user", "content": f"时间块正文（必须全部保留并保持顺序）：\n{source_body}"},
+    ])
+    # 丢弃模型可能输出的任何前缀，只取第一个预期标签之后的部分。
+    body = revised
+    for label in labels:
+        if label in revised:
+            body = revised[revised.index(label):]
+            break
+    full = f"{source_prefix}\n\n{body}"
+    document = validate_full_prompt(full, expected_shot_ranges)
+    if project_mode == "preserve_product" and contains_product_replacement(_actionable_bodies_text(full)):
+        raise ValueError("保留产品模式的模型输出不能替换产品")
+    return f"{document.global_prefix}\n\n" + "\n\n".join(
+        f"{label}\n保持：{block.keep}\n修改：{block.modify}\n删除：{block.delete}\n禁止：{block.forbid}"
+        for block, label in zip(document.blocks, labels)
+    )
+
+
 def execute_final_prompt_job(session: Session, job: Job, settings: Settings | None = None) -> Job:
     """在后台生成一个已持久化的提示词版本，避免HTTP请求长时间阻塞。"""
     revision = session.get(PromptRevision, UUID(job.provider_input_id)) if job.provider_input_id else None
@@ -538,22 +590,28 @@ def execute_prompt_refinement_job(session: Session, job: Job, settings: Settings
     source_text = revision.text.strip()
     if not source_text:
         raise ValueError("没有可供修改的完整提示词快照")
-    refined_text = refine_prompt(source_text, revision.visual_direction, settings)
     revision.replace_product = project.mode == "replace_product"
     if revision.prompt_mode == "full_reference_video_edit":
-        # 完整提示词精修：必须仍覆盖冻结时间轴的全部绝对时间块与四栏目。
+        # 完整提示词精修：冻结源前缀，只发块给 GPT，恢复前缀并严格校验。
         shot_ranges = [(shot.start_sec, shot.end_sec) for shot in session.scalars(select(Shot).where(Shot.timeline_revision_id == revision.source_timeline_revision_id).order_by(Shot.position))]
         try:
-            validate_full_prompt(refined_text, shot_ranges)
+            transformed = transform_full_prompt(
+                settings=settings,
+                source_text=source_text,
+                instruction=revision.visual_direction,
+                expected_shot_ranges=shot_ranges,
+                required_prefixes=("原参考视频是时间轴", "禁止新增字幕"),
+                project_mode=project.mode,
+            )
         except FullPromptValidationError as exc:
             raise ValueError(f"GPT 精修结果不完整：{exc}") from exc
-        if project.mode == "preserve_product" and contains_product_replacement(_actionable_bodies_text(refined_text)):
-            raise ValueError("保留产品模式的模型输出不能替换产品")
-        revision.text = refined_text
+        revision.text = transformed
         revision.status, revision.error_message = "completed", None
         job.status, job.error_message = "completed", None
         session.commit()
         return job
+    # legacy/分段模式继续使用 refine_prompt。
+    refined_text = refine_prompt(source_text, revision.visual_direction, settings)
     # 分段编辑指令精修后必须仍覆盖全部预期相对时间块且含四栏目。
     if revision.prompt_mode == "reference_video_edit":
         segment = session.get(GenerationSegment, revision.generation_segment_id) if revision.generation_segment_id else None
@@ -583,6 +641,48 @@ def execute_prompt_refinement_job(session: Session, job: Job, settings: Settings
     elif project.mode == "preserve_product" and contains_product_replacement(refined_text):
         raise ValueError("保留产品模式的模型输出不能替换产品")
     revision.text = refined_text
+    revision.status, revision.error_message = "completed", None
+    job.status, job.error_message = "completed", None
+    session.commit()
+    return job
+
+
+def execute_selling_point_optimization_job(session: Session, job: Job, settings: Settings | None = None) -> Job:
+    """卖点优化：基于冻结源全文，只改时间块正文，恢复源前缀，严格校验。"""
+    revision = session.get(PromptRevision, UUID(job.provider_input_id)) if job.provider_input_id else None
+    if revision is None or revision.project_id != job.project_id:
+        job.status, job.error_message = "failed", "待优化的提示词版本不存在"
+        session.commit()
+        return job
+    project = session.get(Project, job.project_id)
+    if project is None:
+        raise ValueError("项目不存在")
+    source_text = revision.text.strip()
+    if not source_text or revision.prompt_mode != "full_reference_video_edit":
+        raise ValueError("待优化版本不是完整提示词快照")
+    shot_ranges = [(shot.start_sec, shot.end_sec) for shot in session.scalars(select(Shot).where(Shot.timeline_revision_id == revision.source_timeline_revision_id).order_by(Shot.position))]
+    instruction = (
+        "根据已确认产品卖点优化各镜头的产品表现：决定每个卖点最适合出现在哪些已存在镜头；"
+        "把抽象卖点转换为可生成的材质、光影、动作结果或产品状态；减少多个镜头对同一卖点的机械重复；"
+        "保持前后镜头营销逻辑一致。只可编辑时间块的 修改 栏目。"
+        "不得改变时间标签、分镜数量或顺序；不得删除任何栏目；"
+        "不得为表现卖点增加不存在的新场景或人物动作；"
+        "不得虚构用户未提供的功效、认证、成分、数据或包装文字；"
+        "不得添加字幕、卖点贴纸、浮层文字或水印；"
+        "不得把无法自然表现的卖点强行塞入所有镜头。"
+    )
+    try:
+        optimized = transform_full_prompt(
+            settings=settings,
+            source_text=source_text,
+            instruction=instruction,
+            expected_shot_ranges=shot_ranges,
+            required_prefixes=("原参考视频是时间轴", "禁止新增字幕"),
+            project_mode=project.mode,
+        )
+    except FullPromptValidationError as exc:
+        raise ValueError(f"卖点优化结果不完整：{exc}") from exc
+    revision.text = optimized
     revision.status, revision.error_message = "completed", None
     job.status, job.error_message = "completed", None
     session.commit()

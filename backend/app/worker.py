@@ -23,7 +23,7 @@ from app.services.comfly_frame_vision import ComflyFrameVisionGateway
 from app.services.dual_shot_vision import DualShotVisionGateway
 from app.services.vision_jobs import execute_vision_job
 from app.services.reference_profiles import execute_profile_job
-from app.services.final_prompt import execute_final_prompt_job, execute_prompt_refinement_job
+from app.services.final_prompt import execute_final_prompt_job, execute_prompt_refinement_job, execute_selling_point_optimization_job
 from app.services.worker_state import MAX_ATTEMPTS, next_poll_at, retry_at
 
 
@@ -162,7 +162,7 @@ def run_once() -> int:
     now = datetime.now(UTC)
     worker_id = f"{socket.gethostname()}:{__import__('os').getpid()}"
     with SessionLocal() as session:
-        vision_jobs = _claim(session, Job, ["vision_analysis", "vision_shot_analysis", "reference_profile_analysis", "final_prompt_generation", "prompt_refinement"], worker_id, now, statuses=("queued", "uploaded", "processing", "retryable"))
+        vision_jobs = _claim(session, Job, ["vision_analysis", "vision_shot_analysis", "reference_profile_analysis", "final_prompt_generation", "prompt_refinement", "prompt_selling_point_optimization"], worker_id, now, statuses=("queued", "uploaded", "processing", "retryable"))
         for job in vision_jobs:
             try:
                 if job.kind == "reference_profile_analysis":
@@ -171,13 +171,15 @@ def run_once() -> int:
                     execute_final_prompt_job(session, job, settings)
                 elif job.kind == "prompt_refinement":
                     execute_prompt_refinement_job(session, job, settings)
+                elif job.kind == "prompt_selling_point_optimization":
+                    execute_selling_point_optimization_job(session, job, settings)
                 else:
                     # 完整视频旧任务保持兼容；人工确认后的逐镜任务使用双模型链路。
                     gateway = DualShotVisionGateway(settings) if job.kind == "vision_shot_analysis" else ComflyFrameVisionGateway(settings)
                     execute_vision_job(session, job, gateway)
             except Exception as exc:
                 _mark_retryable(job, exc)
-                if job.kind in {"final_prompt_generation", "prompt_refinement"} and job.provider_input_id:
+                if job.kind in {"final_prompt_generation", "prompt_refinement", "prompt_selling_point_optimization"} and job.provider_input_id:
                     revision = session.get(PromptRevision, UUID(job.provider_input_id))
                     if revision:
                         revision.status, revision.error_message = job.status, job.error_message
