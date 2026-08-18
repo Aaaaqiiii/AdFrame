@@ -850,9 +850,11 @@ def create_prompt_revision(
         prompt_mode = "reference_video_edit"
         # 只读取该片段覆盖的镜头。
         current_shots = [shot for shot in current_shots if shot.end_sec > segment.source_start_sec and shot.start_sec < segment.source_end_sec]
-    elif project.mode == "preserve_product" and contains_product_replacement(payload.visual_direction):
-        # 非分段模式：改编要求整体检测（分段模式的锁定规则由服务端确定性写入，跳过整体检测）。
-        raise HTTPException(status_code=422, detail="保留产品模式的提示词不能替换产品。")
+    if project.mode == "preserve_product" and contains_product_replacement(payload.visual_direction):
+        # 仅“分段人工保存完整文本”延后到栏目级检测（其锁定规则由人工写入）；其余（AI 改编要求、
+        # 非分段）都立即拒绝，避免非法要求进入 GPT 消耗调用。
+        if not (segment is not None and not payload.use_ai):
+            raise HTTPException(status_code=422, detail="保留产品模式的提示词不能替换产品。")
     if replace_product:
         _, conflicts = check_product_compatibility(product_profile or "", current_shots)
         if conflicts:
@@ -896,6 +898,20 @@ def create_prompt_revision(
             # 只对数据库预期时间块的修改/删除正文执行替换检测。
             if contains_product_replacement(actionable_segment_text(text, expected_labels)):
                 raise HTTPException(status_code=422, detail="保留产品模式的提示词不能替换产品。")
+        elif project.mode == "replace_product":
+            # 分段人工保存必须保留服务端确定性目标产品规则：档案、锁定规则、图片用途名称。
+            if "目标产品必须匹配已确认参考图" not in text or not product_profile:
+                raise HTTPException(status_code=422, detail="分段编辑指令缺少目标产品档案")
+            if "产品参考图用途" not in text:
+                raise HTTPException(status_code=422, detail="分段编辑指令缺少产品图用途规则")
+            purpose_names = []
+            for asset in product_assets:
+                structure = load_structure(asset)
+                name = str(structure.get("display_name") or structure.get("view_label") or "其他").strip()
+                purpose_names.append(name)
+            for name in purpose_names:
+                if name not in text:
+                    raise HTTPException(status_code=422, detail=f"分段编辑指令缺少产品图用途：{name}")
     prompt_revision = PromptRevision(
         project_id=project_id, version=version, text=text,
         visual_direction=payload.visual_direction.strip(), audio_mode=payload.audio_mode,

@@ -1176,3 +1176,71 @@ def test_replace_segment_refinement_restores_deterministic_prefix() -> None:
         assert "产品参考图用途" in new_revision.text
         assert "正面瓶身" in new_revision.text
         assert "已确认目标产品" in new_revision.text
+
+
+def test_segment_ai_generation_rejects_product_replacement_in_direction() -> None:
+    """保留产品 + 分段 + use_ai=true + 替换改编要求：入口立即 422，且不创建版本或任务。"""
+    client = TestClient(create_app())
+    project = _segment_ready_project(client)
+    response = client.post(
+        f"/api/projects/{project['id']}/prompts",
+        json={"visual_direction": "把原产品替换成新产品", "use_ai": True, "generation_segment_id": project["segment_id"]},
+    )
+    assert response.status_code == 422
+    with SessionLocal() as session:
+        revisions = session.scalars(select(PromptRevision).where(PromptRevision.project_id == UUID(project["id"]))).all()
+        jobs = session.scalars(select(Job).where(Job.project_id == UUID(project["id"]), Job.kind == "final_prompt_generation")).all()
+        assert revisions == []
+        assert jobs == []
+
+
+def test_replace_segment_manual_save_rejects_missing_product_prefix() -> None:
+    """替换产品人工保存删除目标产品前缀/用途时返回 422。"""
+    client = TestClient(create_app())
+    project = _segment_ready_project(client, mode="replace_product")
+    with SessionLocal() as session:
+        product_path = __import__("pathlib").Path("C:/p.png")
+        session.add(Asset(
+            project_id=UUID(project["id"]),
+            kind="product_reference_image",
+            original_path=str(product_path),
+            original_filename="正面瓶身.png",
+            content_type="image/png",
+            profile_text="已确认目标产品",
+            profile_json=__import__("json").dumps({"view_label": "front", "display_name": "正面瓶身", "note": "注意瓶盖", "summary_confirmed": True}),
+            analysis_status="succeeded",
+        ))
+        session.commit()
+    # 只有时间块，完全删除目标产品档案、锁定规则和用途。
+    stripped = (
+        "00:00.00–00:08.00\n保持：a\n修改：无。\n删除：无。\n禁止：无。\n\n"
+        "00:08.00–00:16.00\n保持：b\n修改：无。\n删除：无。\n禁止：无。"
+    )
+    response = client.post(
+        f"/api/projects/{project['id']}/prompts",
+        json={"visual_direction": stripped, "use_ai": False, "generation_segment_id": project["segment_id"]},
+    )
+    assert response.status_code == 422
+    # 保留锁定规则但删除用途名称也应被拒。
+    missing_purpose = (
+        "全局规则：目标产品必须匹配已确认参考图：\n已确认目标产品\n"
+        "00:00.00–00:08.00\n保持：a\n修改：无。\n删除：无。\n禁止：无。\n\n"
+        "00:08.00–00:16.00\n保持：b\n修改：无。\n删除：无。\n禁止：无。"
+    )
+    response2 = client.post(
+        f"/api/projects/{project['id']}/prompts",
+        json={"visual_direction": missing_purpose, "use_ai": False, "generation_segment_id": project["segment_id"]},
+    )
+    assert response2.status_code == 422
+    # 完整版本应保存成功。
+    complete = (
+        "全局规则：目标产品必须匹配已确认参考图：\n已确认目标产品\n"
+        "全局规则：产品参考图用途（按名称锁定对应结构，不得省略）：\n- 正面瓶身：锁定该角度结构（注意瓶盖）\n\n"
+        "00:00.00–00:08.00\n保持：a\n修改：无。\n删除：无。\n禁止：无。\n\n"
+        "00:08.00–00:16.00\n保持：b\n修改：无。\n删除：无。\n禁止：无。"
+    )
+    ok = client.post(
+        f"/api/projects/{project['id']}/prompts",
+        json={"visual_direction": complete, "use_ai": False, "generation_segment_id": project["segment_id"]},
+    )
+    assert ok.status_code == 201
