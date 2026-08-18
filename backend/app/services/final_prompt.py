@@ -60,11 +60,13 @@ def generate_final_prompt(
     audio_style: str,
     settings: Settings | None = None,
     segment_slices: list[dict] | None = None,
+    product_purpose_lines: list[str] | None = None,
 ) -> str:
     """只用人工确认事实和用户选择，生成可直接编辑的最终提示词。
 
     ``segment_slices`` 提供时进入分段增量模式：提示词只表达差异，每个切片
     使用片段内相对时间，固定输出 保持/修改/删除/禁止 四栏目。
+    ``product_purpose_lines`` 提供时由服务端确定性写入产品图用途名称。
     """
     settings = settings or Settings()
     if not settings.comfly_api_key:
@@ -75,6 +77,7 @@ def generate_final_prompt(
             product_profile=product_profile, person_profile=person_profile,
             replace_product=replace_product, replace_person=replace_person,
             audio_style=audio_style, audio_mode=audio_mode, settings=settings,
+            product_purpose_lines=product_purpose_lines,
         )
     source = {
         "confirmed_shots": shots,
@@ -144,10 +147,12 @@ def _generate_segment_edit_prompt(
     audio_style: str,
     audio_mode: str,
     settings: Settings,
+    product_purpose_lines: list[str] | None = None,
 ) -> str:
     """分段增量提示词：固定四栏目，服务端确定性骨架，GPT 只填差异。
 
     ``slices`` 每个元素含 shot_id、source_start/end_sec、relative_start/end_sec。
+    ``product_purpose_lines`` 由服务端确定性写入，保留正面/侧面/开口等用途名称。
     """
     global_rules = [
         "原参考视频决定人物、动作、场景、构图、运镜、节奏和镜头顺序。只执行明确修改。",
@@ -155,6 +160,11 @@ def _generate_segment_edit_prompt(
     if replace_product:
         # 产品档案由服务端确定性写入，避免模型概括遗漏。
         global_rules.append(f"目标产品必须匹配已确认参考图：\n{product_profile}")
+        if product_purpose_lines:
+            global_rules.append("产品参考图用途（按名称锁定对应结构，不得省略）：\n" + "\n".join(f"- {line}" for line in product_purpose_lines))
+    else:
+        # 保留产品模式：明确锁定原产品，而不是仅靠事后文字检测。
+        global_rules.append("保持原产品不变，禁止替换、删除或重新设计原产品。")
     if replace_person:
         global_rules.append(f"人物必须匹配已确认人物参考图：\n{person_profile}")
     global_rules.append(user_direction.strip())
@@ -184,6 +194,25 @@ def _generate_segment_edit_prompt(
     return f"{skeleton}\n\n{text}"
 
 
+def missing_segment_prompt_blocks(text: str, labels: list[str]) -> list[str]:
+    """返回缺少（未出现或不含四栏目）的相对时间块标签。
+
+    每个时间块必须包含 保持/修改/删除/禁止 四个栏目，且不能通过全局子串搜索蒙混。
+    """
+    missing = []
+    for label in labels:
+        block = text.split(label, 1)[1] if label in text else None
+        if block is None:
+            missing.append(label)
+            continue
+        # 截取到下一个时间标签或结尾，检查四栏目。
+        next_label = next((other for other in labels if other != label and other in block), None)
+        body = block.split(next_label, 1)[0] if next_label else block
+        if not all(heading in body for heading in ("保持：", "修改：", "删除：", "禁止：")):
+            missing.append(label)
+    return missing
+
+
 def _validate_segment_edit_prompt(
     text: str,
     labels: list[str],
@@ -196,17 +225,7 @@ def _validate_segment_edit_prompt(
     replace_person: bool,
 ) -> str:
     """校验模型输出：每个相对时间标签都出现且含四个栏目，缺则定向补全一次。"""
-    required = {label: False for label in labels}
-    for label in labels:
-        block = text.split(label, 1)[1] if label in text else None
-        if block is None:
-            continue
-        # 截取到下一个时间标签或结尾，检查四栏目。
-        next_label = next((other for other in labels if other != label and other in block), None)
-        body = block.split(next_label, 1)[0] if next_label else block
-        if all(heading in body for heading in ("保持：", "修改：", "删除：", "禁止：")):
-            required[label] = True
-    missing = [label for label, ok in required.items() if not ok]
+    missing = missing_segment_prompt_blocks(text, labels)
     if missing:
         # 定向补全一次；再缺则失败，不标记 completed。
         repaired = text
@@ -287,6 +306,14 @@ def execute_final_prompt_job(session: Session, job: Job, settings: Settings | No
     product_profile = product_assets[-1].profile_text.strip() if product_assets and load_structure(product_assets[-1]).get("summary_confirmed") and product_assets[-1].profile_text else ""
     replace_product = project.mode == "replace_product"
     revision.replace_product = replace_product
+    # 服务端确定性写入每张已确认产品图的用途名称与备注，不让 GPT 决定是否保留。
+    product_purpose_lines = []
+    if replace_product:
+        for asset in product_assets:
+            structure = load_structure(asset)
+            name = str(structure.get("display_name") or structure.get("view_label") or "其他").strip()
+            note = str(structure.get("note") or "").strip()
+            product_purpose_lines.append(f"{name}：锁定该角度结构" + (f"（{note}）" if note else ""))
     if segment_slices is not None:
         # 分段增量模式：只输出该片段相交镜头，使用片段内相对时间。
         if not segment_slices:
@@ -296,7 +323,7 @@ def execute_final_prompt_job(session: Session, job: Job, settings: Settings | No
             product_profile=product_profile, person_profile=profile("person_reference_image"),
             replace_product=replace_product, replace_person=revision.replace_person,
             audio_mode=revision.audio_mode, audio_style=revision.audio_style, settings=settings,
-            segment_slices=segment_slices,
+            segment_slices=segment_slices, product_purpose_lines=product_purpose_lines,
         )
     else:
         generated_text = generate_final_prompt(
@@ -305,7 +332,9 @@ def execute_final_prompt_job(session: Session, job: Job, settings: Settings | No
             replace_product=replace_product, replace_person=revision.replace_person,
             audio_mode=revision.audio_mode, audio_style=revision.audio_style, settings=settings,
         )
-    if project.mode == "preserve_product" and contains_product_replacement(generated_text):
+    # 分段增量模式：保留产品的锁定规则已由服务端确定性写入骨架，四栏目由结构校验保证，
+    # 不再做事后替换检测（该检测会误伤锁定规则自身含“替换/删除”的措辞）。
+    if segment_slices is None and project.mode == "preserve_product" and contains_product_replacement(generated_text):
         raise ValueError("保留产品模式的模型输出不能替换产品")
     revision.text = generated_text
     revision.status, revision.error_message = "completed", None
@@ -330,6 +359,21 @@ def execute_prompt_refinement_job(session: Session, job: Job, settings: Settings
     revision.replace_product = project.mode == "replace_product"
     if project.mode == "preserve_product" and contains_product_replacement(refined_text):
         raise ValueError("保留产品模式的模型输出不能替换产品")
+    # 分段编辑指令精修后必须仍覆盖全部预期相对时间块且含四栏目。
+    if revision.prompt_mode == "reference_video_edit":
+        segment = session.get(GenerationSegment, revision.generation_segment_id) if revision.generation_segment_id else None
+        if segment is None:
+            raise ValueError("分段编辑指令的生成片段不存在")
+        expected_labels = []
+        for shot in session.scalars(select(Shot).where(Shot.timeline_revision_id == revision.source_timeline_revision_id).order_by(Shot.position)):
+            overlap_start = max(shot.start_sec, segment.source_start_sec)
+            overlap_end = min(shot.end_sec, segment.source_end_sec)
+            if overlap_end - overlap_start <= 0.001:
+                continue
+            expected_labels.append(_time_label(overlap_start - segment.source_start_sec, overlap_end - segment.source_start_sec))
+        missing = missing_segment_prompt_blocks(refined_text, expected_labels)
+        if missing:
+            raise ValueError(f"GPT 精修结果不完整，缺少镜头编辑指令：{', '.join(missing)}")
     revision.text = refined_text
     revision.status, revision.error_message = "completed", None
     job.status, job.error_message = "completed", None

@@ -13,6 +13,7 @@ from sqlalchemy.orm import Session
 
 from app.core.config import Settings
 from app.db.models import Asset, GenerationSegment, Job, Project, PromptRevision, Shot, ShotAISummary, ShotEdit, ShotEvidence, TimelineRevision
+from app.services.final_prompt import missing_segment_prompt_blocks
 from app.db.session import get_session
 from app.services.media import MediaToolUnavailableError, probe_video
 from app.services.tempfile_publisher import TempfilePublisher
@@ -880,6 +881,11 @@ def create_prompt_revision(
             })
     # AI生成放到Worker，避免浏览器等待数分钟后超时；人工版本仍立即保存。
     text = "" if payload.use_ai else payload.visual_direction.strip()
+    if not payload.use_ai and prompt_mode == "reference_video_edit":
+        # 分段人工保存必须覆盖全部相对时间块且含四栏目，缺则 422，不调用 GPT 修复。
+        labels = list(dict.fromkeys(__import__("re").findall(r"\d{2}:\d{2}\.\d{2}–\d{2}:\d{2}\.\d{2}", text)))
+        if missing_segment_prompt_blocks(text, labels):
+            raise HTTPException(status_code=422, detail="分段编辑指令缺少时间块或保持/修改/删除/禁止栏目")
     prompt_revision = PromptRevision(
         project_id=project_id, version=version, text=text,
         visual_direction=payload.visual_direction.strip(), audio_mode=payload.audio_mode,
@@ -925,6 +931,7 @@ def refine_prompt_revision(
         visual_direction=payload.instruction.strip(), audio_mode=source.audio_mode,
         audio_style=source.audio_style, replace_product=project.mode == "replace_product",
         replace_person=source.replace_person, source_timeline_revision_id=source.source_timeline_revision_id,
+        prompt_mode=source.prompt_mode, generation_segment_id=source.generation_segment_id,
         status="queued",
     )
     session.add(revision)

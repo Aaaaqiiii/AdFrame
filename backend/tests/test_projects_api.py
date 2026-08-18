@@ -624,9 +624,9 @@ def test_generation_queues_person_asset_only_when_requested() -> None:
         assert _json.loads(generation.reference_asset_ids) == [str(session.scalar(select(Asset).where(Asset.project_id == UUID(project["id"]), Asset.kind == "reference_video")).id)]
 
 
-def _segment_ready_project(client: TestClient, duration_sec: float = 32.0) -> dict:
+def _segment_ready_project(client: TestClient, duration_sec: float = 32.0, mode: str = "preserve_product") -> dict:
     """带确认镜头 + 当前分段方案的完整项目，返回各 ID 供提示词接口使用。"""
-    project = client.post("/api/projects", json={"name": "segment-prompt"}).json()
+    project = client.post("/api/projects", json={"name": "segment-prompt", "mode": mode}).json()
     _accepted_video_upload(client, project["id"])
     with SessionLocal() as session:
         video = session.scalar(select(Asset).where(Asset.project_id == UUID(project["id"]), Asset.kind == "reference_video"))
@@ -802,3 +802,171 @@ def test_segment_prompt_rejects_legacy_prompt_mode_for_generation() -> None:
             PromptRevision.version == legacy.json()["version"],
         ))
         assert revision.prompt_mode == "full_video_description"
+
+
+def test_refinement_inherits_segment_identity() -> None:
+    """精修新版本必须继承 prompt_mode 与 generation_segment_id，且不能跨片段。"""
+    client = TestClient(create_app())
+    project = _segment_ready_project(client)
+    v1 = client.post(
+        f"/api/projects/{project['id']}/prompts",
+        json={"visual_direction": "保持原节奏", "use_ai": True, "generation_segment_id": project["segment_id"]},
+    )
+    assert v1.status_code == 201
+    with SessionLocal() as session:
+        revision = session.scalar(select(PromptRevision).where(
+            PromptRevision.project_id == UUID(project["id"]),
+            PromptRevision.version == v1.json()["version"],
+        ))
+        # 标记 v1 完成，作为精修源。
+        revision.status = "completed"
+        revision.text = "00:00.00–00:08.00\n保持：a\n修改：无。\n删除：无。\n禁止：无。\n\n00:08.00–00:16.00\n保持：b\n修改：无。\n删除：无。\n禁止：无。"
+        session.commit()
+        v1_segment_id = str(revision.generation_segment_id)
+        v1_mode = revision.prompt_mode
+    assert v1_mode == "reference_video_edit"
+    refined = client.post(
+        f"/api/projects/{project['id']}/prompts/refine",
+        json={"instruction": "增强光线", "source_version": v1.json()["version"]},
+    )
+    assert refined.status_code == 202
+    with SessionLocal() as session:
+        new_revision = session.scalar(select(PromptRevision).where(
+            PromptRevision.project_id == UUID(project["id"]),
+            PromptRevision.version == refined.json()["version"],
+        ))
+        assert new_revision.prompt_mode == "reference_video_edit"
+        assert str(new_revision.generation_segment_id) == v1_segment_id
+
+
+def test_segment_refinement_missing_block_fails_not_completed() -> None:
+    """分段精修若删除时间块或栏目，任务必须失败而不能标记 completed。"""
+    client = TestClient(create_app())
+    project = _segment_ready_project(client)
+    v1 = client.post(
+        f"/api/projects/{project['id']}/prompts",
+        json={"visual_direction": "保持原节奏", "use_ai": True, "generation_segment_id": project["segment_id"]},
+    )
+    assert v1.status_code == 201
+    with SessionLocal() as session:
+        revision = session.scalar(select(PromptRevision).where(
+            PromptRevision.project_id == UUID(project["id"]),
+            PromptRevision.version == v1.json()["version"],
+        ))
+        revision.status = "completed"
+        revision.text = "00:00.00–00:08.00\n保持：a\n修改：无。\n删除：无。\n禁止：无。\n\n00:08.00–00:16.00\n保持：b\n修改：无。\n删除：无。\n禁止：无。"
+        session.commit()
+    refined = client.post(
+        f"/api/projects/{project['id']}/prompts/refine",
+        json={"instruction": "增强光线", "source_version": v1.json()["version"]},
+    )
+    assert refined.status_code == 202
+    with SessionLocal() as session:
+        new_revision = session.scalar(select(PromptRevision).where(
+            PromptRevision.project_id == UUID(project["id"]),
+            PromptRevision.version == refined.json()["version"],
+        ))
+        job = session.scalar(select(Job).where(
+            Job.project_id == UUID(project["id"]),
+            Job.kind == "prompt_refinement",
+            Job.provider_input_id == str(new_revision.id),
+        ))
+        # 精修结果删掉了第一个时间块和“禁止”栏目。
+        broken = "00:08.00–00:16.00\n保持：b\n修改：无。\n删除：无。"
+        from app.services.final_prompt import execute_prompt_refinement_job
+        with patch("app.services.final_prompt.refine_prompt", return_value=broken):
+            try:
+                execute_prompt_refinement_job(session, job, Settings(comfly_api_key="test-comfly-api-key"))
+            except ValueError as error:
+                assert "不完整" in str(error)
+            else:
+                assert False, "精修结果缺块/缺栏目时必须失败"
+        session.refresh(new_revision)
+        assert new_revision.status != "completed"
+
+
+def test_segment_manual_save_missing_heading_returns_422() -> None:
+    """分段人工保存（use_ai=False）缺少栏目时应返回 422，不调用 GPT 修复。"""
+    client = TestClient(create_app())
+    project = _segment_ready_project(client)
+    # 人工保存模式缺“禁止”栏目。
+    response = client.post(
+        f"/api/projects/{project['id']}/prompts",
+        json={
+            "visual_direction": "00:00.00–00:08.00\n保持：a\n修改：无。\n删除：无。",
+            "use_ai": False,
+            "generation_segment_id": project["segment_id"],
+        },
+    )
+    assert response.status_code == 422
+
+
+def test_product_image_purposes_enter_deterministic_rules() -> None:
+    """多张产品图的用途名称必须由服务端确定性写入全局规则。"""
+    client = TestClient(create_app())
+    project = _segment_ready_project(client, mode="replace_product")
+    with SessionLocal() as session:
+        # 造两张已确认产品图，带不同用途。
+        product_path = __import__("pathlib").Path("C:/p.png")
+        for name, view_label in (("正面瓶身", "front"), ("侧面瓶身", "side")):
+            session.add(Asset(
+                project_id=UUID(project["id"]),
+                kind="product_reference_image",
+                original_path=str(product_path),
+                original_filename=f"{name}.png",
+                content_type="image/png",
+                profile_text=f"{name} 可见事实",
+                profile_json=__import__("json").dumps({"view_label": view_label, "display_name": name, "note": "注意瓶盖结构", "summary_confirmed": True}),
+                analysis_status="succeeded",
+            ))
+        session.commit()
+    response = client.post(
+        f"/api/projects/{project['id']}/prompts",
+        json={"visual_direction": "保持原节奏", "use_ai": True, "generation_segment_id": project["segment_id"]},
+    )
+    assert response.status_code == 201
+    with SessionLocal() as session:
+        revision = session.scalar(select(PromptRevision).where(
+            PromptRevision.project_id == UUID(project["id"]),
+            PromptRevision.version == response.json()["version"],
+        ))
+        job = session.scalar(select(Job).where(
+            Job.project_id == UUID(project["id"]),
+            Job.kind == "final_prompt_generation",
+            Job.provider_input_id == str(revision.id),
+        ))
+        model_text = "00:00.00–00:08.00\n保持：a\n修改：无。\n删除：无。\n禁止：无。\n\n00:08.00–00:16.00\n保持：b\n修改：无。\n删除：无。\n禁止：无。"
+        with patch("app.services.final_prompt._chat", return_value=model_text):
+            execute_final_prompt_job(session, job, Settings(comfly_api_key="test-comfly-api-key"))
+        session.refresh(revision)
+        assert revision.status == "completed"
+        assert "产品参考图用途" in revision.text
+        assert "正面瓶身" in revision.text
+        assert "侧面瓶身" in revision.text
+
+
+def test_preserve_mode_has_explicit_original_product_lock_rule() -> None:
+    """保留产品模式必须在确定性全局规则中明确锁定原产品。"""
+    client = TestClient(create_app())
+    project = _segment_ready_project(client)
+    response = client.post(
+        f"/api/projects/{project['id']}/prompts",
+        json={"visual_direction": "保持原节奏", "use_ai": True, "generation_segment_id": project["segment_id"]},
+    )
+    assert response.status_code == 201
+    with SessionLocal() as session:
+        revision = session.scalar(select(PromptRevision).where(
+            PromptRevision.project_id == UUID(project["id"]),
+            PromptRevision.version == response.json()["version"],
+        ))
+        job = session.scalar(select(Job).where(
+            Job.project_id == UUID(project["id"]),
+            Job.kind == "final_prompt_generation",
+            Job.provider_input_id == str(revision.id),
+        ))
+        model_text = "00:00.00–00:08.00\n保持：a\n修改：无。\n删除：无。\n禁止：无。\n\n00:08.00–00:16.00\n保持：b\n修改：无。\n删除：无。\n禁止：无。"
+        with patch("app.services.final_prompt._chat", return_value=model_text):
+            execute_final_prompt_job(session, job, Settings(comfly_api_key="test-comfly-api-key"))
+        session.refresh(revision)
+        assert revision.status == "completed"
+        assert "保持原产品不变，禁止替换、删除或重新设计原产品。" in revision.text
