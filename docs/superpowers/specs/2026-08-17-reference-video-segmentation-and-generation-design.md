@@ -1,6 +1,8 @@
 # AdFlow 参考视频分段编辑与 Seedance 生成设计规格
 
-**状态：** 已确认
+**状态：** 部分被后续规格取代
+
+> 2026-08-18 变更说明：本规格中的分段算法、物理裁片、逐段 Seedance 任务、任务恢复和独立结果语义继续有效；“每个生成片段拥有独立正式提示词”的语义，以及依赖该语义的页面和生成入口，已被 [`2026-08-18-full-prompt-batched-seedance-generation-design.md`](./2026-08-18-full-prompt-batched-seedance-generation-design.md) 取代。后续实现不得继续执行旧实施计划的 Task 7 原方案。
 
 **日期：** 2026-08-17
 
