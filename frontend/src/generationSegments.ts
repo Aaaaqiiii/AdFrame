@@ -184,8 +184,10 @@ export function toggleShortSegmentAccepted(
   return next
 }
 
-export function shouldResetDraft(planIdentity: number, lastIdentity: number | null): boolean {
+export function shouldResetDraft(planIdentity: string, lastIdentity: string | null): boolean {
   // 只在稳定方案身份变化时重置草稿；同一不可变方案的重复 GET 不重置。
+  // 身份必须是完整方案标识（projectId + timeline_revision_id + plan_version），
+  // 避免不同项目/时间轴使用相同 plan_version 时草稿污染。
   return lastIdentity === null || lastIdentity !== planIdentity
 }
 

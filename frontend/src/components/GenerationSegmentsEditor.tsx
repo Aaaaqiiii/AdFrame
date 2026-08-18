@@ -15,7 +15,9 @@ import type { GenerationSegment, GenerationSegmentInput } from '../generationSeg
 import type { TimelineShot } from '../api'
 
 type Props = {
+  projectId: string
   planVersion: number
+  timelineRevisionId: string | null
   segments: GenerationSegment[]
   shots: TimelineShot[]
   durationSec: number
@@ -40,10 +42,11 @@ export function GenerationSegmentsEditor(p: Props) {
   const [dirty, setDirty] = useState(false)
   const [allowInsideShot, setAllowInsideShot] = useState(false)
 
-  // 只在稳定方案身份（plan_version）变化时重建 draft；同一不可变方案的重复 GET
-  // （轮询期间 restoreProject 会产生新数组引用）不得清空用户未保存草稿。
-  const planIdentity = p.planVersion
-  const lastPlanIdentity = useRef<number | null>(null)
+  // 完整方案身份：projectId + timeline_revision_id + plan_version。
+  // 同一不可变方案的重复 GET（轮询 restoreProject 产生新数组引用）不得清空草稿；
+  // 但项目或时间轴变化时即使 plan_version 相同也必须重置，避免跨项目草稿污染。
+  const planIdentity = `${p.projectId}:${p.timelineRevisionId ?? ''}:${p.planVersion}`
+  const lastPlanIdentity = useRef<string | null>(null)
   useEffect(() => {
     if (!shouldResetDraft(planIdentity, lastPlanIdentity.current)) return
     lastPlanIdentity.current = planIdentity
@@ -64,6 +67,8 @@ export function GenerationSegmentsEditor(p: Props) {
   const structurallyDirty = dirty && !segmentStructureMatches(draft, p.segments)
 
   function update(next: GenerationSegmentInput[]) {
+    // helper 找不到合法分镜边界时会原样返回同一引用；此时不标记 dirty、不产生冗余新方案。
+    if (next === draft) return
     setDraft(next)
     setDirty(true)
   }
@@ -101,9 +106,10 @@ export function GenerationSegmentsEditor(p: Props) {
         const issue = segmentIssue(segment, p.durationSec, p.maxSegmentSeconds, p.recommendedMinSeconds)
         const coveredShots = p.shots.filter((shot) => shot.start_sec < segment.source_end_sec && shot.end_sec > segment.source_start_sec)
         const persisted = p.segments[index]
-        const selected = Boolean(persisted) && p.selectedSegmentId === persisted.id
         const isShortCandidate = isShortSegmentCandidate(segment, p.durationSec, p.recommendedMinSeconds)
         const clickable = Boolean(persisted) && !structurallyDirty
+        // 结构变化期间索引不再对应后端 segment，不得高亮任何已持久化分段。
+        const selected = clickable && Boolean(persisted) && p.selectedSegmentId === persisted.id
         return <div key={index} className={`segment-card${selected ? ' selected' : ''}${clickable ? '' : ' not-selectable'}`} onClick={() => { if (clickable && persisted) p.onSelectSegment(persisted.id) }}>
           <div className="segment-card-head">
             <strong>片段 {index + 1}</strong>

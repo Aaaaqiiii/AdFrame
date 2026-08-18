@@ -120,10 +120,19 @@ describe('generation segment helpers', () => {
     expect(boundaryTypeAt(12.3, boundaries, 32)).toBe('inside_shot')
   })
 
-  it('shouldResetDraft only fires when plan identity changes', () => {
-    expect(shouldResetDraft(2, null)).toBe(true)  // 首次加载
-    expect(shouldResetDraft(2, 2)).toBe(false)   // 同一 plan_version 重复 GET 不重置
-    expect(shouldResetDraft(3, 2)).toBe(true)    // 方案版本变化重置
+  it('shouldResetDraft only fires when full plan identity changes', () => {
+    expect(shouldResetDraft('a:t1:2', null)).toBe(true)   // 首次加载
+    expect(shouldResetDraft('a:t1:2', 'a:t1:2')).toBe(false)  // 相同完整身份重复 GET 不重置
+    expect(shouldResetDraft('a:t1:3', 'a:t1:2')).toBe(true)   // 版本变化重置
+  })
+
+  it('shouldResetDraft resets across projects and timelines even with same version', () => {
+    // 相同版本号、不同项目 → 重置（避免跨项目草稿污染）。
+    expect(shouldResetDraft('b:t1:2', 'a:t1:2')).toBe(true)
+    // 相同项目与版本、不同时间轴 → 重置。
+    expect(shouldResetDraft('a:t2:2', 'a:t1:2')).toBe(true)
+    // 相同项目、时间轴、版本 → 不重置。
+    expect(shouldResetDraft('a:t1:2', 'a:t1:2')).toBe(false)
   })
 
   it('split and move reset short-segment acceptance on changed segments', () => {
