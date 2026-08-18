@@ -92,6 +92,13 @@ def test_format_time_label_beyond_59_seconds():
     assert format_time_label(125.5, 190.25) == "02:05.50–03:10.25"
 
 
+def test_format_time_label_stable_under_float_noise():
+    # 浮点噪声不得改变标签：4.1299999 与 4.12 必须同标签。
+    assert format_time_label(4.12, 9.5) == format_time_label(4.1299999, 9.5000001)
+    assert format_time_label(4.12, 9.5) == "00:04.12–00:09.50"
+    assert format_time_label(0.1 + 0.2, 1.0) == "00:00.30–00:01.00"
+
+
 def test_crlf_and_blank_lines_are_normalized():
     text = "全局规则：前缀。\r\n\r\n00:00.00–00:04.00\r\n保持：a\r\n修改：无\r\n删除：无\r\n禁止：无\r\n"
     document = validate_full_prompt(text, [(0.0, 4.0)])

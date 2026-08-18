@@ -6,6 +6,7 @@ and derives segment-relative provider prompts deterministically.
 """
 from __future__ import annotations
 
+import math
 import re
 from dataclasses import dataclass
 from typing import Sequence
@@ -36,9 +37,13 @@ class FullPromptDocument:
 
 
 def format_time_label(start_sec: float, end_sec: float) -> str:
-    """Format an absolute source-time label; supports more than one minute digit."""
+    """Format an absolute source-time label; supports more than one minute digit.
+
+    Uses floor to the centisecond so tiny floating-point noise (e.g. 4.1299999
+    from arithmetic) always maps to the same label as the intended 4.12.
+    """
     def stamp(value: float) -> str:
-        total_centis = round(value * 100)
+        total_centis = math.floor(value * 100 + 1e-9)
         minutes, centis = divmod(total_centis, 6000)
         seconds, centis = divmod(centis, 100)
         return f"{minutes:02d}:{seconds:02d}.{centis:02d}"
@@ -148,13 +153,7 @@ def validate_full_prompt(
     # 标签必须按顺序一一对应，使用整数厘秒比较避免浮点误差。
     expected_cs = [(_parse_label(start), _parse_label(end)) for start, end in (label.split("–", 1) for label in expected)]
     actual_cs = [(_parse_label(start), _parse_label(end)) for start, end in (label.split("–", 1) for label in actual)]
-    # 重复标签优先于数量差异报告。
-    seen = set()
-    for start_cs, end_cs in actual_cs:
-        key = (start_cs, end_cs)
-        if key in seen:
-            raise FullPromptValidationError("重复")
-        seen.add(key)
+    # parse 已做全局重复检测；此处数量不匹配直接报告多余/缺少。
     if len(actual_cs) != len(expected_cs):
         raise FullPromptValidationError("时间块多余或缺少")
     for (a_start, a_end), (e_start, e_end) in zip(actual_cs, expected_cs):
