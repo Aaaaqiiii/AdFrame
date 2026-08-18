@@ -215,18 +215,18 @@ def test_create_rejects_reference_video_longer_than_30_seconds(client, tmp_path)
 
 
 def test_segment_generation_rejects_actual_segment_over_limit(client, tmp_path) -> None:
-    """实际提交分段超过 29 秒时拒绝。"""
+    """实际提交分段超过 29 秒时，生成接口必须拒绝。"""
+    from app.db.models import GenerationSegment
     project = _segment_generation_project(client, tmp_path)
-    # 手动保存一个 0–30 秒的超长分段方案。
-    plan = client.put(f"/api/projects/{project.project_id}/generation-segments", json={
-        "segments": [
-            {"source_start_sec": 0, "source_end_sec": 30, "start_boundary_type": "video_edge", "end_boundary_type": "inside_shot", "short_segment_accepted": False},
-            {"source_start_sec": 30, "source_end_sec": 32, "start_boundary_type": "inside_shot", "end_boundary_type": "video_edge", "short_segment_accepted": False},
-        ]
-    })
-    assert plan.status_code == 422  # 超过 29 秒
-    # 用合法的第二段（30–32 秒，2 秒短段需确认）也无法直接生成，因其提示词基于旧方案。
-    # 这里只验证超限分段方案本身被拒绝。
+    seg = project.segments[0]
+    # 直接在数据库把当前方案的合法 segment 改成 30 秒（保持方案仍是最新当前方案）。
+    with SessionLocal() as session:
+        row = session.get(GenerationSegment, UUID(seg["id"]))
+        row.source_end_sec = 30.0
+        session.commit()
+    response = client.post(project.url, json=project.payload(seg["id"], project.prompts[seg["id"]]))
+    assert response.status_code == 422
+    assert "安全时长" in response.json()["detail"]
 
 
 def test_create_duplicate_fingerprint_returns_conflict(client, tmp_path) -> None:
@@ -415,3 +415,25 @@ def test_segment_generation_rejects_stale_segment(client, tmp_path) -> None:
         session.commit()
     response = client.post(project.url, json=project.payload(seg["id"], project.prompts[seg["id"]]))
     assert response.status_code == 422
+
+
+def test_retry_failed_generation_revalidates_current_segment(client, tmp_path) -> None:
+    """创建失败任务后更新时间轴，重试必须 422 且不创建新 Generation。"""
+    project = _segment_generation_project(client, tmp_path)
+    seg = project.segments[0]
+    created = client.post(project.url, json=project.payload(seg["id"], project.prompts[seg["id"]]))
+    assert created.status_code == 202
+    generation_id = created.json()["id"]
+    with SessionLocal() as session:
+        generation = session.get(Generation, UUID(generation_id))
+        generation.status = "failed"
+        session.commit()
+        # 更新时间轴 v2，旧分段方案失效。
+        newer = TimelineRevision(project_id=project.project_id, version=2, source="human")
+        session.add(newer)
+        session.commit()
+    response = client.post(f"/api/projects/{project.project_id}/generations/{generation_id}/retry")
+    assert response.status_code == 422
+    with SessionLocal() as session:
+        generations = session.scalars(select(Generation).where(Generation.project_id == project.project_id)).all()
+        assert len(generations) == 1  # 没有创建新任务

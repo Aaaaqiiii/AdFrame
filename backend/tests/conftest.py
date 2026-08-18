@@ -50,6 +50,14 @@ def pytest_sessionstart(session) -> None:
     Base.metadata.create_all(engine)
 
 
+@pytest.fixture(autouse=True)
+def isolate_database() -> None:
+    """每个测试前按外键逆序清空测试库，保证用例与文件执行顺序无关。"""
+    with engine.begin() as connection:
+        for table in reversed(Base.metadata.sorted_tables):
+            connection.execute(table.delete())
+
+
 def pytest_sessionfinish() -> None:
     # Windows 必须先释放 SQLite 连接，才能可靠删除测试库；正式库从不在此路径中。
     engine.dispose()

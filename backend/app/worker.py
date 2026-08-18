@@ -207,10 +207,10 @@ def run_once() -> int:
                     if not covers_full_source:
                         destination = Settings().media_root / str(generation.project_id) / "generation-segments" / f"plan-{segment.plan_version}" / f"segment-{segment.position}.mp4"
                         destination.parent.mkdir(parents=True, exist_ok=True)
-                        if Path(segment.clip_path or "") != destination:
-                            ensure_segment_clip(Path(video_asset.original_path), destination, segment.source_start_sec, segment.source_end_sec, Settings().effective_segment_limit_seconds)
-                            segment.clip_path = str(destination)
-                            session.commit()
+                        # 始终调用：ensure_segment_clip 负责复用存在且有效的文件，或重建丢失/损坏的裁片。
+                        ensure_segment_clip(Path(video_asset.original_path), destination, segment.source_start_sec, segment.source_end_sec, Settings().effective_segment_limit_seconds)
+                        segment.clip_path = str(destination)
+                        session.commit()
                         video_url = _publish_segment_if_expired(session, segment)
                     else:
                         video_url = _publish_if_expired(session, video_asset, settings)
@@ -226,7 +226,16 @@ def run_once() -> int:
                     generation.generate_audio,
                     image_urls,
                 )
-                generation.request_snapshot = json.dumps(redact_request_urls(payload), ensure_ascii=False, sort_keys=True)
+                # 审计快照：外包 segment/prompt 元数据，保持发给供应商的 payload 不变。
+                snapshot = {
+                    "generation_segment_id": str(segment.id) if segment else None,
+                    "plan_version": segment.plan_version if segment else None,
+                    "source_start_sec": segment.source_start_sec if segment else None,
+                    "source_end_sec": segment.source_end_sec if segment else None,
+                    "prompt_version": generation.prompt_version,
+                    "provider_request": redact_request_urls(payload),
+                }
+                generation.request_snapshot = json.dumps(snapshot, ensure_ascii=False, sort_keys=True)
                 session.commit()
                 execute_generation_job(session, generation, gateway, payload)
             except Exception as exc:

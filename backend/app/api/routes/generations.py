@@ -116,17 +116,12 @@ def _asset_ids(assets: list[Asset]) -> str:
     return json.dumps([str(asset.id) for asset in assets], ensure_ascii=False)
 
 
-@router.post("", response_model=GenerationResponse, status_code=status.HTTP_202_ACCEPTED)
-def create_generation(project_id: UUID, payload: CreateGenerationRequest, session: Session = Depends(get_session)) -> GenerationResponse:
-    project = session.scalar(select(Project).where(Project.id == project_id).with_for_update())
-    if project is None:
-        raise HTTPException(status_code=404, detail="Project does not exist")
-    # 1. 生成片段必须存在且属于项目。
-    segment = session.get(GenerationSegment, payload.generation_segment_id)
+def _require_current_segment_prompt(session: Session, project_id: UUID, generation_segment_id: UUID, prompt_version: int):
+    """创建与重试共用的只读校验：片段/提示词/时间轴/方案必须仍是当前最新且互相匹配。"""
+    current_revision = _current_timeline_revision(session, project_id)
+    segment = session.get(GenerationSegment, generation_segment_id)
     if segment is None or segment.project_id != project_id:
         raise HTTPException(status_code=422, detail="生成分段已过期，请重新确认分段")
-    current_revision = _current_timeline_revision(session, project_id)
-    # 2. 片段时间轴必须等于当前时间轴，且分段方案仍是最新当前方案。
     if current_revision is None or segment.source_timeline_revision_id != current_revision.id:
         raise HTTPException(status_code=422, detail="生成分段已过期，请重新确认分段")
     latest_plan = session.scalar(
@@ -137,29 +132,36 @@ def create_generation(project_id: UUID, payload: CreateGenerationRequest, sessio
     )
     if latest_plan is None or segment.plan_version != latest_plan:
         raise HTTPException(status_code=422, detail="生成分段已过期，请重新确认分段")
-    # 3. 提示词必须是 completed、reference_video_edit、绑定同一片段、使用当前时间轴。
-    prompt = session.scalar(select(PromptRevision).where(PromptRevision.project_id == project_id, PromptRevision.version == payload.prompt_version))
+    prompt = session.scalar(select(PromptRevision).where(PromptRevision.project_id == project_id, PromptRevision.version == prompt_version))
     if prompt is None or prompt.status != "completed" or not (prompt.text or "").strip():
         raise HTTPException(status_code=422, detail="请先生成或保存一份完整提示词")
     if prompt.prompt_mode != "reference_video_edit" or prompt.generation_segment_id != segment.id:
         raise HTTPException(status_code=422, detail="编辑指令与生成片段不匹配")
     if current_revision is None or prompt.source_timeline_revision_id != current_revision.id:
         raise HTTPException(status_code=422, detail="提示词来自旧时间轴，请重新生成提示词")
-    # 4. 校验实际提交片段时长，而不是原视频总时长。
     if segment.source_end_sec - segment.source_start_sec > Settings().effective_segment_limit_seconds:
         raise HTTPException(status_code=422, detail="生成片段超过安全时长上限")
     shots = _current_shots(session, current_revision)
     if not shots:
         raise HTTPException(status_code=422, detail="当前时间轴没有镜头")
-    # 5. 所有当前镜头确认。
     unconfirmed = [shot for shot in shots if not session.scalar(select(ShotEdit).where(ShotEdit.project_id == project_id, ShotEdit.shot_id == shot.id, ShotEdit.confirmed.is_(True)))]
     if unconfirmed:
         raise HTTPException(status_code=422, detail="时间轴存在未确认镜头，请先确认全部镜头")
+    return segment, prompt, current_revision, shots
 
+
+@router.post("", response_model=GenerationResponse, status_code=status.HTTP_202_ACCEPTED)
+def create_generation(project_id: UUID, payload: CreateGenerationRequest, session: Session = Depends(get_session)) -> GenerationResponse:
+    project = session.scalar(select(Project).where(Project.id == project_id).with_for_update())
+    if project is None:
+        raise HTTPException(status_code=404, detail="Project does not exist")
+    # 稳定校验顺序（含片段/时间轴/方案/提示词/镜头确认）。
+    segment, prompt, current_revision, shots = _require_current_segment_prompt(
+        session, project_id, payload.generation_segment_id, payload.prompt_version,
+    )
     video = session.scalar(select(Asset).where(Asset.project_id == project_id, Asset.kind == "reference_video").order_by(Asset.id.desc()))
     if video is None:
         raise HTTPException(status_code=422, detail="请先上传参考视频")
-
     # 6. provider key 和模式相关引用有效。
     _require_provider_key(payload.provider)
 
@@ -265,6 +267,12 @@ def retry_generation(project_id: UUID, generation_id: UUID, session: Session = D
         raise HTTPException(status_code=404, detail="Generation does not exist")
     if generation.status not in {"failed"}:
         raise HTTPException(status_code=422, detail="只有失败的生成任务可以重试")
+    # 分段任务重试必须重新验证片段/提示词/时间轴/方案仍是当前最新且互相匹配，
+    # 避免时间轴更新后仍提交旧裁片。
+    if generation.generation_segment_id:
+        _require_current_segment_prompt(
+            session, project_id, generation.generation_segment_id, generation.prompt_version,
+        )
     version = (session.scalar(select(func.max(Generation.version)).where(Generation.project_id == project_id)) or 0) + 1
     retried = Generation(
         project_id=project_id,
