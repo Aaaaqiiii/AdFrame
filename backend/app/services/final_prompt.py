@@ -225,6 +225,14 @@ def expected_segment_labels(segment: GenerationSegment, shots: list) -> list[str
     return labels
 
 
+def _segment_prefix(text: str, labels: list[str]) -> str:
+    """取文本中第一个预期时间标签之前的服务端确定性前缀。"""
+    for label in labels:
+        if label in text:
+            return text[: text.index(label)].strip()
+    return ""
+
+
 def actionable_segment_text(text: str, labels: list[str]) -> str:
     """只连接每个时间块的 修改/删除 正文，供产品替换检测。
 
@@ -401,17 +409,25 @@ def execute_prompt_refinement_job(session: Session, job: Job, settings: Settings
             raise ValueError("分段编辑指令的生成片段不存在")
         shots = list(session.scalars(select(Shot).where(Shot.timeline_revision_id == revision.source_timeline_revision_id).order_by(Shot.position)))
         expected_labels = expected_segment_labels(segment, shots)
-        missing = missing_segment_prompt_blocks(refined_text, expected_labels)
+        # 服务端确定性全局规则来自源版本（第一个预期时间标签之前的部分），精修后重新拼接，
+        # 保护原产品锁定、目标产品档案、产品图用途、人物参考与音频规则不被 GPT 删除。
+        source_prefix = _segment_prefix(source_text, expected_labels)
+        if not source_prefix:
+            raise ValueError("分段编辑指令缺少服务端全局规则")
+        # 丢弃 GPT 返回的全局前缀，只保留其可编辑时间块正文。
+        body = refined_text
+        for label in expected_labels:
+            if label in body:
+                body = body[body.index(label):]
+                break
+        missing = missing_segment_prompt_blocks(body, expected_labels)
         if missing:
             raise ValueError(f"GPT 精修结果不完整，缺少镜头编辑指令：{', '.join(missing)}")
         if project.mode == "preserve_product":
-            # 服务端原产品锁定规则必须仍在；缺失则拒绝。
-            lock_marker = "保持原产品不变，禁止替换、删除或重新设计原产品。"
-            if lock_marker not in refined_text:
-                raise ValueError("保留产品模式的精修结果缺少原产品锁定规则")
-            # 只检测每个时间块的 修改/删除 可执行正文。
-            if contains_product_replacement(actionable_segment_text(refined_text, expected_labels)):
+            # 只检测每个时间块的 修改/删除 可执行正文（锁定规则由源前缀确定性重建，无需 GPT 保留）。
+            if contains_product_replacement(actionable_segment_text(body, expected_labels)):
                 raise ValueError("保留产品模式的模型输出不能替换产品")
+        refined_text = f"{source_prefix.rstrip()}\n\n{body.strip()}"
     elif project.mode == "preserve_product" and contains_product_replacement(refined_text):
         raise ValueError("保留产品模式的模型输出不能替换产品")
     revision.text = refined_text

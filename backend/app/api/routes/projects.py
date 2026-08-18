@@ -13,7 +13,7 @@ from sqlalchemy.orm import Session
 
 from app.core.config import Settings
 from app.db.models import Asset, GenerationSegment, Job, Project, PromptRevision, Shot, ShotAISummary, ShotEdit, ShotEvidence, TimelineRevision
-from app.services.final_prompt import expected_segment_labels, missing_segment_prompt_blocks
+from app.services.final_prompt import actionable_segment_text, expected_segment_labels, missing_segment_prompt_blocks
 from app.db.session import get_session
 from app.services.media import MediaToolUnavailableError, probe_video
 from app.services.tempfile_publisher import TempfilePublisher
@@ -824,8 +824,6 @@ def create_prompt_revision(
         raise HTTPException(status_code=404, detail="项目不存在")
     if project.mode == "preserve_product" and payload.replace_product:
         raise HTTPException(status_code=422, detail="保留产品模式不能开启产品替换。")
-    if project.mode == "preserve_product" and contains_product_replacement(payload.visual_direction):
-        raise HTTPException(status_code=422, detail="保留产品模式的提示词不能替换产品。")
     replace_product = project.mode == "replace_product"
     product_assets = confirmed_target_product_assets(session, project)
     product_profile = _combined_reference_profile(product_assets)
@@ -852,6 +850,9 @@ def create_prompt_revision(
         prompt_mode = "reference_video_edit"
         # 只读取该片段覆盖的镜头。
         current_shots = [shot for shot in current_shots if shot.end_sec > segment.source_start_sec and shot.start_sec < segment.source_end_sec]
+    elif project.mode == "preserve_product" and contains_product_replacement(payload.visual_direction):
+        # 非分段模式：改编要求整体检测（分段模式的锁定规则由服务端确定性写入，跳过整体检测）。
+        raise HTTPException(status_code=422, detail="保留产品模式的提示词不能替换产品。")
     if replace_product:
         _, conflicts = check_product_compatibility(product_profile or "", current_shots)
         if conflicts:
@@ -888,6 +889,13 @@ def create_prompt_revision(
         expected_labels = expected_segment_labels(segment, [shot for shot in session.scalars(select(Shot).where(Shot.timeline_revision_id == revision.id).order_by(Shot.position))])
         if missing_segment_prompt_blocks(text, expected_labels):
             raise HTTPException(status_code=422, detail="分段编辑指令缺少时间块或保持/修改/删除/禁止栏目")
+        if project.mode == "preserve_product":
+            # 分段人工保存必须要求服务端原产品锁定规则存在。
+            if "保持原产品不变，禁止替换、删除或重新设计原产品。" not in text:
+                raise HTTPException(status_code=422, detail="分段编辑指令缺少原产品锁定规则")
+            # 只对数据库预期时间块的修改/删除正文执行替换检测。
+            if contains_product_replacement(actionable_segment_text(text, expected_labels)):
+                raise HTTPException(status_code=422, detail="保留产品模式的提示词不能替换产品。")
     prompt_revision = PromptRevision(
         project_id=project_id, version=version, text=text,
         visual_direction=payload.visual_direction.strip(), audio_mode=payload.audio_mode,
