@@ -14,6 +14,7 @@ class VideoMetadata:
     width: int
     height: int
     fps: float
+    has_audio: bool = False
 
 
 @dataclass(frozen=True)
@@ -60,6 +61,7 @@ def probe_video(path: Path) -> VideoMetadata:
         width=int(stream["width"]),
         height=int(stream["height"]),
         fps=_fps(stream["avg_frame_rate"]),
+        has_audio=any(item["codec_type"] == "audio" for item in payload["streams"]),
     )
 
 
@@ -89,6 +91,18 @@ def clip_video(source: Path, destination: Path, start_sec: float, end_sec: float
         "-an", "-c:v", "libx264", "-pix_fmt", "yuv420p", str(destination),
     ])
     probe_video(destination)
+    return destination
+
+
+def ensure_segment_clip(source: Path, destination: Path, start_sec: float, end_sec: float, max_sec: float) -> Path:
+    """Create or reuse a persistent segment clip, reusing clip_video() without changing codec/audio flags."""
+    if destination.is_file():
+        metadata = probe_video(destination)
+    else:
+        metadata = probe_video(clip_video(source, destination, start_sec, end_sec))
+    if metadata.duration_sec > max_sec:
+        destination.unlink(missing_ok=True)
+        raise ValueError("生成片段超过供应商安全时长")
     return destination
 
 

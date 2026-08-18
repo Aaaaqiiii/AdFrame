@@ -320,3 +320,79 @@ def test_task_id_is_committed_before_first_poll(queued_generation) -> None:
         generation = session.get(type(queued_generation), queued_generation.id)
         execute_generation_job(session, generation, Gateway(), {"model": "seedance"})
     assert observed and observed[0] == ("processing", "provider-task-99")
+
+
+def test_worker_publishes_segment_clip_and_matches_prompt(client, tmp_path, monkeypatch) -> None:
+    """Worker 对物理裁切分段发布 segment clip，请求文本匹配提示词，快照无签名串。"""
+    from uuid import UUID as _UUID
+    from app.db.models import GenerationSegment
+    project = client.post("/api/projects", json={"name": "segment worker"}).json()
+    video_id, asset_ids = _ready_generation_rows(tmp_path, project["id"])
+    # 造一个非完整覆盖的分段（0–4 秒，原视频 8 秒）及分段提示词。
+    with SessionLocal() as session:
+        revision = session.scalar(select(TimelineRevision).where(TimelineRevision.project_id == _UUID(project["id"])))
+        segment = GenerationSegment(
+            project_id=_UUID(project["id"]), plan_version=1, position=0,
+            source_start_sec=0.0, source_end_sec=4.0,
+            start_boundary_type="video_edge", end_boundary_type="shot_boundary",
+            source_timeline_revision_id=revision.id,
+        )
+        session.add(segment)
+        session.flush()
+        prompt = PromptRevision(
+            project_id=_UUID(project["id"]), version=2, text="00:00.00–00:04.00\n保持：a\n修改：无。\n删除：无。\n禁止：无。",
+            prompt_mode="reference_video_edit", generation_segment_id=segment.id,
+            source_timeline_revision_id=revision.id, status="completed",
+        )
+        session.add(prompt)
+        generation = Generation(
+            project_id=_UUID(project["id"]), version=2, prompt_version=prompt.version,
+            generation_segment_id=segment.id, provider="volcengine",
+            ratio="adaptive", duration=-1, status="queued",
+            reference_asset_ids=json.dumps(asset_ids),
+        )
+        session.add(generation)
+        session.commit()
+        generation_id, segment_id = generation.id, segment.id
+
+    from app.worker import run_once
+    published = []
+    class FakePublisher:
+        def publish(self, path, content_type):
+            published.append((str(path), content_type))
+            return type("P", (), {"url": f"https://tempfile.org/seg/{len(published)}?signature=abc", "expires_at": datetime.now(UTC)})()
+    monkeypatch.setattr("app.worker.TempfilePublisher", FakePublisher)
+    # 避免真实 ffmpeg 裁切：mock ensure_segment_clip 只写一个占位文件。
+    fake_clip = tmp_path / "fake-clip.mp4"
+    fake_clip.write_bytes(b"clip")
+    def _fake_ensure(source, destination, start, end, max_sec):
+        destination.write_bytes(b"clip")
+        return destination
+    monkeypatch.setattr("app.worker.ensure_segment_clip", _fake_ensure)
+    seen_payloads = []
+    class FakeGateway:
+        def submit(self, payload):
+            seen_payloads.append(payload)
+            return "provider-seg-1"
+        def get_result(self, task_id):
+            return GenerationResult(task_id=task_id, status="processing")
+    monkeypatch.setattr("app.worker._generation_gateway", lambda settings, provider: (FakeGateway(), "model"))
+
+    run_once()
+
+    assert published, "segment clip should be published"
+    with SessionLocal() as session:
+        generation = session.get(Generation, generation_id)
+        segment = session.get(GenerationSegment, segment_id)
+        assert generation.status in {"queued", "processing", "retryable"}
+        assert segment.clip_path is not None
+        assert segment.public_url is not None
+        # 请求文本匹配分段提示词。
+        assert seen_payloads and seen_payloads[0]["content"][0]["text"].startswith("00:00.00–00:04.00")
+        # 参考视频 URL 是 segment clip 的发布 URL。
+        video_part = seen_payloads[0]["content"][1]["video_url"]["url"]
+        assert video_part.startswith("https://tempfile.org/seg/")
+        # 快照不含签名查询串。
+        snapshot = generation.request_snapshot or ""
+        assert "signature" not in snapshot
+        assert "abc" not in snapshot

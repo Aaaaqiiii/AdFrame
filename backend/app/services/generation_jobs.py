@@ -13,7 +13,7 @@ from app.services.worker_state import MAX_ATTEMPTS, retry_at
 MAX_GENERATED_VIDEO_BYTES = 1024 * 1024 * 1024
 
 
-def _download_result(source_url: str, destination: Path) -> None:
+def _download_result(source_url: str, destination: Path, require_audio: bool = False) -> None:
     temporary = destination.with_suffix(destination.suffix + ".part")
     temporary.unlink(missing_ok=True)
     try:
@@ -33,7 +33,11 @@ def _download_result(source_url: str, destination: Path) -> None:
                         if total > MAX_GENERATED_VIDEO_BYTES:
                             raise RuntimeError("Generated result exceeds the download size limit")
                         output.write(chunk)
-        probe_video(temporary)
+        metadata = probe_video(temporary)
+        if metadata.duration_sec <= 0 or metadata.width <= 0 or metadata.height <= 0 or metadata.fps <= 0:
+            raise RuntimeError("Generated result video metadata is invalid")
+        if require_audio and not metadata.has_audio:
+            raise RuntimeError("Generated result is missing the required audio stream")
         temporary.replace(destination)
     finally:
         temporary.unlink(missing_ok=True)
@@ -61,7 +65,7 @@ def execute_generation_job(session: Session, generation: Generation, gateway: Ge
         if result.status == "completed" and result.video_url:
             destination = Settings().media_root / str(generation.project_id) / "generated" / f"v{generation.version}.mp4"
             destination.parent.mkdir(parents=True, exist_ok=True)
-            _download_result(result.video_url, destination)
+            _download_result(result.video_url, destination, require_audio=generation.generate_audio)
             generation.result_path = str(destination)
             generation.completed_at = datetime.now(UTC)
             generation.status = "completed"

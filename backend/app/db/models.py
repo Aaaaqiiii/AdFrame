@@ -55,6 +55,7 @@ class Generation(Base):
     result_path: Mapped[str | None] = mapped_column(String(500), nullable=True)
     request_snapshot: Mapped[str | None] = mapped_column(Text, nullable=True)
     reference_asset_ids: Mapped[str | None] = mapped_column(Text, nullable=True)
+    generation_segment_id: Mapped[UUID | None] = mapped_column(ForeignKey("generation_segments.id"), nullable=True)
     provider_response_summary: Mapped[str | None] = mapped_column(Text, nullable=True)
     submission_fingerprint: Mapped[str | None] = mapped_column(String(64), nullable=True)
     completed_at: Mapped[datetime | None] = mapped_column(nullable=True)

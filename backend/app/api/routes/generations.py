@@ -12,7 +12,7 @@ from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
 from app.core.config import Settings
-from app.db.models import Asset, Generation, Project, PromptRevision, Shot, ShotEdit, TimelineRevision
+from app.db.models import Asset, Generation, GenerationSegment, Project, PromptRevision, Shot, ShotEdit, TimelineRevision
 from app.db.session import get_session
 from app.services.product_compatibility import check_product_compatibility
 from app.services.reference_profiles import load_structure
@@ -25,6 +25,7 @@ class CreateGenerationRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
     provider: str = Field(pattern="^(volcengine|comfly)$")
     prompt_version: int = Field(gt=0)
+    generation_segment_id: UUID
     generate_audio: bool = False
     include_person_reference: bool = False
     include_background_reference: bool = False
@@ -34,6 +35,7 @@ class GenerationResponse(BaseModel):
     id: UUID
     version: int
     prompt_version: int
+    generation_segment_id: UUID | None
     provider: str
     status: str
     generate_audio: bool
@@ -52,6 +54,7 @@ def generation_response(project_id: UUID, generation: Generation) -> GenerationR
         id=generation.id,
         version=generation.version,
         prompt_version=generation.prompt_version,
+        generation_segment_id=generation.generation_segment_id,
         provider=generation.provider,
         status=generation.status,
         generate_audio=generation.generate_audio,
@@ -118,15 +121,37 @@ def create_generation(project_id: UUID, payload: CreateGenerationRequest, sessio
     project = session.scalar(select(Project).where(Project.id == project_id).with_for_update())
     if project is None:
         raise HTTPException(status_code=404, detail="Project does not exist")
+    # 1. 生成片段必须存在且属于项目。
+    segment = session.get(GenerationSegment, payload.generation_segment_id)
+    if segment is None or segment.project_id != project_id:
+        raise HTTPException(status_code=422, detail="生成分段已过期，请重新确认分段")
+    current_revision = _current_timeline_revision(session, project_id)
+    # 2. 片段时间轴必须等于当前时间轴，且分段方案仍是最新当前方案。
+    if current_revision is None or segment.source_timeline_revision_id != current_revision.id:
+        raise HTTPException(status_code=422, detail="生成分段已过期，请重新确认分段")
+    latest_plan = session.scalar(
+        select(func.max(GenerationSegment.plan_version)).where(
+            GenerationSegment.project_id == project_id,
+            GenerationSegment.source_timeline_revision_id == current_revision.id,
+        )
+    )
+    if latest_plan is None or segment.plan_version != latest_plan:
+        raise HTTPException(status_code=422, detail="生成分段已过期，请重新确认分段")
+    # 3. 提示词必须是 completed、reference_video_edit、绑定同一片段、使用当前时间轴。
     prompt = session.scalar(select(PromptRevision).where(PromptRevision.project_id == project_id, PromptRevision.version == payload.prompt_version))
     if prompt is None or prompt.status != "completed" or not (prompt.text or "").strip():
         raise HTTPException(status_code=422, detail="请先生成或保存一份完整提示词")
-    current_revision = _current_timeline_revision(session, project_id)
+    if prompt.prompt_mode != "reference_video_edit" or prompt.generation_segment_id != segment.id:
+        raise HTTPException(status_code=422, detail="编辑指令与生成片段不匹配")
     if current_revision is None or prompt.source_timeline_revision_id != current_revision.id:
         raise HTTPException(status_code=422, detail="提示词来自旧时间轴，请重新生成提示词")
+    # 4. 校验实际提交片段时长，而不是原视频总时长。
+    if segment.source_end_sec - segment.source_start_sec > Settings().effective_segment_limit_seconds:
+        raise HTTPException(status_code=422, detail="生成片段超过安全时长上限")
     shots = _current_shots(session, current_revision)
     if not shots:
         raise HTTPException(status_code=422, detail="当前时间轴没有镜头")
+    # 5. 所有当前镜头确认。
     unconfirmed = [shot for shot in shots if not session.scalar(select(ShotEdit).where(ShotEdit.project_id == project_id, ShotEdit.shot_id == shot.id, ShotEdit.confirmed.is_(True)))]
     if unconfirmed:
         raise HTTPException(status_code=422, detail="时间轴存在未确认镜头，请先确认全部镜头")
@@ -134,9 +159,8 @@ def create_generation(project_id: UUID, payload: CreateGenerationRequest, sessio
     video = session.scalar(select(Asset).where(Asset.project_id == project_id, Asset.kind == "reference_video").order_by(Asset.id.desc()))
     if video is None:
         raise HTTPException(status_code=422, detail="请先上传参考视频")
-    if video.duration_sec is not None and video.duration_sec > 30:
-        raise HTTPException(status_code=422, detail="参考视频超过 30 秒，Seedance 提交前请先裁剪或更换视频")
 
+    # 6. provider key 和模式相关引用有效。
     _require_provider_key(payload.provider)
 
     assets: list[Asset] = [video]
@@ -171,6 +195,10 @@ def create_generation(project_id: UUID, payload: CreateGenerationRequest, sessio
     fingerprint_payload = {
         "project_id": str(project.id),
         "timeline_revision_id": str(current_revision.id),
+        "segment_id": str(segment.id),
+        "segment_plan_version": segment.plan_version,
+        "segment_start_sec": segment.source_start_sec,
+        "segment_end_sec": segment.source_end_sec,
         "prompt_revision_id": str(prompt.id),
         "provider": payload.provider,
         "generate_audio": payload.generate_audio,
@@ -189,6 +217,7 @@ def create_generation(project_id: UUID, payload: CreateGenerationRequest, sessio
         project_id=project_id,
         version=version,
         prompt_version=payload.prompt_version,
+        generation_segment_id=segment.id,
         provider=payload.provider,
         ratio="adaptive",
         duration=-1,
@@ -241,6 +270,7 @@ def retry_generation(project_id: UUID, generation_id: UUID, session: Session = D
         project_id=project_id,
         version=version,
         prompt_version=generation.prompt_version,
+        generation_segment_id=generation.generation_segment_id,
         provider=generation.provider,
         ratio="adaptive",
         duration=-1,

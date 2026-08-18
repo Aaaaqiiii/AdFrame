@@ -12,10 +12,11 @@ from datetime import UTC, datetime, timedelta
 from sqlalchemy import or_, select
 
 from app.core.config import Settings
-from app.db.models import Asset, Generation, Job, PromptRevision
+from app.db.models import Asset, Generation, GenerationSegment, Job, PromptRevision
 from app.db.migrations import require_database_at_head
 from app.db.session import SessionLocal
 from app.services.generation_jobs import execute_generation_job
+from app.services.media import ensure_segment_clip
 from app.services.seedance import JsonTaskGateway, build_seedance_request
 from app.services.tempfile_publisher import TempfilePublisher
 from app.services.comfly_frame_vision import ComflyFrameVisionGateway
@@ -74,6 +75,24 @@ def _publish_if_expired(session, asset: Asset, settings: Settings) -> str:
     asset.public_url, asset.public_url_expires_at = published.url, published.expires_at.isoformat()
     session.commit()
     return asset.public_url
+
+
+def _publish_segment_if_expired(session, segment: GenerationSegment) -> str:
+    """Republish an expired or missing segment-clip URL; otherwise reuse the stored one."""
+    expires_at = None
+    if segment.public_url_expires_at:
+        try:
+            expires_at = datetime.fromisoformat(segment.public_url_expires_at)
+        except ValueError:
+            expires_at = None
+    if segment.public_url and (expires_at is None or expires_at > datetime.now(UTC)):
+        return segment.public_url
+    if not segment.clip_path or not Path(segment.clip_path).is_file():
+        raise RuntimeError("Segment clip is missing")
+    published = TempfilePublisher().publish(Path(segment.clip_path), "video/mp4")
+    segment.public_url, segment.public_url_expires_at = published.url, published.expires_at.isoformat()
+    session.commit()
+    return segment.public_url
 
 
 def _generation_gateway(settings: Settings, provider: str):
@@ -180,7 +199,23 @@ def run_once() -> int:
                     generation.status, generation.error_message = "failed", "Generation input is no longer available"
                     session.commit()
                     continue
-                video_url = _publish_if_expired(session, assets[0], settings)
+                # 按生成片段决定发布原视频还是物理裁片。
+                segment = session.get(GenerationSegment, generation.generation_segment_id) if generation.generation_segment_id else None
+                video_asset = assets[0]
+                if segment is not None:
+                    covers_full_source = segment.source_start_sec <= 0.001 and abs(segment.source_end_sec - (video_asset.duration_sec or segment.source_end_sec)) <= 0.001
+                    if not covers_full_source:
+                        destination = Settings().media_root / str(generation.project_id) / "generation-segments" / f"plan-{segment.plan_version}" / f"segment-{segment.position}.mp4"
+                        destination.parent.mkdir(parents=True, exist_ok=True)
+                        if Path(segment.clip_path or "") != destination:
+                            ensure_segment_clip(Path(video_asset.original_path), destination, segment.source_start_sec, segment.source_end_sec, Settings().effective_segment_limit_seconds)
+                            segment.clip_path = str(destination)
+                            session.commit()
+                        video_url = _publish_segment_if_expired(session, segment)
+                    else:
+                        video_url = _publish_if_expired(session, video_asset, settings)
+                else:
+                    video_url = _publish_if_expired(session, video_asset, settings)
                 image_urls = [_publish_if_expired(session, asset, settings) for asset in assets[1:]]
                 payload = build_seedance_request(
                     model,

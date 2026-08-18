@@ -38,16 +38,6 @@ def _ready_project(client, tmp_path, mode="preserve_product", replace_person=Fal
         session.add(shot)
         session.flush()
         session.add(ShotEdit(project_id=project_id, shot_id=shot.id, action="展示产品", confirmed=True))
-        prompt = PromptRevision(
-            project_id=project_id,
-            version=1,
-            text="保持当前镜头和产品",
-            replace_product=mode == "replace_product",
-            replace_person=replace_person,
-            source_timeline_revision_id=revision.id,
-            status="completed",
-        )
-        session.add(prompt)
         if mode == "replace_product":
             product_path = tmp_path / "product.png"
             product_path.write_bytes(b"product")
@@ -76,14 +66,36 @@ def _ready_project(client, tmp_path, mode="preserve_product", replace_person=Fal
                 analysis_status="succeeded",
             ))
         session.commit()
+        # 8 秒视频 ≤ 29 秒 → 单段覆盖整个视频；建分段方案 + 分段编辑提示词。
+        plan = client.post(f"/api/projects/{project_id}/generation-segments/auto")
+        assert plan.status_code == 201
+        segment_id = plan.json()["segments"][0]["id"]
+        if mode == "replace_product":
+            prompt_text = (
+                "全局规则：目标产品必须匹配已确认参考图：\n已确认目标产品\n"
+                "全局规则：产品参考图用途（按名称锁定对应结构，不得省略）：\n- 其他：锁定该角度结构\n\n"
+                "00:00.00–00:08.00\n保持：a\n修改：无。\n删除：无。\n禁止：无。"
+            )
+        else:
+            prompt_text = (
+                "全局规则：保持原产品不变，禁止替换、删除或重新设计原产品。\n\n"
+                "00:00.00–00:08.00\n保持：a\n修改：无。\n删除：无。\n禁止：无。"
+            )
+        prompt_body = client.post(
+            f"/api/projects/{project_id}/prompts",
+            json={"visual_direction": prompt_text, "use_ai": False, "generation_segment_id": segment_id},
+        )
+        assert prompt_body.status_code == 201
         return SimpleNamespace(
             project_id=project_id,
             video_asset_id=video.id,
-            prompt_version=prompt.version,
+            segment_id=segment_id,
+            prompt_version=prompt_body.json()["version"],
             generations_url=f"/api/projects/{project_id}/generations",
             payload={
                 "provider": "volcengine",
-                "prompt_version": prompt.version,
+                "prompt_version": prompt_body.json()["version"],
+                "generation_segment_id": segment_id,
                 "generate_audio": False,
                 "include_person_reference": replace_person,
                 "include_background_reference": False,
@@ -182,7 +194,7 @@ def test_create_rejects_unconfirmed_shot(client, tmp_path) -> None:
 
 def test_create_rejects_missing_provider_key(client, tmp_path, monkeypatch) -> None:
     from types import SimpleNamespace as _NS
-    fake_settings = _NS(volcengine_api_key="", volcengine_seedance_base_url="https://x", volcengine_seedance_task_path="/t", comfly_api_key="", comfly_base_url="https://y", comfly_seedance_task_path="/t")
+    fake_settings = _NS(volcengine_api_key="", volcengine_seedance_base_url="https://x", volcengine_seedance_task_path="/t", comfly_api_key="", comfly_base_url="https://y", comfly_seedance_task_path="/t", effective_segment_limit_seconds=29.0)
     monkeypatch.setattr("app.api.routes.generations.Settings", lambda: fake_settings)
     ready_project = _ready_project(client, tmp_path)
     response = client.post(ready_project.generations_url, json=ready_project.payload)
@@ -197,8 +209,24 @@ def test_create_rejects_reference_video_longer_than_30_seconds(client, tmp_path)
         )
         video.duration_sec = 31
         session.commit()
+    # 视频总时长 31 秒，但提交分段仍为 0–8 秒（合法），不应按完整总时长拒绝。
     response = client.post(ready_project.generations_url, json=ready_project.payload)
-    assert response.status_code == 422
+    assert response.status_code == 202
+
+
+def test_segment_generation_rejects_actual_segment_over_limit(client, tmp_path) -> None:
+    """实际提交分段超过 29 秒时拒绝。"""
+    project = _segment_generation_project(client, tmp_path)
+    # 手动保存一个 0–30 秒的超长分段方案。
+    plan = client.put(f"/api/projects/{project.project_id}/generation-segments", json={
+        "segments": [
+            {"source_start_sec": 0, "source_end_sec": 30, "start_boundary_type": "video_edge", "end_boundary_type": "inside_shot", "short_segment_accepted": False},
+            {"source_start_sec": 30, "source_end_sec": 32, "start_boundary_type": "inside_shot", "end_boundary_type": "video_edge", "short_segment_accepted": False},
+        ]
+    })
+    assert plan.status_code == 422  # 超过 29 秒
+    # 用合法的第二段（30–32 秒，2 秒短段需确认）也无法直接生成，因其提示词基于旧方案。
+    # 这里只验证超限分段方案本身被拒绝。
 
 
 def test_create_duplicate_fingerprint_returns_conflict(client, tmp_path) -> None:
@@ -275,4 +303,115 @@ def test_attach_task_requires_nonblank_id(client, uncertain_generation) -> None:
     response = client.post(f"/api/projects/{uncertain_generation.project_id}/generations/{uncertain_generation.id}/resolve", json={
         "action": "attach_task", "external_task_id": "  "
     })
+    assert response.status_code == 422
+
+
+def _segment_generation_project(client, tmp_path, duration_sec=32.0):
+    """32 秒视频 + 确认镜头 + 自动分段方案 + 分段编辑提示词。"""
+    project_body = client.post("/api/projects", json={"name": "segment-gen"}).json()
+    project_id = UUID(project_body["id"])
+    video_path = tmp_path / "reference.mp4"
+    video_path.write_bytes(b"stored-video")
+    with SessionLocal() as session:
+        video = Asset(
+            project_id=project_id, kind="reference_video", original_path=str(video_path),
+            original_filename="reference.mp4", content_type="video/mp4", duration_sec=duration_sec,
+        )
+        revision = TimelineRevision(project_id=project_id, version=1, source="human")
+        session.add_all([video, revision])
+        session.flush()
+        for index, (start, end) in enumerate([(0.0, 8.0), (8.0, 16.0), (16.0, 24.0), (24.0, 32.0)]):
+            shot = Shot(timeline_revision_id=revision.id, position=index, start_sec=start, end_sec=end, analysis_status="succeeded")
+            session.add(shot)
+            session.flush()
+            session.add(ShotEdit(project_id=project_id, shot_id=shot.id, action="展示", confirmed=True))
+        session.commit()
+        video_id, revision_id = video.id, revision.id
+    plan = client.post(f"/api/projects/{project_id}/generation-segments/auto")
+    assert plan.status_code == 201
+    segments = plan.json()["segments"]
+    assert len(segments) == 2
+    prompts = {}
+    for seg in segments:
+        r = client.post(
+            f"/api/projects/{project_id}/prompts",
+            json={"visual_direction": "保持原节奏", "use_ai": False, "generation_segment_id": seg["id"]},
+        )
+        # 人工保存分段编辑提示词必须含四栏目 + 保留模式锁定规则。
+        r = client.post(
+            f"/api/projects/{project_id}/prompts",
+            json={
+                "visual_direction": (
+                    "全局规则：保持原产品不变，禁止替换、删除或重新设计原产品。\n\n"
+                    f"00:00.00–00:08.00\n保持：a\n修改：无。\n删除：无。\n禁止：无。\n\n"
+                    f"00:08.00–00:16.00\n保持：b\n修改：无。\n删除：无。\n禁止：无。"
+                ),
+                "use_ai": False,
+                "generation_segment_id": seg["id"],
+            },
+        )
+        assert r.status_code == 201
+        prompts[seg["id"]] = r.json()["version"]
+    return SimpleNamespace(
+        project_id=project_id, segments=segments, prompts=prompts,
+        url=f"/api/projects/{project_id}/generations",
+        payload=lambda seg_id, pv: {
+            "provider": "volcengine", "prompt_version": pv,
+            "generation_segment_id": str(seg_id),
+            "generate_audio": False,
+            "include_person_reference": False,
+            "include_background_reference": False,
+        },
+    )
+
+
+def test_segment_generation_accepts_32_second_video(client, tmp_path) -> None:
+    """32 秒原视频 + 合法分段可生成（不再按完整总时长拒绝）。"""
+    project = _segment_generation_project(client, tmp_path)
+    seg = project.segments[0]
+    response = client.post(project.url, json=project.payload(seg["id"], project.prompts[seg["id"]]))
+    assert response.status_code == 202
+    assert response.json()["generation_segment_id"] == seg["id"]
+    with SessionLocal() as session:
+        generation = session.get(Generation, UUID(response.json()["id"]))
+        assert generation.generation_segment_id == UUID(seg["id"])
+
+
+def test_segment_generation_rejects_prompt_segment_mismatch(client, tmp_path) -> None:
+    project = _segment_generation_project(client, tmp_path)
+    seg_a, seg_b = project.segments[0], project.segments[1]
+    # 用 seg_b 的提示词提交 seg_a。
+    response = client.post(project.url, json=project.payload(seg_a["id"], project.prompts[seg_b["id"]]))
+    assert response.status_code == 422
+
+
+def test_two_segments_create_two_generations_not_per_shot(client, tmp_path) -> None:
+    """两个分段各创建一个任务，绝不为每个分镜创建任务。"""
+    project = _segment_generation_project(client, tmp_path)
+    for seg in project.segments:
+        response = client.post(project.url, json=project.payload(seg["id"], project.prompts[seg["id"]]))
+        assert response.status_code == 202
+    with SessionLocal() as session:
+        generations = session.scalars(select(Generation).where(Generation.project_id == project.project_id)).all()
+        assert len(generations) == 2
+
+
+def test_segment_generation_duplicate_active_returns_conflict(client, tmp_path) -> None:
+    project = _segment_generation_project(client, tmp_path)
+    seg = project.segments[0]
+    first = client.post(project.url, json=project.payload(seg["id"], project.prompts[seg["id"]]))
+    assert first.status_code == 202
+    duplicate = client.post(project.url, json=project.payload(seg["id"], project.prompts[seg["id"]]))
+    assert duplicate.status_code == 409
+
+
+def test_segment_generation_rejects_stale_segment(client, tmp_path) -> None:
+    project = _segment_generation_project(client, tmp_path)
+    seg = project.segments[0]
+    # 创建更新的时间轴 v2（旧方案失效）。
+    with SessionLocal() as session:
+        newer = TimelineRevision(project_id=project.project_id, version=2, source="human")
+        session.add(newer)
+        session.commit()
+    response = client.post(project.url, json=project.payload(seg["id"], project.prompts[seg["id"]]))
     assert response.status_code == 422

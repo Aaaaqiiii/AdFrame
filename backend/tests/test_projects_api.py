@@ -33,11 +33,22 @@ def _ready_generation_project(client: TestClient, name: str = "ready") -> dict:
         f"/api/projects/{project['id']}/shots/{shot_id}/edit",
         json={"action": "展示产品", "confirmed": True},
     )
+    plan = client.post(f"/api/projects/{project['id']}/generation-segments/auto")
+    assert plan.status_code == 201
+    segment_id = plan.json()["segments"][0]["id"]
     prompt = client.post(
         f"/api/projects/{project['id']}/prompts",
-        json={"product_profile": "bottle", "visual_direction": "keep lighting", "use_ai": False},
-    ).json()
-    return {"id": project["id"], "prompt_version": prompt["version"]}
+        json={
+            "visual_direction": (
+                "全局规则：保持原产品不变，禁止替换、删除或重新设计原产品。\n\n"
+                "00:00.00–00:08.00\n保持：a\n修改：无。\n删除：无。\n禁止：无。"
+            ),
+            "use_ai": False,
+            "generation_segment_id": segment_id,
+        },
+    )
+    assert prompt.status_code == 201
+    return {"id": project["id"], "segment_id": segment_id, "prompt_version": prompt.json()["version"]}
 
 
 def test_create_reference_adaptation_project() -> None:
@@ -536,7 +547,7 @@ def test_generation_creation_does_not_publish_material_in_http() -> None:
     with patch.object(TempfilePublisher, "publish") as publish:
         response = client.post(
             f"/api/projects/{project['id']}/generations",
-            json={"provider": "volcengine", "prompt_version": project["prompt_version"]},
+            json={"provider": "volcengine", "prompt_version": project["prompt_version"], "generation_segment_id": project["segment_id"]},
         )
     assert response.status_code == 202
     assert not publish.called
@@ -557,7 +568,7 @@ def test_generation_api_queues_work_without_calling_provider() -> None:
 
     response = client.post(
         f"/api/projects/{project['id']}/generations",
-        json={"provider": "volcengine", "prompt_version": project["prompt_version"], "generate_audio": True},
+        json={"provider": "volcengine", "prompt_version": project["prompt_version"], "generation_segment_id": project["segment_id"], "generate_audio": True},
     )
 
     assert response.status_code == 202
@@ -571,37 +582,22 @@ def test_generation_api_queues_work_without_calling_provider() -> None:
         assert (generation.ratio, generation.duration, generation.generate_audio) == ("adaptive", -1, True)
 
 
-def test_generation_blocks_reference_video_longer_than_30_seconds() -> None:
+def test_generation_does_not_reject_full_video_over_30_when_segment_legal() -> None:
+    """原视频总时长超过 30 秒但提交分段合法时，不应按完整总时长拒绝。"""
     client = TestClient(create_app())
-    project = client.post("/api/projects", json={"name": "long reference"}).json()
-    with patch("app.api.routes.projects.probe_video", return_value=VideoMetadata(31, 1280, 720, 30)):
-        uploaded = client.post(
-            f"/api/projects/{project['id']}/reference-video",
-            files={"file": ("long.mp4", b"video-bytes", "video/mp4")},
-        )
-    assert uploaded.status_code == 202
+    project = _ready_generation_project(client, "long reference")
     with SessionLocal() as session:
         video = session.scalar(select(Asset).where(Asset.project_id == UUID(project["id"]), Asset.kind == "reference_video"))
         video.duration_sec = 31
-        revision = TimelineRevision(project_id=UUID(project["id"]), version=1, source="human")
-        session.add(revision)
-        session.flush()
-        shot = Shot(timeline_revision_id=revision.id, position=0, start_sec=0, end_sec=8, analysis_status="succeeded")
-        session.add(shot)
-        session.flush()
-        session.add(ShotEdit(project_id=UUID(project["id"]), shot_id=shot.id, action="展示", confirmed=True))
-        prompt = PromptRevision(project_id=UUID(project["id"]), version=1, text="保持镜头", status="completed", source_timeline_revision_id=revision.id)
-        session.add(prompt)
         session.commit()
-        prompt_version = prompt.version
 
     response = client.post(
         f"/api/projects/{project['id']}/generations",
-        json={"provider": "volcengine", "prompt_version": prompt_version},
+        json={"provider": "volcengine", "prompt_version": project["prompt_version"], "generation_segment_id": project["segment_id"]},
     )
 
-    assert response.status_code == 422
-    assert "30" in response.json()["detail"]
+    # 提交分段 0–8 秒合法，即使原视频 31 秒也允许生成。
+    assert response.status_code == 202
 
 
 def test_generation_queues_person_asset_only_when_requested() -> None:
@@ -614,7 +610,7 @@ def test_generation_queues_person_asset_only_when_requested() -> None:
 
     response = client.post(
         f"/api/projects/{project['id']}/generations",
-        json={"provider": "volcengine", "prompt_version": project["prompt_version"], "include_person_reference": False},
+        json={"provider": "volcengine", "prompt_version": project["prompt_version"], "generation_segment_id": project["segment_id"], "include_person_reference": False},
     )
     assert response.status_code == 202
     from app.db.models import Generation
