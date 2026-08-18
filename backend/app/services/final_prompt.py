@@ -86,7 +86,7 @@ def build_full_prompt_prefix(
         lines.append(f"人物必须匹配已确认人物参考：{people_reference}")
     if background_reference:
         lines.append(f"背景必须匹配已确认背景参考：{background_reference}")
-    lines.append(audio_style if audio_mode == "generate" else "保持原 BGM，不增加音频描述")
+    lines.append(audio_style if audio_mode == "add_style" else "保持原 BGM，不增加音频描述")
     lines.append("禁止新增字幕、贴纸、水印、乱码和不存在包装文字。")
     lines.append("不得新增未确认场景、动作、人物或产品功效。")
     return "\n".join(lines)

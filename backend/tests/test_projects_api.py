@@ -1105,3 +1105,33 @@ def test_full_prompt_legacy_segment_revisions_remain_readable() -> None:
         revision = session.get(PromptRevision, old_id)
         assert revision.prompt_mode == "reference_video_edit"
         assert revision.text == "00:00.00–00:08.00\n保持：a\n修改：无。\n删除：无。\n禁止：无。"
+
+
+def test_full_prompt_ai_creation_rejects_missing_timeline() -> None:
+    """完整提示词 AI 生成：无时间轴必须立即 422，不创建 queued Job。"""
+    client = TestClient(create_app())
+    project = client.post("/api/projects", json={"name": "no-timeline", "mode": "preserve_product"}).json()
+    response = client.post(
+        f"/api/projects/{project['id']}/prompts",
+        json={"visual_direction": "保持节奏", "use_ai": True},
+    )
+    assert response.status_code == 422
+    with SessionLocal() as session:
+        jobs = session.scalars(select(Job).where(Job.project_id == UUID(project["id"]), Job.kind == "final_prompt_generation")).all()
+        assert jobs == []
+
+
+def test_full_prompt_ai_creation_rejects_unconfirmed_shot() -> None:
+    """完整提示词 AI 生成：镜头未确认必须 422（不创建 queued Job）。"""
+    client = TestClient(create_app())
+    project = client.post("/api/projects", json={"name": "no-confirm", "mode": "preserve_product"}).json()
+    _accepted_video_upload(client, project["id"])
+    client.put(f"/api/projects/{project['id']}/timeline", json={"shots": [{"start_sec": 0, "end_sec": 3}]})
+    response = client.post(
+        f"/api/projects/{project['id']}/prompts",
+        json={"visual_direction": "保持节奏", "use_ai": True},
+    )
+    assert response.status_code == 422
+    with SessionLocal() as session:
+        jobs = session.scalars(select(Job).where(Job.project_id == UUID(project["id"]), Job.kind == "final_prompt_generation")).all()
+        assert jobs == []

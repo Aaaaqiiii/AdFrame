@@ -856,6 +856,10 @@ def create_prompt_revision(
     segment: GenerationSegment | None = None
     if payload.generation_segment_id is not None:
         raise HTTPException(status_code=422, detail="已改为完整提示词工作流，不再按生成片段创建提示词")
+    if payload.use_ai and revision is None:
+        raise HTTPException(status_code=422, detail="请先确认时间轴")
+    if payload.use_ai and not current_shots:
+        raise HTTPException(status_code=422, detail="当前时间轴没有镜头")
     if project.mode == "preserve_product" and contains_product_replacement(payload.visual_direction):
         # AI 改编要求立即拒绝；人工保存完整文本延后到栏目级可执行正文检测（避免误伤锁定规则）。
         if payload.use_ai:
