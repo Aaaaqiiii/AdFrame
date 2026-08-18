@@ -118,6 +118,29 @@ export type ProductCompatibility = {
   product_kind?: string | null
   conflicts: CompatibilityConflict[]
 }
+export type GenerationSegment = {
+  id: string
+  position: number
+  source_start_sec: number
+  source_end_sec: number
+  start_boundary_type: 'video_edge' | 'shot_boundary' | 'inside_shot'
+  end_boundary_type: 'video_edge' | 'shot_boundary' | 'inside_shot'
+  short_segment_accepted: boolean
+}
+export type GenerationSegmentPlan = {
+  plan_version: number
+  timeline_revision_id: string | null
+  max_segment_seconds: number
+  recommended_min_seconds: number
+  segments: GenerationSegment[]
+}
+export type GenerationSegmentInput = {
+  source_start_sec: number
+  source_end_sec: number
+  start_boundary_type: 'video_edge' | 'shot_boundary' | 'inside_shot'
+  end_boundary_type: 'video_edge' | 'shot_boundary' | 'inside_shot'
+  short_segment_accepted: boolean
+}
 export type ConnectionCheck = { connected: boolean; message: string }
 export type SettingsSaveResult = { configured: boolean; service: string; connection: ConnectionCheck }
 
@@ -205,6 +228,9 @@ export function saveTimeline(projectId: string, shots: Array<{ start_sec: number
 export function splitTimelineShot(projectId: string, revisionId: string, shotId: string, atSec: number) { return request<Timeline>(`/api/projects/${projectId}/timeline/${revisionId}/split`, { method: 'POST', ...json({ shot_id: shotId, at_sec: atSec }) }) }
 export function mergeTimelineShots(projectId: string, revisionId: string, shotIds: string[]) { return request<Timeline>(`/api/projects/${projectId}/timeline/${revisionId}/merge`, { method: 'POST', ...json({ shot_ids: shotIds }) }) }
 export function restoreAiTimeline(projectId: string, revisionId: string) { return request<Timeline>(`/api/projects/${projectId}/timeline/${revisionId}/restore-ai`, { method: 'POST' }) }
+export function getGenerationSegments(projectId: string) { return request<GenerationSegmentPlan>(`/api/projects/${projectId}/generation-segments`) }
+export function autoPlanGenerationSegments(projectId: string) { return request<GenerationSegmentPlan>(`/api/projects/${projectId}/generation-segments/auto`, { method: 'POST' }) }
+export function saveGenerationSegments(projectId: string, segments: GenerationSegmentInput[]) { return request<GenerationSegmentPlan>(`/api/projects/${projectId}/generation-segments`, { method: 'PUT', ...json({ segments }) }) }
 
 export function saveShotEdit(projectId: string, shotId: string, payload: ShotEdit) { return request<ShotEdit>(`/api/projects/${projectId}/shots/${shotId}/edit`, { method: 'PUT', ...json(payload) }) }
 export function getProductCompatibility(projectId: string) { return request<ProductCompatibility>(`/api/projects/${projectId}/product-compatibility`) }

@@ -406,3 +406,20 @@ button, .button { border: 0; font: inherit; cursor: pointer; }
   box-shadow: 0 20px 60px rgba(44, 36, 28, .12);
 }
 .app-error-fallback button { margin-top: 18px; padding: 12px 18px; border: 0; border-radius: 10px; background: #ef6b2e; color: #fff; cursor: pointer; }
+
+/* 生成分段编辑器 */
+.segment-stage { padding-bottom: 24px; }
+.segment-actions { display: flex; gap: 10px; flex-wrap: wrap; padding: 18px 30px 0; }
+.segment-list { padding: 18px 30px; display: grid; gap: 12px; }
+.segment-empty { padding: 40px; text-align: center; color: var(--muted); border: 1px dashed var(--line); border-radius: 12px; }
+.segment-card { border: 1px solid var(--line); border-radius: 12px; padding: 14px 16px; background: #fff; }
+.segment-card-head { display: flex; align-items: center; gap: 12px; flex-wrap: wrap; }
+.segment-card-head strong { font-size: 14px; }
+.segment-card-head > span { color: var(--muted); font-size: 12px; }
+.segment-boundary-badge { padding: 2px 8px; border-radius: 20px; background: var(--success-soft); color: var(--success); font-size: 11px; }
+.segment-issue { color: var(--danger); font-size: 12px; }
+.segment-card-shots { margin-top: 8px; font-size: 12px; color: var(--muted); }
+.segment-boundary-move { margin-top: 10px; padding-top: 10px; border-top: 1px dashed var(--line); display: flex; align-items: center; gap: 12px; font-size: 12px; }
+.segment-boundary-move input { width: 90px; padding: 4px 8px; border: 1px solid var(--line); border-radius: 6px; }
+.segment-save-bar { padding: 14px 30px; display: flex; align-items: center; justify-content: space-between; gap: 12px; }
+.segment-save-bar span { color: var(--muted); font-size: 12px; }
