@@ -1107,6 +1107,45 @@ def test_full_prompt_legacy_segment_revisions_remain_readable() -> None:
         assert revision.text == "00:00.00–00:08.00\n保持：a\n修改：无。\n删除：无。\n禁止：无。"
 
 
+def test_full_prompt_worker_repairs_missing_column_per_block() -> None:
+    """完整提示词 worker：第一块缺栏目时逐块定向补全，最终版本 completed。"""
+    from app.services.final_prompt import execute_final_prompt_job
+    client = TestClient(create_app())
+    project = _full_prompt_project(client)
+    response = client.post(
+        f"/api/projects/{project['id']}/prompts",
+        json={"visual_direction": "保持节奏", "use_ai": True},
+    )
+    assert response.status_code == 202
+    with SessionLocal() as session:
+        revision = session.scalar(select(PromptRevision).where(
+            PromptRevision.project_id == UUID(project["id"]),
+            PromptRevision.version == response.json()["version"],
+        ))
+        job = session.scalar(select(Job).where(
+            Job.project_id == UUID(project["id"]),
+            Job.kind == "final_prompt_generation",
+            Job.provider_input_id == str(revision.id),
+        ))
+        calls = {"n": 0}
+        def fake_chat(settings, messages, **kw):
+            calls["n"] += 1
+            if calls["n"] == 1:
+                # 第一块缺“禁止”栏目；第二块完整。
+                return (
+                    "00:00.00–00:04.00\n保持：a\n修改：无。\n删除：无。\n"
+                    "00:04.00–00:09.50\n保持：b\n修改：无。\n删除：无。\n禁止：无。"
+                )
+            # 补全第一块。
+            return "00:00.00–00:04.00\n保持：a\n修改：无。\n删除：无。\n禁止：无。"
+        with patch("app.services.final_prompt._chat", side_effect=fake_chat):
+            execute_final_prompt_job(session, job, Settings(comfly_api_key="test-comfly-api-key"))
+        session.refresh(revision)
+        assert revision.status == "completed"
+        assert "00:00.00–00:04.00" in revision.text
+        assert "00:04.00–00:09.50" in revision.text
+
+
 def test_full_prompt_ai_creation_rejects_missing_timeline() -> None:
     """完整提示词 AI 生成：无时间轴必须立即 422，不创建 queued Job。"""
     client = TestClient(create_app())

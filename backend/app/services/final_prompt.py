@@ -133,15 +133,28 @@ def generate_full_edit_prompt(
     try:
         document = validate_full_prompt(full, shot_ranges)
     except FullPromptValidationError:
-        # 一次定向补全缺失结构。
-        repaired = full
+        # 一次定向补全缺失结构：逐块判定缺失（非全局搜索），并把补全块按时间顺序插入，
+        # 避免追加末尾造成乱序。
+        body_blocks: dict[str, str] = {}
         for label in expected_labels:
-            if label not in repaired or not all(h in repaired for h in ("保持：", "修改：", "删除：", "禁止：")):
+            if label in body:
+                block_text = body.split(label, 1)[1]
+                next_label = next((other for other in expected_labels if other != label and other in block_text), None)
+                body_blocks[label] = block_text.split(next_label, 1)[0] if next_label else block_text
+        for index, label in enumerate(expected_labels):
+            block_text = body_blocks.get(label)
+            if block_text is None or not all(h in block_text for h in ("保持：", "修改：", "删除：", "禁止：")):
                 repair = _chat(settings, [
                     {"role": "system", "content": "你负责补全一个镜头编辑指令块。必须以指定绝对时间范围开头，包含 保持/修改/删除/禁止 四栏目，只输出这个块。"},
-                    {"role": "user", "content": f"请补全块：{label}\n" + json.dumps(shot_slices[expected_labels.index(label)], ensure_ascii=False)},
+                    {"role": "user", "content": f"请补全块：{label}\n" + json.dumps(shot_slices[index], ensure_ascii=False)},
                 ], max_tokens=4000)
-                repaired += f"\n\n{repair}"
+                # 补全返回通常以标签开头；剥离标签只保留四栏目正文。
+                if repair.startswith(label):
+                    repair = repair[len(label):]
+                body_blocks[label] = repair
+        repaired = deterministic_prefix + "\n\n" + "\n\n".join(
+            f"{label}{block}" for label, block in ((label, body_blocks[label]) for label in expected_labels)
+        )
         document = validate_full_prompt(repaired, shot_ranges)
     return f"{document.global_prefix}\n\n" + "\n\n".join(
         f"{label}\n保持：{block.keep}\n修改：{block.modify}\n删除：{block.delete}\n禁止：{block.forbid}"
