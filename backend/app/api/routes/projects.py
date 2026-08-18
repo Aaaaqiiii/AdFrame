@@ -13,7 +13,7 @@ from sqlalchemy.orm import Session
 
 from app.core.config import Settings
 from app.db.models import Asset, GenerationSegment, Job, Project, PromptRevision, Shot, ShotAISummary, ShotEdit, ShotEvidence, TimelineRevision
-from app.services.final_prompt import missing_segment_prompt_blocks
+from app.services.final_prompt import expected_segment_labels, missing_segment_prompt_blocks
 from app.db.session import get_session
 from app.services.media import MediaToolUnavailableError, probe_video
 from app.services.tempfile_publisher import TempfilePublisher
@@ -882,9 +882,11 @@ def create_prompt_revision(
     # AI生成放到Worker，避免浏览器等待数分钟后超时；人工版本仍立即保存。
     text = "" if payload.use_ai else payload.visual_direction.strip()
     if not payload.use_ai and prompt_mode == "reference_video_edit":
-        # 分段人工保存必须覆盖全部相对时间块且含四栏目，缺则 422，不调用 GPT 修复。
-        labels = list(dict.fromkeys(__import__("re").findall(r"\d{2}:\d{2}\.\d{2}–\d{2}:\d{2}\.\d{2}", text)))
-        if missing_segment_prompt_blocks(text, labels):
+        # 分段人工保存：预期标签来自数据库（片段 × 时间轴镜头交集），而非待验证文本自身。
+        if segment is None:
+            raise HTTPException(status_code=422, detail="分段编辑指令必须绑定生成片段")
+        expected_labels = expected_segment_labels(segment, [shot for shot in session.scalars(select(Shot).where(Shot.timeline_revision_id == revision.id).order_by(Shot.position))])
+        if missing_segment_prompt_blocks(text, expected_labels):
             raise HTTPException(status_code=422, detail="分段编辑指令缺少时间块或保持/修改/删除/禁止栏目")
     prompt_revision = PromptRevision(
         project_id=project_id, version=version, text=text,

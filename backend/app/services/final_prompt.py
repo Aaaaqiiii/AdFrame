@@ -213,6 +213,39 @@ def missing_segment_prompt_blocks(text: str, labels: list[str]) -> list[str]:
     return missing
 
 
+def expected_segment_labels(segment: GenerationSegment, shots: list) -> list[str]:
+    """从片段与时间轴镜头交集计算预期相对时间标签（数据库为准，不依赖文本）。"""
+    labels = []
+    for shot in shots:
+        overlap_start = max(shot.start_sec, segment.source_start_sec)
+        overlap_end = min(shot.end_sec, segment.source_end_sec)
+        if overlap_end - overlap_start <= 0.001:
+            continue
+        labels.append(_time_label(overlap_start - segment.source_start_sec, overlap_end - segment.source_start_sec))
+    return labels
+
+
+def actionable_segment_text(text: str, labels: list[str]) -> str:
+    """只连接每个时间块的 修改/删除 正文，供产品替换检测。
+
+    不包含全局锁定规则与 禁止 栏目，避免否定句误伤。
+    """
+    parts = []
+    for label in labels:
+        if label not in text:
+            continue
+        block = text.split(label, 1)[1]
+        next_label = next((other for other in labels if other != label and other in block), None)
+        body = block.split(next_label, 1)[0] if next_label else block
+        # 只取 修改/删除 后的正文（到下一个栏目头为止）。
+        for heading in ("修改：", "删除："):
+            if heading in body:
+                tail = body.split(heading, 1)[1]
+                next_heading = next((h for h in ("保持：", "修改：", "删除：", "禁止：") if h != heading and h in tail), None)
+                parts.append(tail.split(next_heading, 1)[0] if next_heading else tail)
+    return "\n".join(parts)
+
+
 def _validate_segment_edit_prompt(
     text: str,
     labels: list[str],
@@ -332,10 +365,14 @@ def execute_final_prompt_job(session: Session, job: Job, settings: Settings | No
             replace_product=replace_product, replace_person=revision.replace_person,
             audio_mode=revision.audio_mode, audio_style=revision.audio_style, settings=settings,
         )
-    # 分段增量模式：保留产品的锁定规则已由服务端确定性写入骨架，四栏目由结构校验保证，
-    # 不再做事后替换检测（该检测会误伤锁定规则自身含“替换/删除”的措辞）。
-    if segment_slices is None and project.mode == "preserve_product" and contains_product_replacement(generated_text):
-        raise ValueError("保留产品模式的模型输出不能替换产品")
+    if project.mode == "preserve_product":
+        if segment_slices is not None:
+            # 分段模式：只检测每个时间块的 修改/删除 可执行正文，不检测全局锁定规则与 禁止 栏目。
+            labels = [_time_label(slice["relative_start_sec"], slice["relative_end_sec"]) for slice in segment_slices]
+            if contains_product_replacement(actionable_segment_text(generated_text, labels)):
+                raise ValueError("保留产品模式的模型输出不能替换产品")
+        elif contains_product_replacement(generated_text):
+            raise ValueError("保留产品模式的模型输出不能替换产品")
     revision.text = generated_text
     revision.status, revision.error_message = "completed", None
     job.status, job.error_message = "completed", None
@@ -357,23 +394,26 @@ def execute_prompt_refinement_job(session: Session, job: Job, settings: Settings
         raise ValueError("没有可供修改的完整提示词快照")
     refined_text = refine_prompt(source_text, revision.visual_direction, settings)
     revision.replace_product = project.mode == "replace_product"
-    if project.mode == "preserve_product" and contains_product_replacement(refined_text):
-        raise ValueError("保留产品模式的模型输出不能替换产品")
     # 分段编辑指令精修后必须仍覆盖全部预期相对时间块且含四栏目。
     if revision.prompt_mode == "reference_video_edit":
         segment = session.get(GenerationSegment, revision.generation_segment_id) if revision.generation_segment_id else None
         if segment is None:
             raise ValueError("分段编辑指令的生成片段不存在")
-        expected_labels = []
-        for shot in session.scalars(select(Shot).where(Shot.timeline_revision_id == revision.source_timeline_revision_id).order_by(Shot.position)):
-            overlap_start = max(shot.start_sec, segment.source_start_sec)
-            overlap_end = min(shot.end_sec, segment.source_end_sec)
-            if overlap_end - overlap_start <= 0.001:
-                continue
-            expected_labels.append(_time_label(overlap_start - segment.source_start_sec, overlap_end - segment.source_start_sec))
+        shots = list(session.scalars(select(Shot).where(Shot.timeline_revision_id == revision.source_timeline_revision_id).order_by(Shot.position)))
+        expected_labels = expected_segment_labels(segment, shots)
         missing = missing_segment_prompt_blocks(refined_text, expected_labels)
         if missing:
             raise ValueError(f"GPT 精修结果不完整，缺少镜头编辑指令：{', '.join(missing)}")
+        if project.mode == "preserve_product":
+            # 服务端原产品锁定规则必须仍在；缺失则拒绝。
+            lock_marker = "保持原产品不变，禁止替换、删除或重新设计原产品。"
+            if lock_marker not in refined_text:
+                raise ValueError("保留产品模式的精修结果缺少原产品锁定规则")
+            # 只检测每个时间块的 修改/删除 可执行正文。
+            if contains_product_replacement(actionable_segment_text(refined_text, expected_labels)):
+                raise ValueError("保留产品模式的模型输出不能替换产品")
+    elif project.mode == "preserve_product" and contains_product_replacement(refined_text):
+        raise ValueError("保留产品模式的模型输出不能替换产品")
     revision.text = refined_text
     revision.status, revision.error_message = "completed", None
     job.status, job.error_message = "completed", None
