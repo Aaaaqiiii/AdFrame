@@ -137,8 +137,16 @@ def test_dual_results_stay_in_backend_and_only_final_facts_reach_shot() -> None:
 
 
 def test_final_prompt_uses_only_confirmed_edit_and_can_be_saved_manually() -> None:
-    client = TestClient(create_app())
-    project = client.post("/api/projects", json={"name": "confirmed prompt"}).json()
+    """完整提示词：AI 生成只使用已确认镜头，人工保存立即完成。"""
+    from app.services.media import VideoMetadata
+    with patch("app.api.routes.projects.probe_video", return_value=VideoMetadata(3.2, 1280, 720, 30)):
+        client = TestClient(create_app())
+        project = client.post("/api/projects", json={"name": "confirmed prompt"}).json()
+        uploaded = client.post(
+            f"/api/projects/{project['id']}/reference-video",
+            files={"file": ("reference.mp4", b"video-bytes", "video/mp4")},
+        )
+        assert uploaded.status_code == 202
     timeline = client.put(
         f"/api/projects/{project['id']}/timeline",
         json={"shots": [{"start_sec": 0, "end_sec": 3.2}]},
@@ -154,7 +162,7 @@ def test_final_prompt_uses_only_confirmed_edit_and_can_be_saved_manually() -> No
         f"/api/projects/{project['id']}/prompts",
         json={"visual_direction": "保持原节奏", "replace_product": False, "replace_person": False, "use_ai": True},
     )
-    assert response.status_code == 201
+    assert response.status_code == 202
     assert response.json()["status"] == "queued"
     with SessionLocal() as session:
         revision = session.scalar(select(PromptRevision).where(
@@ -166,23 +174,30 @@ def test_final_prompt_uses_only_confirmed_edit_and_can_be_saved_manually() -> No
             Job.kind == "final_prompt_generation",
         ))
         assert revision is not None
+        assert revision.prompt_mode == "full_reference_video_edit"
+        assert revision.generation_segment_id is None
         assert job is not None
         assert job.status == "queued"
-        with patch("app.services.final_prompt.generate_final_prompt", return_value="00:00.00–00:03.20\n人工确认动作") as generate:
-            execute_final_prompt_job(session, job, Settings())
+        model_text = "00:00.00–00:03.20\n保持：人物身份、动作节奏、手部位置、背景、构图、镜头运动不变。\n修改：无。\n删除：无。\n禁止：不得新增文字或改变动作。"
+        with patch("app.services.final_prompt._chat", return_value=model_text) as chat:
+            execute_final_prompt_job(session, job, Settings(comfly_api_key="test-key"))
         session.refresh(revision)
         session.refresh(job)
         assert revision.status == "completed"
-        assert revision.text == "00:00.00–00:03.20\n人工确认动作"
+        assert "00:00.00–00:03.20" in revision.text
+        assert "保持：" in revision.text and "禁止：" in revision.text
         assert job.status == "completed"
-        assert generate.call_args.kwargs["shots"][0]["facts"]["people"] == "人工确认人物"
+        assert chat.call_count >= 1
 
     manual = client.post(
         f"/api/projects/{project['id']}/prompts",
-        json={"visual_direction": "人工修改后的最终正文", "use_ai": False},
+        json={"visual_direction": (
+            "全局规则：原参考视频是时间轴、动作、构图、运镜、节奏和镜头顺序的最高优先级参考。\n"
+            "保持原产品不变，禁止替换、删除或重新设计原产品。\n\n"
+            "00:00.00–00:03.20\n保持：a\n修改：无。\n删除：无。\n禁止：无。"
+        ), "use_ai": False},
     )
     assert manual.status_code == 201
-    assert manual.json()["text"] == "人工修改后的最终正文"
     assert manual.json()["status"] == "completed"
 
 

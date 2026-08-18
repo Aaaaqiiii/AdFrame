@@ -10,6 +10,7 @@ from app.db.models import Asset, Job, PromptRevision
 from app.db.session import SessionLocal
 from app.main import create_app
 from app.services.final_prompt import generate_final_prompt, refine_prompt
+from app.services.media import VideoMetadata
 from app.services.reference_profiles import _consolidate_product_profiles, load_structure
 
 
@@ -156,9 +157,28 @@ def test_page_two_collects_product_images_and_forces_replacement() -> None:
     )
     assert confirmed.status_code == 200
 
+    with patch("app.api.routes.projects.probe_video", return_value=VideoMetadata(3.0, 1280, 720, 30)):
+        client.post(
+            f"/api/projects/{project['id']}/reference-video",
+            files={"file": ("reference.mp4", b"video-bytes", "video/mp4")},
+        )
+    timeline = client.put(
+        f"/api/projects/{project['id']}/timeline",
+        json={"shots": [{"start_sec": 0, "end_sec": 3}]},
+    ).json()
+    client.put(
+        f"/api/projects/{project['id']}/shots/{timeline['shots'][0]['id']}/edit",
+        json={"action": "展示", "confirmed": True},
+    )
+    full_text = (
+        "全局规则：原参考视频是时间轴、动作、构图、运镜、节奏和镜头顺序的最高优先级参考。\n"
+        "目标产品必须匹配已确认产品档案：目标产品视角 1\n"
+        "产品参考图用途：\n- front：锁定该角度结构\n- right：锁定该角度结构\n\n"
+        "00:00.00–00:03.00\n保持：a\n修改：无。\n删除：无。\n禁止：无。"
+    )
     saved = client.post(
         f"/api/projects/{project['id']}/prompts",
-        json={"visual_direction": "保持原节奏", "replace_product": False, "use_ai": False},
+        json={"visual_direction": full_text, "replace_product": False, "use_ai": False},
     )
     assert saved.status_code == 201
     with SessionLocal() as session:

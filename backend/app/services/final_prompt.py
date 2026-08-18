@@ -11,6 +11,7 @@ from sqlalchemy.orm import Session
 from app.core.config import Settings
 from app.services.volcengine_vision import VisionConfigurationError
 from app.db.models import Asset, GenerationSegment, Job, Project, PromptRevision, Shot, ShotEdit
+from app.services.full_prompt import FullPromptValidationError, expected_full_prompt_labels, parse_full_prompt, validate_full_prompt
 from app.services.product_rules import confirmed_target_product_assets, contains_product_replacement
 from app.services.reference_profiles import load_structure
 
@@ -46,6 +47,106 @@ def _chat(settings: Settings, messages: list[dict], max_tokens: int = 20000) -> 
     if not text:
         raise ValueError("GPT 未返回提示词")
     return text
+
+
+def _actionable_bodies_text(text: str) -> str:
+    """提取完整提示词全部时间块的 修改/删除 正文，供替换检测（不含前缀与禁止栏目）。"""
+    try:
+        document = validate_full_prompt(text, [(b.source_start_sec, b.source_end_sec) for b in parse_full_prompt(text).blocks])
+    except (FullPromptValidationError, ValueError):
+        return text
+    parts = []
+    for block in document.blocks:
+        parts.append(block.modify)
+        parts.append(block.delete)
+    return "\n".join(parts)
+
+
+def build_full_prompt_prefix(
+    *,
+    project_mode: str,
+    product_profile: str,
+    product_image_purposes: list[str],
+    people_reference: str | None,
+    background_reference: str | None,
+    audio_mode: str,
+    audio_style: str,
+) -> str:
+    """服务端确定性前缀：模式锁定、产品档案与用途、人物/背景、音频、禁止规则。"""
+    lines = [
+        "原参考视频是时间轴、动作、构图、运镜、节奏和镜头顺序的最高优先级参考。只执行明确修改。",
+    ]
+    if project_mode == "preserve_product":
+        lines.append("保持原产品不变，禁止替换、删除或重新设计原产品。")
+    else:
+        lines.append(f"目标产品必须匹配已确认产品档案：\n{product_profile}")
+        if product_image_purposes:
+            lines.append("产品参考图用途（按名称锁定对应结构，不得省略）：\n" + "\n".join(f"- {line}" for line in product_image_purposes))
+    if people_reference:
+        lines.append(f"人物必须匹配已确认人物参考：{people_reference}")
+    if background_reference:
+        lines.append(f"背景必须匹配已确认背景参考：{background_reference}")
+    lines.append(audio_style if audio_mode == "generate" else "保持原 BGM，不增加音频描述")
+    lines.append("禁止新增字幕、贴纸、水印、乱码和不存在包装文字。")
+    lines.append("不得新增未确认场景、动作、人物或产品功效。")
+    return "\n".join(lines)
+
+
+def generate_full_edit_prompt(
+    *,
+    settings: Settings,
+    shot_slices: list[dict],
+    deterministic_prefix: str,
+    visual_direction: str,
+) -> str:
+    """调用 GPT 生成完整视频编辑提示词，服务端重建确定性前缀并严格校验。
+
+    模型输出后丢弃其可能改写的全局前缀，重新拼接 deterministic_prefix，
+    用 validate_full_prompt 校验；结构缺失时允许一次定向补全。
+    """
+    if not settings.comfly_api_key:
+        raise VisionConfigurationError("请先在设置中配置 Comfly API Key")
+    shot_ranges = [(slice["start_sec"], slice["end_sec"]) for slice in shot_slices]
+    expected_labels = expected_full_prompt_labels(shot_ranges)
+    messages = [
+        {"role": "system", "content": (
+            "你是广告视频编辑指令作者。原参考视频是最高优先级参考。必须为每个提供的镜头输出恰好一个绝对时间块，按给定顺序。"
+            "每个块只含四栏目：保持（锁定不变内容）、修改（仅产品替换或用户要求的局部改编）、删除（原字幕/贴纸/水印等）、禁止（不得新增或改变）。"
+            "不得新增可见文字、Logo、标签、水印、字幕或虚构文案，除非已确认事实明确要求。"
+            "不得修改服务端全局前缀。保留产品模式不得替换、删除或重新设计原产品；替换产品模式必须使用已确认目标产品档案和图片用途名称。"
+            "栏目正文可写“无”，但不能缺少栏目或时间块。"
+        )},
+        {"role": "user", "content": (
+            f"改编要求：{visual_direction}\n"
+            f"预期绝对时间块（必须全部覆盖、顺序一致）：\n{chr(10).join(expected_labels)}\n"
+            "分镜事实：\n" + json.dumps(shot_slices, ensure_ascii=False)
+        )},
+    ]
+    text = _chat(settings, messages)
+    # 丢弃模型可能的全局前缀：只保留第一个时间头之后的部分。
+    body = text
+    for label in expected_labels:
+        if label in text:
+            body = text[text.index(label):]
+            break
+    full = f"{deterministic_prefix}\n\n{body}"
+    try:
+        document = validate_full_prompt(full, shot_ranges)
+    except FullPromptValidationError:
+        # 一次定向补全缺失结构。
+        repaired = full
+        for label in expected_labels:
+            if label not in repaired or not all(h in repaired for h in ("保持：", "修改：", "删除：", "禁止：")):
+                repair = _chat(settings, [
+                    {"role": "system", "content": "你负责补全一个镜头编辑指令块。必须以指定绝对时间范围开头，包含 保持/修改/删除/禁止 四栏目，只输出这个块。"},
+                    {"role": "user", "content": f"请补全块：{label}\n" + json.dumps(shot_slices[expected_labels.index(label)], ensure_ascii=False)},
+                ], max_tokens=4000)
+                repaired += f"\n\n{repair}"
+        document = validate_full_prompt(repaired, shot_ranges)
+    return f"{document.global_prefix}\n\n" + "\n\n".join(
+        f"{label}\n保持：{block.keep}\n修改：{block.modify}\n删除：{block.delete}\n禁止：{block.forbid}"
+        for block, label in zip(document.blocks, expected_labels)
+    )
 
 
 def generate_final_prompt(
@@ -355,7 +456,31 @@ def execute_final_prompt_job(session: Session, job: Job, settings: Settings | No
             name = str(structure.get("display_name") or structure.get("view_label") or "其他").strip()
             note = str(structure.get("note") or "").strip()
             product_purpose_lines.append(f"{name}：锁定该角度结构" + (f"（{note}）" if note else ""))
-    if segment_slices is not None:
+    if revision.prompt_mode == "full_reference_video_edit":
+        # 完整提示词：使用冻结时间轴全部已确认镜头，服务端确定性前缀。
+        if not shots:
+            raise ValueError("当前时间轴没有已确认镜头")
+        people_reference = profile("person_reference_image") or None
+        background_reference = profile("background_reference_image") or None
+        deterministic_prefix = build_full_prompt_prefix(
+            project_mode=project.mode,
+            product_profile=product_profile,
+            product_image_purposes=product_purpose_lines,
+            people_reference=people_reference,
+            background_reference=background_reference,
+            audio_mode=revision.audio_mode,
+            audio_style=revision.audio_style,
+        )
+        generated_text = generate_full_edit_prompt(
+            settings=settings,
+            shot_slices=shots,
+            deterministic_prefix=deterministic_prefix,
+            visual_direction=revision.visual_direction,
+        )
+        if project.mode == "preserve_product":
+            if contains_product_replacement(_actionable_bodies_text(generated_text)):
+                raise ValueError("保留产品模式的模型输出不能替换产品")
+    elif segment_slices is not None:
         # 分段增量模式：只输出该片段相交镜头，使用片段内相对时间。
         if not segment_slices:
             raise ValueError("生成片段没有覆盖任何已确认镜头")
@@ -373,9 +498,9 @@ def execute_final_prompt_job(session: Session, job: Job, settings: Settings | No
             replace_product=replace_product, replace_person=revision.replace_person,
             audio_mode=revision.audio_mode, audio_style=revision.audio_style, settings=settings,
         )
-    if project.mode == "preserve_product":
+    if project.mode == "preserve_product" and revision.prompt_mode != "full_reference_video_edit":
+        # 完整提示词已在 full 分支内用可执行正文检测；此处分段/legacy 只检测可执行正文或全文。
         if segment_slices is not None:
-            # 分段模式：只检测每个时间块的 修改/删除 可执行正文，不检测全局锁定规则与 禁止 栏目。
             labels = [_time_label(slice["relative_start_sec"], slice["relative_end_sec"]) for slice in segment_slices]
             if contains_product_replacement(actionable_segment_text(generated_text, labels)):
                 raise ValueError("保留产品模式的模型输出不能替换产品")
@@ -402,6 +527,20 @@ def execute_prompt_refinement_job(session: Session, job: Job, settings: Settings
         raise ValueError("没有可供修改的完整提示词快照")
     refined_text = refine_prompt(source_text, revision.visual_direction, settings)
     revision.replace_product = project.mode == "replace_product"
+    if revision.prompt_mode == "full_reference_video_edit":
+        # 完整提示词精修：必须仍覆盖冻结时间轴的全部绝对时间块与四栏目。
+        shot_ranges = [(shot.start_sec, shot.end_sec) for shot in session.scalars(select(Shot).where(Shot.timeline_revision_id == revision.source_timeline_revision_id).order_by(Shot.position))]
+        try:
+            validate_full_prompt(refined_text, shot_ranges)
+        except FullPromptValidationError as exc:
+            raise ValueError(f"GPT 精修结果不完整：{exc}") from exc
+        if project.mode == "preserve_product" and contains_product_replacement(_actionable_bodies_text(refined_text)):
+            raise ValueError("保留产品模式的模型输出不能替换产品")
+        revision.text = refined_text
+        revision.status, revision.error_message = "completed", None
+        job.status, job.error_message = "completed", None
+        session.commit()
+        return job
     # 分段编辑指令精修后必须仍覆盖全部预期相对时间块且含四栏目。
     if revision.prompt_mode == "reference_video_edit":
         segment = session.get(GenerationSegment, revision.generation_segment_id) if revision.generation_segment_id else None

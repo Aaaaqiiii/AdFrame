@@ -174,7 +174,7 @@ def test_page_two_applies_target_product_to_every_product_shot() -> None:
         json={"product_profile": profile, "visual_direction": "背景改为厨房", "use_ai": True},
     )
 
-    assert response.status_code == 201
+    assert response.status_code == 202
     assert response.json()["status"] == "queued"
     assert response.json()["text"] == ""
     with SessionLocal() as session:
@@ -183,6 +183,8 @@ def test_page_two_applies_target_product_to_every_product_shot() -> None:
             PromptRevision.version == response.json()["version"],
         ))
         assert revision is not None
+        assert revision.prompt_mode == "full_reference_video_edit"
+        assert revision.generation_segment_id is None
         job = session.scalar(select(Job).where(
             Job.project_id == UUID(project["id"]),
             Job.kind == "final_prompt_generation",
@@ -190,10 +192,11 @@ def test_page_two_applies_target_product_to_every_product_shot() -> None:
         ))
         assert job is not None
         assert job.status == "queued"
-        with patch(
-            "app.services.final_prompt._chat",
-            return_value="00:00.00–00:02.00\n桌面产品特写\n00:02.00–00:04.00\n拿起盒子饮用",
-        ):
+        model_text = (
+            "00:00.00–00:02.00\n保持：a\n修改：桌面产品特写\n删除：无。\n禁止：无。\n\n"
+            "00:02.00–00:04.00\n保持：b\n修改：拿起盒子饮用\n删除：无。\n禁止：无。"
+        )
+        with patch("app.services.final_prompt._chat", return_value=model_text):
             execute_final_prompt_job(session, job, Settings(comfly_api_key="test-comfly-api-key"))
         session.refresh(revision)
         session.refresh(job)
@@ -201,7 +204,6 @@ def test_page_two_applies_target_product_to_every_product_shot() -> None:
         assert job.status == "completed"
         assert "00:00.00–00:02.00" in revision.text
         assert "00:02.00–00:04.00" in revision.text
-        assert revision.text.startswith("目标产品锁定档案（应用于所有含产品镜头）：\n")
         assert profile in revision.text
 
 
@@ -283,7 +285,16 @@ def test_replace_mode_forces_replacement_when_client_sends_false() -> None:
 
     response = client.post(
         f"/api/projects/{project['id']}/prompts",
-        json={"visual_direction": "保持节奏", "replace_product": False, "use_ai": False},
+        json={
+            "visual_direction": (
+                "全局规则：原参考视频是时间轴、动作、构图、运镜、节奏和镜头顺序的最高优先级参考。\n"
+                "目标产品必须匹配已确认产品档案：已确认盒装产品\n"
+                "产品参考图用途：\n- other：锁定该角度结构\n\n"
+                "00:00.00–00:03.00\n保持：a\n修改：无。\n删除：无。\n禁止：无。"
+            ),
+            "replace_product": False,
+            "use_ai": False,
+        },
     )
 
     assert response.status_code == 201
@@ -292,6 +303,7 @@ def test_replace_mode_forces_replacement_when_client_sends_false() -> None:
             PromptRevision.project_id == UUID(project["id"])
         ))
         assert revision is not None
+        # 服务端以项目模式为准，客户端传 false 也被强制为替换模式。
         assert revision.replace_product is True
 
 
@@ -347,7 +359,9 @@ def test_final_prompt_worker_rejects_replacement_output_in_preserve_mode() -> No
         ))
         assert revision is not None
         assert job is not None
-        with patch("app.services.final_prompt._chat", return_value="00:00.00–00:03.00\nreplace the bottle with shampoo"):
+        # 四栏目齐全，但“修改”栏目写入了产品替换 → 完整提示词 worker 必须拒绝。
+        malicious = "00:00.00–00:03.00\n保持：a\n修改：将原产品替换为新产品。\n删除：无。\n禁止：无。"
+        with patch("app.services.final_prompt._chat", return_value=malicious):
             try:
                 execute_final_prompt_job(session, job, Settings(comfly_api_key="test-comfly-api-key"))
             except ValueError as error:

@@ -5,7 +5,7 @@ from datetime import datetime
 from pathlib import Path
 from uuid import UUID, uuid4
 
-from fastapi import APIRouter, Depends, File, Form, HTTPException, Query, UploadFile, status
+from fastapi import APIRouter, Depends, File, Form, HTTPException, Query, Response, UploadFile, status
 from fastapi.responses import FileResponse
 from pydantic import BaseModel, Field
 from sqlalchemy import func, select
@@ -14,6 +14,7 @@ from sqlalchemy.orm import Session
 from app.core.config import Settings
 from app.db.models import Asset, GenerationSegment, Job, Project, PromptRevision, Shot, ShotAISummary, ShotEdit, ShotEvidence, TimelineRevision
 from app.services.final_prompt import actionable_segment_text, expected_segment_labels, missing_segment_prompt_blocks
+from app.services.full_prompt import FullPromptValidationError, parse_full_prompt, validate_full_prompt
 from app.db.session import get_session
 from app.services.media import MediaToolUnavailableError, probe_video
 from app.services.tempfile_publisher import TempfilePublisher
@@ -446,6 +447,19 @@ def _combined_analysis_status(assets: list[Asset]) -> str | None:
     return "failed"
 
 
+def _actionable_bodies(text: str) -> str:
+    """提取完整提示词所有时间块的 修改/删除 正文，供替换检测（不含前缀与禁止栏目）。"""
+    try:
+        document = parse_full_prompt(text)
+    except FullPromptValidationError:
+        return text
+    parts = []
+    for block in document.blocks:
+        parts.append(block.modify)
+        parts.append(block.delete)
+    return "\n".join(parts)
+
+
 def _asset_kind(reference_kind: str) -> str:
     kind = {"person": "person_reference_image", "background": "background_reference_image", "product": "product_reference_image", "target_product": "target_product_reference_image"}.get(reference_kind)
     if kind is None:
@@ -817,6 +831,7 @@ def latest_ai_summary(project_id: UUID, shot_id: UUID, session: Session = Depend
 def create_prompt_revision(
     project_id: UUID,
     payload: CreatePromptRequest,
+    response: Response,
     session: Session = Depends(get_session),
 ) -> PromptResponse:
     project = session.get(Project, project_id)
@@ -836,24 +851,14 @@ def create_prompt_revision(
         raise HTTPException(status_code=422, detail="请选择音频风格")
     revision = session.scalar(select(TimelineRevision).where(TimelineRevision.project_id == project_id).order_by(TimelineRevision.version.desc()))
     current_shots = list(session.scalars(select(Shot).where(Shot.timeline_revision_id == revision.id).order_by(Shot.position))) if revision else []
-    # 分段工作流：提示词必须绑定一个属于当前时间轴的生成片段。
-    prompt_mode = "full_video_description"
+    # 新工作流：一份覆盖完整时间轴的提示词。不接受生成片段绑定。
+    prompt_mode = "full_reference_video_edit"
     segment: GenerationSegment | None = None
     if payload.generation_segment_id is not None:
-        if revision is None:
-            raise HTTPException(status_code=422, detail="请先确认时间轴")
-        segment = session.get(GenerationSegment, payload.generation_segment_id)
-        if segment is None or segment.project_id != project_id:
-            raise HTTPException(status_code=422, detail="生成片段不存在")
-        if segment.source_timeline_revision_id != revision.id:
-            raise HTTPException(status_code=422, detail="生成分段已过期，请重新确认分段")
-        prompt_mode = "reference_video_edit"
-        # 只读取该片段覆盖的镜头。
-        current_shots = [shot for shot in current_shots if shot.end_sec > segment.source_start_sec and shot.start_sec < segment.source_end_sec]
+        raise HTTPException(status_code=422, detail="已改为完整提示词工作流，不再按生成片段创建提示词")
     if project.mode == "preserve_product" and contains_product_replacement(payload.visual_direction):
-        # 仅“分段人工保存完整文本”延后到栏目级检测（其锁定规则由人工写入）；其余（AI 改编要求、
-        # 非分段）都立即拒绝，避免非法要求进入 GPT 消耗调用。
-        if not (segment is not None and not payload.use_ai):
+        # AI 改编要求立即拒绝；人工保存完整文本延后到栏目级可执行正文检测（避免误伤锁定规则）。
+        if payload.use_ai:
             raise HTTPException(status_code=422, detail="保留产品模式的提示词不能替换产品。")
     if replace_product:
         _, conflicts = check_product_compatibility(product_profile or "", current_shots)
@@ -884,26 +889,27 @@ def create_prompt_revision(
             })
     # AI生成放到Worker，避免浏览器等待数分钟后超时；人工版本仍立即保存。
     text = "" if payload.use_ai else payload.visual_direction.strip()
-    if not payload.use_ai and prompt_mode == "reference_video_edit":
-        # 分段人工保存：预期标签来自数据库（片段 × 时间轴镜头交集），而非待验证文本自身。
-        if segment is None:
-            raise HTTPException(status_code=422, detail="分段编辑指令必须绑定生成片段")
-        expected_labels = expected_segment_labels(segment, [shot for shot in session.scalars(select(Shot).where(Shot.timeline_revision_id == revision.id).order_by(Shot.position))])
-        if missing_segment_prompt_blocks(text, expected_labels):
-            raise HTTPException(status_code=422, detail="分段编辑指令缺少时间块或保持/修改/删除/禁止栏目")
+    if not payload.use_ai and prompt_mode == "full_reference_video_edit":
+        # 人工保存：预期绝对时间标签来自数据库当前 Shot，而非待验证文本自身。
+        if revision is None:
+            raise HTTPException(status_code=422, detail="请先确认时间轴")
+        shot_ranges = [(shot.start_sec, shot.end_sec) for shot in session.scalars(select(Shot).where(Shot.timeline_revision_id == revision.id).order_by(Shot.position))]
+        try:
+            validate_full_prompt(text, shot_ranges)
+        except FullPromptValidationError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+        # 确定性前缀必须包含模式锁定与产品规则。
         if project.mode == "preserve_product":
-            # 分段人工保存必须要求服务端原产品锁定规则存在。
-            if "保持原产品不变，禁止替换、删除或重新设计原产品。" not in text:
-                raise HTTPException(status_code=422, detail="分段编辑指令缺少原产品锁定规则")
-            # 只对数据库预期时间块的修改/删除正文执行替换检测。
-            if contains_product_replacement(actionable_segment_text(text, expected_labels)):
+            if "保持原产品不变" not in text:
+                raise HTTPException(status_code=422, detail="完整提示词缺少原产品锁定规则")
+            # 只对修改/删除正文执行替换检测。
+            if contains_product_replacement(_actionable_bodies(text)):
                 raise HTTPException(status_code=422, detail="保留产品模式的提示词不能替换产品。")
-        elif project.mode == "replace_product":
-            # 分段人工保存必须保留服务端确定性目标产品规则：档案、锁定规则、图片用途名称。
-            if "目标产品必须匹配已确认参考图" not in text or not product_profile:
-                raise HTTPException(status_code=422, detail="分段编辑指令缺少目标产品档案")
+        else:
+            if "目标产品必须匹配已确认产品档案" not in text or not product_profile:
+                raise HTTPException(status_code=422, detail="完整提示词缺少目标产品档案")
             if "产品参考图用途" not in text:
-                raise HTTPException(status_code=422, detail="分段编辑指令缺少产品图用途规则")
+                raise HTTPException(status_code=422, detail="完整提示词缺少产品图用途规则")
             purpose_names = []
             for asset in product_assets:
                 structure = load_structure(asset)
@@ -911,20 +917,22 @@ def create_prompt_revision(
                 purpose_names.append(name)
             for name in purpose_names:
                 if name not in text:
-                    raise HTTPException(status_code=422, detail=f"分段编辑指令缺少产品图用途：{name}")
+                    raise HTTPException(status_code=422, detail=f"完整提示词缺少产品图用途：{name}")
     prompt_revision = PromptRevision(
         project_id=project_id, version=version, text=text,
         visual_direction=payload.visual_direction.strip(), audio_mode=payload.audio_mode,
         audio_style=payload.audio_style.strip(), replace_product=replace_product,
         replace_person=payload.replace_person, source_timeline_revision_id=revision.id if revision else None,
         prompt_mode=prompt_mode,
-        generation_segment_id=segment.id if segment else None,
+        generation_segment_id=None,
         status="queued" if payload.use_ai else "completed",
     )
     session.add(prompt_revision)
     session.flush()
     if payload.use_ai:
         session.add(Job(project_id=project_id, kind="final_prompt_generation", status="queued", provider="comfly_gpt", provider_input_id=str(prompt_revision.id)))
+        # 异步入队：AI 创建返回 202，人工保存返回 201。
+        response.status_code = status.HTTP_202_ACCEPTED
     session.commit()
     return PromptResponse(version=version, text=text, status=prompt_revision.status)
 

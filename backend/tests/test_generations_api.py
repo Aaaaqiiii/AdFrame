@@ -66,14 +66,15 @@ def _ready_project(client, tmp_path, mode="preserve_product", replace_person=Fal
                 analysis_status="succeeded",
             ))
         session.commit()
-        # 8 秒视频 ≤ 29 秒 → 单段覆盖整个视频；建分段方案 + 分段编辑提示词。
+        # 8 秒视频 ≤ 29 秒 → 单段覆盖整个视频；建分段方案。
         plan = client.post(f"/api/projects/{project_id}/generation-segments/auto")
         assert plan.status_code == 201
         segment_id = plan.json()["segments"][0]["id"]
+        # 历史兼容：数据库直插 reference_video_edit 分段提示词（新提示词 POST 已拒绝分段提示词）。
         if mode == "replace_product":
             prompt_text = (
                 "全局规则：目标产品必须匹配已确认参考图：\n已确认目标产品\n"
-                "全局规则：产品参考图用途（按名称锁定对应结构，不得省略）：\n- 其他：锁定该角度结构\n\n"
+                "全局规则：产品参考图用途（按名称锁定对应结构，不得省略）：\n- other：锁定该角度结构\n\n"
                 "00:00.00–00:08.00\n保持：a\n修改：无。\n删除：无。\n禁止：无。"
             )
         else:
@@ -81,20 +82,24 @@ def _ready_project(client, tmp_path, mode="preserve_product", replace_person=Fal
                 "全局规则：保持原产品不变，禁止替换、删除或重新设计原产品。\n\n"
                 "00:00.00–00:08.00\n保持：a\n修改：无。\n删除：无。\n禁止：无。"
             )
-        prompt_body = client.post(
-            f"/api/projects/{project_id}/prompts",
-            json={"visual_direction": prompt_text, "use_ai": False, "generation_segment_id": segment_id},
-        )
-        assert prompt_body.status_code == 201
+        with SessionLocal() as session:
+            prompt = PromptRevision(
+                project_id=project_id, version=1, prompt_mode="reference_video_edit",
+                generation_segment_id=UUID(segment_id),
+                source_timeline_revision_id=revision.id, text=prompt_text, status="completed",
+            )
+            session.add(prompt)
+            session.commit()
+            prompt_version = prompt.version
         return SimpleNamespace(
             project_id=project_id,
             video_asset_id=video.id,
             segment_id=segment_id,
-            prompt_version=prompt_body.json()["version"],
+            prompt_version=prompt_version,
             generations_url=f"/api/projects/{project_id}/generations",
             payload={
                 "provider": "volcengine",
-                "prompt_version": prompt_body.json()["version"],
+                "prompt_version": prompt_version,
                 "generation_segment_id": segment_id,
                 "generate_audio": False,
                 "include_person_reference": replace_person,
@@ -331,27 +336,23 @@ def _segment_generation_project(client, tmp_path, duration_sec=32.0):
     assert plan.status_code == 201
     segments = plan.json()["segments"]
     assert len(segments) == 2
+    # 历史兼容：为每个分段直接插入 reference_video_edit 提示词（新提示词 POST 已拒绝分段提示词）。
     prompts = {}
-    for seg in segments:
-        r = client.post(
-            f"/api/projects/{project_id}/prompts",
-            json={"visual_direction": "保持原节奏", "use_ai": False, "generation_segment_id": seg["id"]},
-        )
-        # 人工保存分段编辑提示词必须含四栏目 + 保留模式锁定规则。
-        r = client.post(
-            f"/api/projects/{project_id}/prompts",
-            json={
-                "visual_direction": (
-                    "全局规则：保持原产品不变，禁止替换、删除或重新设计原产品。\n\n"
-                    f"00:00.00–00:08.00\n保持：a\n修改：无。\n删除：无。\n禁止：无。\n\n"
-                    f"00:08.00–00:16.00\n保持：b\n修改：无。\n删除：无。\n禁止：无。"
-                ),
-                "use_ai": False,
-                "generation_segment_id": seg["id"],
-            },
-        )
-        assert r.status_code == 201
-        prompts[seg["id"]] = r.json()["version"]
+    with SessionLocal() as session:
+        for index, seg in enumerate(segments):
+            if index == 0:
+                block = "00:00.00–00:08.00\n保持：a\n修改：无。\n删除：无。\n禁止：无。\n\n00:08.00–00:16.00\n保持：b\n修改：无。\n删除：无。\n禁止：无。"
+            else:
+                block = "00:00.00–00:08.00\n保持：c\n修改：无。\n删除：无。\n禁止：无。\n\n00:08.00–00:16.00\n保持：d\n修改：无。\n删除：无。\n禁止：无。"
+            prompt = PromptRevision(
+                project_id=project_id, version=index + 1, prompt_mode="reference_video_edit",
+                generation_segment_id=UUID(seg["id"]),
+                source_timeline_revision_id=revision_id, text=block, status="completed",
+            )
+            session.add(prompt)
+            session.flush()
+            prompts[seg["id"]] = prompt.version
+        session.commit()
     return SimpleNamespace(
         project_id=project_id, segments=segments, prompts=prompts,
         url=f"/api/projects/{project_id}/generations",

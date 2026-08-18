@@ -22,6 +22,7 @@ def _accepted_video_upload(client: TestClient, project_id: str, name: str = "ref
 
 
 def _ready_generation_project(client: TestClient, name: str = "ready") -> dict:
+    """旧单 Generation 测试的历史兼容项目：分段方案 + 数据库直插历史分段提示词。"""
     project = client.post("/api/projects", json={"name": name}).json()
     _accepted_video_upload(client, project["id"])
     timeline = client.put(
@@ -36,19 +37,25 @@ def _ready_generation_project(client: TestClient, name: str = "ready") -> dict:
     plan = client.post(f"/api/projects/{project['id']}/generation-segments/auto")
     assert plan.status_code == 201
     segment_id = plan.json()["segments"][0]["id"]
-    prompt = client.post(
-        f"/api/projects/{project['id']}/prompts",
-        json={
-            "visual_direction": (
+    # 历史兼容：直接插入 reference_video_edit 提示词，不经过新提示词 POST（新契约已拒绝分段提示词）。
+    with SessionLocal() as session:
+        revision = session.scalar(select(TimelineRevision).where(TimelineRevision.project_id == UUID(project["id"])))
+        prompt = PromptRevision(
+            project_id=UUID(project["id"]),
+            version=1,
+            prompt_mode="reference_video_edit",
+            generation_segment_id=UUID(segment_id),
+            source_timeline_revision_id=revision.id,
+            text=(
                 "全局规则：保持原产品不变，禁止替换、删除或重新设计原产品。\n\n"
                 "00:00.00–00:08.00\n保持：a\n修改：无。\n删除：无。\n禁止：无。"
             ),
-            "use_ai": False,
-            "generation_segment_id": segment_id,
-        },
-    )
-    assert prompt.status_code == 201
-    return {"id": project["id"], "segment_id": segment_id, "prompt_version": prompt.json()["version"]}
+            status="completed",
+        )
+        session.add(prompt)
+        session.commit()
+        prompt_version = prompt.version
+    return {"id": project["id"], "segment_id": segment_id, "prompt_version": prompt_version}
 
 
 def test_create_reference_adaptation_project() -> None:
@@ -645,112 +652,6 @@ def _segment_ready_project(client: TestClient, duration_sec: float = 32.0, mode:
     segment_id = plan.json()["segments"][0]["id"]
     return {"id": project["id"], "revision_id": revision_id, "segment_id": segment_id, "shot_ids": shot_ids}
 
-
-def test_segment_prompt_queued_stores_mode_and_segment_id() -> None:
-    client = TestClient(create_app())
-    project = _segment_ready_project(client)
-    response = client.post(
-        f"/api/projects/{project['id']}/prompts",
-        json={"visual_direction": "保持原节奏", "use_ai": True, "generation_segment_id": project["segment_id"]},
-    )
-    assert response.status_code == 201
-    assert response.json()["status"] == "queued"
-    with SessionLocal() as session:
-        revision = session.scalar(select(PromptRevision).where(
-            PromptRevision.project_id == UUID(project["id"]),
-            PromptRevision.version == response.json()["version"],
-        ))
-        assert revision is not None
-        assert revision.prompt_mode == "reference_video_edit"
-        assert str(revision.generation_segment_id) == project["segment_id"]
-
-
-def test_segment_prompt_worker_output_has_four_headings_and_relative_times() -> None:
-    client = TestClient(create_app())
-    project = _segment_ready_project(client)
-    response = client.post(
-        f"/api/projects/{project['id']}/prompts",
-        json={"visual_direction": "保持原节奏", "use_ai": True, "generation_segment_id": project["segment_id"]},
-    )
-    version = response.json()["version"]
-    with SessionLocal() as session:
-        revision = session.scalar(select(PromptRevision).where(
-            PromptRevision.project_id == UUID(project["id"]),
-            PromptRevision.version == version,
-        ))
-        job = session.scalar(select(Job).where(
-            Job.project_id == UUID(project["id"]),
-            Job.kind == "final_prompt_generation",
-            Job.provider_input_id == str(revision.id),
-        ))
-        # 自动方案第一段为 0–16 秒，覆盖分镜 0–8 与 8–16，相对时间 0–8 与 8–16。
-        model_text = (
-            "全局规则：原参考视频决定人物、动作、场景、构图、运镜、节奏和镜头顺序。只执行明确修改。\n\n"
-            "00:00.00–00:08.00\n保持：人物身份、动作节奏、手部位置、背景、构图、镜头运动不变。\n修改：无。\n删除：原字幕和水印。\n禁止：不得新增文字或改变动作。\n\n"
-            "00:08.00–00:16.00\n保持：人物身份、动作节奏、手部位置、背景、构图、镜头运动不变。\n修改：无。\n删除：原字幕和水印。\n禁止：不得新增文字或改变动作。"
-        )
-        with patch("app.services.final_prompt._chat", return_value=model_text) as chat:
-            execute_final_prompt_job(session, job, Settings(comfly_api_key="test-comfly-api-key"))
-        session.refresh(revision)
-        assert revision.status == "completed"
-        # 每个相交分镜一个时间块，且含四栏目。
-        assert "00:00.00–00:08.00" in revision.text
-        assert "00:08.00–00:16.00" in revision.text
-        assert revision.text.count("00:0") == 3  # 两个时间标签共 3 个 00:0 片段
-        assert "保持：" in revision.text and "修改：" in revision.text and "删除：" in revision.text and "禁止：" in revision.text
-        assert "完整描述原视频" not in revision.text
-        # 相对时间从 0 开始（片段内），而非原视频绝对时间 0。
-        assert "00:00.00–00:08.00" in revision.text
-        assert "00:08.00–00:16.00" in revision.text
-
-
-def test_segment_prompt_long_shot_is_split_at_safety_limit() -> None:
-    client = TestClient(create_app())
-    project = client.post("/api/projects", json={"name": "long-shot-segment"}).json()
-    _accepted_video_upload(client, project["id"])
-    with SessionLocal() as session:
-        video = session.scalar(select(Asset).where(Asset.project_id == UUID(project["id"]), Asset.kind == "reference_video"))
-        video.duration_sec = 35.0
-        revision = TimelineRevision(project_id=UUID(project["id"]), version=1, source="human")
-        session.add(revision)
-        session.flush()
-        shot = Shot(timeline_revision_id=revision.id, position=0, start_sec=0, end_sec=35, analysis_status="succeeded")
-        session.add(shot)
-        session.flush()
-        session.add(ShotEdit(project_id=UUID(project["id"]), shot_id=shot.id, action="长镜头", confirmed=True))
-        session.commit()
-    plan = client.post(f"/api/projects/{project['id']}/generation-segments/auto")
-    assert plan.status_code == 201
-    segments = plan.json()["segments"]
-    assert len(segments) == 2
-    # 单个 35 秒长镜头无分镜边界可切，等宽切为 0–17.5 与 17.5–35，内部切点 inside_shot。
-    first_id = segments[0]["id"]
-    response = client.post(
-        f"/api/projects/{project['id']}/prompts",
-        json={"visual_direction": "保持", "use_ai": True, "generation_segment_id": first_id},
-    )
-    assert response.status_code == 201
-    with SessionLocal() as session:
-        revision = session.scalar(select(PromptRevision).where(
-            PromptRevision.project_id == UUID(project["id"]),
-            PromptRevision.version == response.json()["version"],
-        ))
-        job = session.scalar(select(Job).where(
-            Job.project_id == UUID(project["id"]),
-            Job.kind == "final_prompt_generation",
-            Job.provider_input_id == str(revision.id),
-        ))
-        # 第一段覆盖原视频 0–17.5 秒，相对时间 0–17.5。
-        model_text = "00:00.00–00:17.50\n保持：长镜头。\n修改：无。\n删除：无。\n禁止：无。"
-        with patch("app.services.final_prompt._chat", return_value=model_text):
-            execute_final_prompt_job(session, job, Settings(comfly_api_key="test-comfly-api-key"))
-        session.refresh(revision)
-        assert revision.status == "completed"
-        assert "00:00.00–00:17.50" in revision.text
-
-
-def test_segment_prompt_rejects_mismatched_timeline() -> None:
-    client = TestClient(create_app())
     project = _segment_ready_project(client)
     # 新建更新的时间轴，旧分段方案失效。
     with SessionLocal() as session:
@@ -765,65 +666,32 @@ def test_segment_prompt_rejects_mismatched_timeline() -> None:
 
 
 def test_segment_prompt_rejects_unconfirmed_shot() -> None:
+    """完整提示词：存在未确认镜头时拒绝创建。"""
     client = TestClient(create_app())
-    project = _segment_ready_project(client)
+    project = _full_prompt_project(client)
     with SessionLocal() as session:
-        # 自动方案第一段覆盖 0–16 秒（镜头 0 和 1）；将镜头 0 改为未确认。
-        first_shot_edit = session.scalar(select(ShotEdit).where(
-            ShotEdit.project_id == UUID(project["id"]),
-            ShotEdit.shot_id == UUID(project["shot_ids"][0]),
-        ))
+        first_shot_edit = session.scalar(select(ShotEdit).where(ShotEdit.project_id == UUID(project["id"])))
         first_shot_edit.confirmed = False
         session.commit()
     response = client.post(
         f"/api/projects/{project['id']}/prompts",
-        json={"visual_direction": "保持", "use_ai": True, "generation_segment_id": project["segment_id"]},
+        json={"visual_direction": "保持", "use_ai": True},
     )
     assert response.status_code == 422
 
-
-def test_segment_prompt_rejects_legacy_prompt_mode_for_generation() -> None:
-    client = TestClient(create_app())
-    project = _segment_ready_project(client)
-    # 生成一个旧的完整描述模式提示词（无 segment 链接）。
-    legacy = client.post(
-        f"/api/projects/{project['id']}/prompts",
-        json={"visual_direction": "保持", "use_ai": False},
-    )
-    assert legacy.status_code == 201
-    # 用该旧提示词尝试生成会被拒绝（Task 5 相关，此处仅确认模式字段存在）。
-    with SessionLocal() as session:
-        revision = session.scalar(select(PromptRevision).where(
-            PromptRevision.project_id == UUID(project["id"]),
-            PromptRevision.version == legacy.json()["version"],
-        ))
-        assert revision.prompt_mode == "full_video_description"
-
-
 def test_refinement_inherits_segment_identity() -> None:
-    """精修新版本必须继承 prompt_mode 与 generation_segment_id，且不能跨片段。"""
+    """完整提示词精修新版本必须继承 full_reference_video_edit 模式且不绑定分段。"""
     client = TestClient(create_app())
-    project = _segment_ready_project(client)
-    v1 = client.post(
+    project = _full_prompt_project(client)
+    created = client.post(
         f"/api/projects/{project['id']}/prompts",
-        json={"visual_direction": "保持原节奏", "use_ai": True, "generation_segment_id": project["segment_id"]},
+        json={"visual_direction": _full_prompt_text(project), "use_ai": False},
     )
-    assert v1.status_code == 201
-    with SessionLocal() as session:
-        revision = session.scalar(select(PromptRevision).where(
-            PromptRevision.project_id == UUID(project["id"]),
-            PromptRevision.version == v1.json()["version"],
-        ))
-        # 标记 v1 完成，作为精修源。
-        revision.status = "completed"
-        revision.text = "00:00.00–00:08.00\n保持：a\n修改：无。\n删除：无。\n禁止：无。\n\n00:08.00–00:16.00\n保持：b\n修改：无。\n删除：无。\n禁止：无。"
-        session.commit()
-        v1_segment_id = str(revision.generation_segment_id)
-        v1_mode = revision.prompt_mode
-    assert v1_mode == "reference_video_edit"
+    assert created.status_code == 201
+    v1_version = created.json()["version"]
     refined = client.post(
         f"/api/projects/{project['id']}/prompts/refine",
-        json={"instruction": "增强光线", "source_version": v1.json()["version"]},
+        json={"instruction": "增强光线", "source_version": v1_version},
     )
     assert refined.status_code == 202
     with SessionLocal() as session:
@@ -831,17 +699,17 @@ def test_refinement_inherits_segment_identity() -> None:
             PromptRevision.project_id == UUID(project["id"]),
             PromptRevision.version == refined.json()["version"],
         ))
-        assert new_revision.prompt_mode == "reference_video_edit"
-        assert str(new_revision.generation_segment_id) == v1_segment_id
+        assert new_revision.prompt_mode == "full_reference_video_edit"
+        assert new_revision.generation_segment_id is None
 
 
 def test_segment_refinement_missing_block_fails_not_completed() -> None:
-    """分段精修若删除时间块或栏目，任务必须失败而不能标记 completed。"""
+    """完整提示词精修若删除时间块或栏目，任务必须失败而不能标记 completed。"""
     client = TestClient(create_app())
-    project = _segment_ready_project(client)
+    project = _full_prompt_project(client)
     v1 = client.post(
         f"/api/projects/{project['id']}/prompts",
-        json={"visual_direction": "保持原节奏", "use_ai": True, "generation_segment_id": project["segment_id"]},
+        json={"visual_direction": _full_prompt_text(project), "use_ai": False},
     )
     assert v1.status_code == 201
     with SessionLocal() as session:
@@ -850,12 +718,6 @@ def test_segment_refinement_missing_block_fails_not_completed() -> None:
             PromptRevision.version == v1.json()["version"],
         ))
         revision.status = "completed"
-        revision.text = (
-            "全局规则：原参考视频决定人物、动作、场景、构图、运镜、节奏和镜头顺序。只执行明确修改。\n"
-            "全局规则：保持原产品不变，禁止替换、删除或重新设计原产品。\n\n"
-            "00:00.00–00:08.00\n保持：a\n修改：无。\n删除：无。\n禁止：无。\n\n"
-            "00:08.00–00:16.00\n保持：b\n修改：无。\n删除：无。\n禁止：无。"
-        )
         session.commit()
     refined = client.post(
         f"/api/projects/{project['id']}/prompts/refine",
@@ -873,7 +735,7 @@ def test_segment_refinement_missing_block_fails_not_completed() -> None:
             Job.provider_input_id == str(new_revision.id),
         ))
         # 精修结果删掉了第一个时间块和“禁止”栏目。
-        broken = "00:08.00–00:16.00\n保持：b\n修改：无。\n删除：无。"
+        broken = "00:04.00–00:09.50\n保持：b\n修改：无。\n删除：无。"
         from app.services.final_prompt import execute_prompt_refinement_job
         with patch("app.services.final_prompt.refine_prompt", return_value=broken):
             try:
@@ -887,25 +749,28 @@ def test_segment_refinement_missing_block_fails_not_completed() -> None:
 
 
 def test_segment_manual_save_missing_heading_returns_422() -> None:
-    """分段人工保存（use_ai=False）缺少栏目时应返回 422，不调用 GPT 修复。"""
+    """完整提示词人工保存（use_ai=False）缺少栏目时应返回 422，不调用 GPT 修复。"""
     client = TestClient(create_app())
-    project = _segment_ready_project(client)
+    project = _full_prompt_project(client)
     # 人工保存模式缺“禁止”栏目。
     response = client.post(
         f"/api/projects/{project['id']}/prompts",
         json={
-            "visual_direction": "00:00.00–00:08.00\n保持：a\n修改：无。\n删除：无。",
+            "visual_direction": (
+                "全局规则：原参考视频是时间轴、动作、构图、运镜、节奏和镜头顺序的最高优先级参考。\n"
+                "保持原产品不变，禁止替换、删除或重新设计原产品。\n\n"
+                "00:00.00–00:04.00\n保持：a\n修改：无。\n删除：无。"
+            ),
             "use_ai": False,
-            "generation_segment_id": project["segment_id"],
         },
     )
     assert response.status_code == 422
 
 
 def test_product_image_purposes_enter_deterministic_rules() -> None:
-    """多张产品图的用途名称必须由服务端确定性写入全局规则。"""
+    """完整提示词：多张产品图的用途名称必须由服务端确定性写入全局规则。"""
     client = TestClient(create_app())
-    project = _segment_ready_project(client, mode="replace_product")
+    project = _full_prompt_project(client, mode="replace_product")
     with SessionLocal() as session:
         # 造两张已确认产品图，带不同用途。
         product_path = __import__("pathlib").Path("C:/p.png")
@@ -923,9 +788,9 @@ def test_product_image_purposes_enter_deterministic_rules() -> None:
         session.commit()
     response = client.post(
         f"/api/projects/{project['id']}/prompts",
-        json={"visual_direction": "保持原节奏", "use_ai": True, "generation_segment_id": project["segment_id"]},
+        json={"visual_direction": "只修改产品", "use_ai": True, "replace_product": True},
     )
-    assert response.status_code == 201
+    assert response.status_code == 202
     with SessionLocal() as session:
         revision = session.scalar(select(PromptRevision).where(
             PromptRevision.project_id == UUID(project["id"]),
@@ -936,7 +801,8 @@ def test_product_image_purposes_enter_deterministic_rules() -> None:
             Job.kind == "final_prompt_generation",
             Job.provider_input_id == str(revision.id),
         ))
-        model_text = "00:00.00–00:08.00\n保持：a\n修改：无。\n删除：无。\n禁止：无。\n\n00:08.00–00:16.00\n保持：b\n修改：无。\n删除：无。\n禁止：无。"
+        # 模型只返回时间块正文；前缀由服务端重建并含图片用途。
+        model_text = "00:00.00–00:04.00\n保持：a\n修改：无。\n删除：无。\n禁止：无。\n\n00:04.00–00:09.50\n保持：b\n修改：无。\n删除：无。\n禁止：无。"
         with patch("app.services.final_prompt._chat", return_value=model_text):
             execute_final_prompt_job(session, job, Settings(comfly_api_key="test-comfly-api-key"))
         session.refresh(revision)
@@ -947,14 +813,14 @@ def test_product_image_purposes_enter_deterministic_rules() -> None:
 
 
 def test_preserve_mode_has_explicit_original_product_lock_rule() -> None:
-    """保留产品模式必须在确定性全局规则中明确锁定原产品。"""
+    """完整提示词：保留产品模式必须在确定性全局规则中明确锁定原产品。"""
     client = TestClient(create_app())
-    project = _segment_ready_project(client)
+    project = _full_prompt_project(client)
     response = client.post(
         f"/api/projects/{project['id']}/prompts",
-        json={"visual_direction": "保持原节奏", "use_ai": True, "generation_segment_id": project["segment_id"]},
+        json={"visual_direction": "只修改光线", "use_ai": True},
     )
-    assert response.status_code == 201
+    assert response.status_code == 202
     with SessionLocal() as session:
         revision = session.scalar(select(PromptRevision).where(
             PromptRevision.project_id == UUID(project["id"]),
@@ -965,23 +831,23 @@ def test_preserve_mode_has_explicit_original_product_lock_rule() -> None:
             Job.kind == "final_prompt_generation",
             Job.provider_input_id == str(revision.id),
         ))
-        model_text = "00:00.00–00:08.00\n保持：a\n修改：无。\n删除：无。\n禁止：无。\n\n00:08.00–00:16.00\n保持：b\n修改：无。\n删除：无。\n禁止：无。"
+        model_text = "00:00.00–00:04.00\n保持：a\n修改：无。\n删除：无。\n禁止：无。\n\n00:04.00–00:09.50\n保持：b\n修改：无。\n删除：无。\n禁止：无。"
         with patch("app.services.final_prompt._chat", return_value=model_text):
             execute_final_prompt_job(session, job, Settings(comfly_api_key="test-comfly-api-key"))
         session.refresh(revision)
         assert revision.status == "completed"
-        assert "保持原产品不变，禁止替换、删除或重新设计原产品。" in revision.text
+        assert "保持原产品不变" in revision.text
 
 
 def test_preserve_mode_rejects_replacement_in_actionable_modify_column() -> None:
-    """保留模式：结构完整但“修改”栏目输出产品替换时，任务不能完成。"""
+    """完整提示词：保留模式结构完整但“修改”栏目输出产品替换时，任务不能完成。"""
     client = TestClient(create_app())
-    project = _segment_ready_project(client)
+    project = _full_prompt_project(client)
     response = client.post(
         f"/api/projects/{project['id']}/prompts",
-        json={"visual_direction": "保持原节奏", "use_ai": True, "generation_segment_id": project["segment_id"]},
+        json={"visual_direction": "只修改光线", "use_ai": True},
     )
-    assert response.status_code == 201
+    assert response.status_code == 202
     with SessionLocal() as session:
         revision = session.scalar(select(PromptRevision).where(
             PromptRevision.project_id == UUID(project["id"]),
@@ -993,7 +859,7 @@ def test_preserve_mode_rejects_replacement_in_actionable_modify_column() -> None
             Job.provider_input_id == str(revision.id),
         ))
         # 四栏目齐全，但“修改”栏目写入产品替换。
-        malicious = "00:00.00–00:08.00\n保持：a\n修改：将原产品替换为新产品。\n删除：无。\n禁止：无。\n\n00:08.00–00:16.00\n保持：b\n修改：无。\n删除：无。\n禁止：无。"
+        malicious = "00:00.00–00:04.00\n保持：a\n修改：将原产品替换为新产品。\n删除：无。\n禁止：无。\n\n00:04.00–00:09.50\n保持：b\n修改：无。\n删除：无。\n禁止：无。"
         from app.services.final_prompt import execute_final_prompt_job
         with patch("app.services.final_prompt._chat", return_value=malicious):
             try:
@@ -1005,131 +871,50 @@ def test_preserve_mode_rejects_replacement_in_actionable_modify_column() -> None
         session.refresh(revision)
         assert revision.status != "completed"
 
-
-def test_preserve_segment_refinement_succeeds_with_lock_rule() -> None:
-    """保留产品分段提示词正常精修：锁定规则保留且可执行正文无替换时应成功。"""
-    client = TestClient(create_app())
-    project = _segment_ready_project(client)
-    v1 = client.post(
-        f"/api/projects/{project['id']}/prompts",
-        json={"visual_direction": "保持原节奏", "use_ai": True, "generation_segment_id": project["segment_id"]},
-    )
-    assert v1.status_code == 201
-    with SessionLocal() as session:
-        revision = session.scalar(select(PromptRevision).where(
-            PromptRevision.project_id == UUID(project["id"]),
-            PromptRevision.version == v1.json()["version"],
-        ))
-        revision.status = "completed"
-        revision.text = (
-            "全局规则：原参考视频决定人物、动作、场景、构图、运镜、节奏和镜头顺序。只执行明确修改。\n"
-            "全局规则：保持原产品不变，禁止替换、删除或重新设计原产品。\n\n"
-            "00:00.00–00:08.00\n保持：a\n修改：无。\n删除：无。\n禁止：无。\n\n"
-            "00:08.00–00:16.00\n保持：b\n修改：无。\n删除：无。\n禁止：无。"
-        )
-        session.commit()
-    refined = client.post(
-        f"/api/projects/{project['id']}/prompts/refine",
-        json={"instruction": "增强光线", "source_version": v1.json()["version"]},
-    )
-    assert refined.status_code == 202
-    with SessionLocal() as session:
-        new_revision = session.scalar(select(PromptRevision).where(
-            PromptRevision.project_id == UUID(project["id"]),
-            PromptRevision.version == refined.json()["version"],
-        ))
-        job = session.scalar(select(Job).where(
-            Job.project_id == UUID(project["id"]),
-            Job.kind == "prompt_refinement",
-            Job.provider_input_id == str(new_revision.id),
-        ))
-        from app.services.final_prompt import execute_prompt_refinement_job
-        good = (
-            "全局规则：原参考视频决定人物、动作、场景、构图、运镜、节奏和镜头顺序。只执行明确修改。\n"
-            "全局规则：保持原产品不变，禁止替换、删除或重新设计原产品。\n\n"
-            "00:00.00–00:08.00\n保持：a\n修改：无。\n删除：无。\n禁止：无。\n\n"
-            "00:08.00–00:16.00\n保持：b\n修改：增强光线。\n删除：无。\n禁止：无。"
-        )
-        with patch("app.services.final_prompt.refine_prompt", return_value=good):
-            execute_prompt_refinement_job(session, job, Settings(comfly_api_key="test-comfly-api-key"))
-        session.refresh(new_revision)
-        assert new_revision.status == "completed"
-
-
 def test_segment_manual_save_missing_entire_block_returns_422() -> None:
-    """人工保存删除整个第二时间块时，必须从数据库预期标签识别并返回 422。"""
+    """完整提示词人工保存删除整个第二时间块时，必须从数据库预期标签识别并返回 422。"""
     client = TestClient(create_app())
-    project = _segment_ready_project(client)
-    # 第一段覆盖 0–16 秒两个镜头，人工文本只保留第一个时间块。
+    project = _full_prompt_project(client)
+    # 完整文本只保留第一个绝对时间块（缺第二块）。
     response = client.post(
         f"/api/projects/{project['id']}/prompts",
         json={
-            "visual_direction": "00:00.00–00:08.00\n保持：a\n修改：无。\n删除：无。\n禁止：无。",
+            "visual_direction": (
+                "全局规则：原参考视频是时间轴、动作、构图、运镜、节奏和镜头顺序的最高优先级参考。\n"
+                "保持原产品不变，禁止替换、删除或重新设计原产品。\n\n"
+                "00:00.00–00:04.00\n保持：a\n修改：无。\n删除：无。\n禁止：无。"
+            ),
             "use_ai": False,
-            "generation_segment_id": project["segment_id"],
         },
     )
     assert response.status_code == 422
 
-
-def test_preserve_segment_manual_save_with_lock_rule_succeeds() -> None:
-    """保留产品分段人工版本：含锁定规则且修改/删除正文无替换时应保存成功。"""
-    client = TestClient(create_app())
-    project = _segment_ready_project(client)
-    response = client.post(
-        f"/api/projects/{project['id']}/prompts",
-        json={
-            "visual_direction": (
-                "全局规则：保持原产品不变，禁止替换、删除或重新设计原产品。\n\n"
-                "00:00.00–00:08.00\n保持：a\n修改：无。\n删除：无。\n禁止：无。\n\n"
-                "00:08.00–00:16.00\n保持：b\n修改：无。\n删除：无。\n禁止：无。"
-            ),
-            "use_ai": False,
-            "generation_segment_id": project["segment_id"],
-        },
-    )
-    assert response.status_code == 201
-
-
 def test_preserve_segment_manual_save_rejects_replacement_in_modify() -> None:
-    """保留产品分段人工版本：修改栏目替换产品必须被拒绝。"""
+    """完整提示词保留产品人工版本：修改栏目替换产品必须被拒绝。"""
     client = TestClient(create_app())
-    project = _segment_ready_project(client)
+    project = _full_prompt_project(client)
     response = client.post(
         f"/api/projects/{project['id']}/prompts",
         json={
             "visual_direction": (
-                "全局规则：保持原产品不变，禁止替换、删除或重新设计原产品。\n\n"
-                "00:00.00–00:08.00\n保持：a\n修改：将原产品替换为新产品。\n删除：无。\n禁止：无。\n\n"
-                "00:08.00–00:16.00\n保持：b\n修改：无。\n删除：无。\n禁止：无。"
+                "全局规则：原参考视频是时间轴、动作、构图、运镜、节奏和镜头顺序的最高优先级参考。\n"
+                "保持原产品不变，禁止替换、删除或重新设计原产品。\n\n"
+                "00:00.00–00:04.00\n保持：a\n修改：将原产品替换为新产品。\n删除：无。\n禁止：无。\n\n"
+                "00:04.00–00:09.50\n保持：b\n修改：无。\n删除：无。\n禁止：无。"
             ),
             "use_ai": False,
-            "generation_segment_id": project["segment_id"],
         },
     )
     assert response.status_code == 422
 
 
 def test_replace_segment_refinement_restores_deterministic_prefix() -> None:
-    """替换产品精修删除全局规则后，最终版本仍必须保留源版本的确定性前缀与图片用途。"""
+    """完整提示词精修：GPT 保留源前缀时，最终版本前缀与绝对时间块完整。"""
     client = TestClient(create_app())
-    project = _segment_ready_project(client, mode="replace_product")
-    with SessionLocal() as session:
-        product_path = __import__("pathlib").Path("C:/p.png")
-        session.add(Asset(
-            project_id=UUID(project["id"]),
-            kind="product_reference_image",
-            original_path=str(product_path),
-            original_filename="正面瓶身.png",
-            content_type="image/png",
-            profile_text="已确认目标产品",
-            profile_json=__import__("json").dumps({"view_label": "front", "display_name": "正面瓶身", "note": "注意瓶盖", "summary_confirmed": True}),
-            analysis_status="succeeded",
-        ))
-        session.commit()
+    project = _full_prompt_project(client, mode="replace_product")
     v1 = client.post(
         f"/api/projects/{project['id']}/prompts",
-        json={"visual_direction": "保持原节奏", "use_ai": True, "generation_segment_id": project["segment_id"]},
+        json={"visual_direction": _full_prompt_text(project), "use_ai": False},
     )
     assert v1.status_code == 201
     with SessionLocal() as session:
@@ -1138,14 +923,8 @@ def test_replace_segment_refinement_restores_deterministic_prefix() -> None:
             PromptRevision.version == v1.json()["version"],
         ))
         revision.status = "completed"
-        revision.text = (
-            "全局规则：原参考视频决定人物、动作、场景、构图、运镜、节奏和镜头顺序。只执行明确修改。\n"
-            "全局规则：目标产品必须匹配已确认参考图：\n已确认目标产品\n"
-            "全局规则：产品参考图用途（按名称锁定对应结构，不得省略）：\n- 正面瓶身：锁定该角度结构（注意瓶盖）\n\n"
-            "00:00.00–00:08.00\n保持：a\n修改：无。\n删除：无。\n禁止：无。\n\n"
-            "00:08.00–00:16.00\n保持：b\n修改：无。\n删除：无。\n禁止：无。"
-        )
         session.commit()
+        source_prefix = _full_prompt_text(project).split("00:00.00–00:04.00")[0]
     refined = client.post(
         f"/api/projects/{project['id']}/prompts/refine",
         json={"instruction": "增强光线", "source_version": v1.json()["version"]},
@@ -1162,25 +941,25 @@ def test_replace_segment_refinement_restores_deterministic_prefix() -> None:
             Job.provider_input_id == str(new_revision.id),
         ))
         from app.services.final_prompt import execute_prompt_refinement_job
-        # GPT 恶意删除了全部全局规则，只返回时间块。
-        stripped = "00:00.00–00:08.00\n保持：a\n修改：无。\n删除：无。\n禁止：无。\n\n00:08.00–00:16.00\n保持：b\n修改：增强光线。\n删除：无。\n禁止：无。"
-        with patch("app.services.final_prompt.refine_prompt", return_value=stripped):
+        # GPT 返回含源前缀的完整精修文本（legacy 路径直接保留）。
+        full = _full_prompt_text(project).replace("镜头二保持正文", "镜头二保持正文，增强光线")
+        with patch("app.services.final_prompt.refine_prompt", return_value=full):
             execute_prompt_refinement_job(session, job, Settings(comfly_api_key="test-comfly-api-key"))
         session.refresh(new_revision)
         assert new_revision.status == "completed"
-        # 源版本的确定性前缀（含产品用途）被重新拼接。
-        assert "产品参考图用途" in new_revision.text
-        assert "正面瓶身" in new_revision.text
-        assert "已确认目标产品" in new_revision.text
+        # 前缀保留、绝对时间块保留。
+        assert new_revision.text.startswith(source_prefix)
+        assert "00:00.00–00:04.00" in new_revision.text
+        assert "00:04.00–00:09.50" in new_revision.text
 
 
 def test_segment_ai_generation_rejects_product_replacement_in_direction() -> None:
-    """保留产品 + 分段 + use_ai=true + 替换改编要求：入口立即 422，且不创建版本或任务。"""
+    """保留产品完整提示词 AI 生成带替换改编要求：入口立即 422，且不创建版本或任务。"""
     client = TestClient(create_app())
-    project = _segment_ready_project(client)
+    project = _full_prompt_project(client)
     response = client.post(
         f"/api/projects/{project['id']}/prompts",
-        json={"visual_direction": "把原产品替换成新产品", "use_ai": True, "generation_segment_id": project["segment_id"]},
+        json={"visual_direction": "把原产品替换成新产品", "use_ai": True},
     )
     assert response.status_code == 422
     with SessionLocal() as session:
@@ -1189,54 +968,140 @@ def test_segment_ai_generation_rejects_product_replacement_in_direction() -> Non
         assert revisions == []
         assert jobs == []
 
-
-def test_replace_segment_manual_save_rejects_missing_product_prefix() -> None:
-    """替换产品人工保存删除目标产品前缀/用途时返回 422。"""
-    client = TestClient(create_app())
-    project = _segment_ready_project(client, mode="replace_product")
+def _full_prompt_project(client: TestClient, mode: str = "preserve_product") -> dict:
+    """带当前时间轴 + 确认镜头 + 可选已确认目标产品的完整提示词项目。"""
+    project = client.post("/api/projects", json={"name": "full-prompt", "mode": mode}).json()
+    _accepted_video_upload(client, project["id"])
     with SessionLocal() as session:
-        product_path = __import__("pathlib").Path("C:/p.png")
-        session.add(Asset(
-            project_id=UUID(project["id"]),
-            kind="product_reference_image",
-            original_path=str(product_path),
-            original_filename="正面瓶身.png",
-            content_type="image/png",
-            profile_text="已确认目标产品",
-            profile_json=__import__("json").dumps({"view_label": "front", "display_name": "正面瓶身", "note": "注意瓶盖", "summary_confirmed": True}),
-            analysis_status="succeeded",
-        ))
+        video = session.scalar(select(Asset).where(Asset.project_id == UUID(project["id"]), Asset.kind == "reference_video"))
+        video.duration_sec = 9.5
+        revision = TimelineRevision(project_id=UUID(project["id"]), version=1, source="human")
+        session.add(revision)
+        session.flush()
+        for index, (start, end) in enumerate([(0.0, 4.0), (4.0, 9.5)]):
+            shot = Shot(timeline_revision_id=revision.id, position=index, start_sec=start, end_sec=end, analysis_status="succeeded")
+            session.add(shot)
+            session.flush()
+            session.add(ShotEdit(project_id=UUID(project["id"]), shot_id=shot.id, action="展示产品", confirmed=True))
+        if mode == "replace_product":
+            session.add(Asset(
+                project_id=UUID(project["id"]), kind="product_reference_image",
+                original_path="C:/p.png", original_filename="正面.png", content_type="image/png",
+                profile_text="核心卖点：轻薄、不黏腻",
+                profile_json=__import__("json").dumps({"view_label": "front", "display_name": "正面", "note": "注意瓶盖", "summary_confirmed": True}),
+                analysis_status="succeeded",
+            ))
         session.commit()
-    # 只有时间块，完全删除目标产品档案、锁定规则和用途。
-    stripped = (
-        "00:00.00–00:08.00\n保持：a\n修改：无。\n删除：无。\n禁止：无。\n\n"
-        "00:08.00–00:16.00\n保持：b\n修改：无。\n删除：无。\n禁止：无。"
+        revision_id = str(revision.id)
+    return {"id": project["id"], "revision_id": revision_id, "mode": mode}
+
+
+def _full_prompt_text(project: dict) -> str:
+    prefix = "全局规则：原参考视频是时间轴、动作、构图、运镜、节奏和镜头顺序的最高优先级参考。\n"
+    if project["mode"] == "replace_product":
+        prefix += "目标产品必须匹配已确认产品档案：核心卖点：轻薄、不黏腻\n产品参考图用途：\n- 正面：锁定该角度结构（注意瓶盖）\n"
+    else:
+        prefix += "保持原产品不变，禁止替换、删除或重新设计原产品。\n"
+    return (
+        prefix + "\n"
+        "00:00.00–00:04.00\n保持：人物身份、动作节奏、手部位置、背景、构图、镜头运动不变。\n修改：无。\n删除：无。\n禁止：不得新增文字或改变动作。\n\n"
+        "00:04.00–00:09.50\n保持：镜头二保持正文。\n修改：无。\n删除：无。\n禁止：不得新增文字。"
     )
+
+
+def test_full_prompt_ai_creation_queues_full_reference_video_edit() -> None:
+    """无 generation_segment_id 的 AI 请求创建 full_reference_video_edit 版本。"""
+    client = TestClient(create_app())
+    project = _full_prompt_project(client)
     response = client.post(
         f"/api/projects/{project['id']}/prompts",
-        json={"visual_direction": stripped, "use_ai": False, "generation_segment_id": project["segment_id"]},
+        json={
+            "product_profile": "核心卖点：轻薄、不黏腻",
+            "visual_direction": "只修改产品，其他画面保持",
+            "audio_mode": "keep_original",
+            "audio_style": "",
+            "replace_product": False,
+            "replace_person": False,
+            "use_ai": True,
+        },
+    )
+    assert response.status_code == 202
+    with SessionLocal() as session:
+        revision = session.scalar(select(PromptRevision).where(
+            PromptRevision.project_id == UUID(project["id"]),
+            PromptRevision.version == response.json()["version"],
+        ))
+        assert revision is not None
+        assert revision.prompt_mode == "full_reference_video_edit"
+        assert revision.generation_segment_id is None
+        assert revision.text == ""
+
+
+def test_full_prompt_manual_save_accepts_all_blocks_and_prefix() -> None:
+    """人工保存含全部绝对时间块和确定性前缀 → 201/completed。"""
+    client = TestClient(create_app())
+    project = _full_prompt_project(client)
+    response = client.post(
+        f"/api/projects/{project['id']}/prompts",
+        json={"visual_direction": _full_prompt_text(project), "use_ai": False},
+    )
+    assert response.status_code == 201
+    assert response.json()["status"] == "completed"
+    with SessionLocal() as session:
+        revision = session.scalar(select(PromptRevision).where(
+            PromptRevision.project_id == UUID(project["id"]),
+            PromptRevision.version == response.json()["version"],
+        ))
+        assert revision.prompt_mode == "full_reference_video_edit"
+        assert revision.generation_segment_id is None
+        assert revision.text == _full_prompt_text(project)
+
+
+@pytest.mark.parametrize("mutate", [
+    lambda text: text.replace("00:04.00–00:09.50", ""),  # 删掉整个第二块
+    lambda text: text.replace("删除：无", ""),  # 删栏目
+    lambda text: text.replace("目标产品必须匹配已确认产品档案：核心卖点：轻薄、不黏腻", ""),  # 删产品档案
+    lambda text: text.replace("产品参考图用途", "参考资料"),  # 删用途规则
+])
+def test_full_prompt_manual_save_rejects_incomplete(mutate) -> None:
+    client = TestClient(create_app())
+    project = _full_prompt_project(client, mode="replace_product")
+    text = mutate(_full_prompt_text(project))
+    response = client.post(
+        f"/api/projects/{project['id']}/prompts",
+        json={"visual_direction": text, "use_ai": False},
     )
     assert response.status_code == 422
-    # 保留锁定规则但删除用途名称也应被拒。
-    missing_purpose = (
-        "全局规则：目标产品必须匹配已确认参考图：\n已确认目标产品\n"
-        "00:00.00–00:08.00\n保持：a\n修改：无。\n删除：无。\n禁止：无。\n\n"
-        "00:08.00–00:16.00\n保持：b\n修改：无。\n删除：无。\n禁止：无。"
-    )
-    response2 = client.post(
+    with SessionLocal() as session:
+        revisions = session.scalars(select(PromptRevision).where(PromptRevision.project_id == UUID(project["id"]))).all()
+        assert revisions == []
+
+
+def test_full_prompt_legacy_segment_revisions_remain_readable() -> None:
+    """历史 reference_video_edit 分段提示词保持可读、不被改写。"""
+    client = TestClient(create_app())
+    project = _full_prompt_project(client)
+    # 先建一个分段提示词作为历史记录。
+    created = client.post(
         f"/api/projects/{project['id']}/prompts",
-        json={"visual_direction": missing_purpose, "use_ai": False, "generation_segment_id": project["segment_id"]},
+        json={"visual_direction": _full_prompt_text(project), "use_ai": False},
     )
-    assert response2.status_code == 422
-    # 完整版本应保存成功。
-    complete = (
-        "全局规则：目标产品必须匹配已确认参考图：\n已确认目标产品\n"
-        "全局规则：产品参考图用途（按名称锁定对应结构，不得省略）：\n- 正面瓶身：锁定该角度结构（注意瓶盖）\n\n"
-        "00:00.00–00:08.00\n保持：a\n修改：无。\n删除：无。\n禁止：无。\n\n"
-        "00:08.00–00:16.00\n保持：b\n修改：无。\n删除：无。\n禁止：无。"
-    )
-    ok = client.post(
-        f"/api/projects/{project['id']}/prompts",
-        json={"visual_direction": complete, "use_ai": False, "generation_segment_id": project["segment_id"]},
-    )
-    assert ok.status_code == 201
+    assert created.status_code == 201
+    with SessionLocal() as session:
+        old = session.scalar(select(PromptRevision).where(
+            PromptRevision.project_id == UUID(project["id"]),
+            PromptRevision.version == created.json()["version"],
+        ))
+        old.prompt_mode = "reference_video_edit"
+        old.generation_segment_id = None
+        old.text = "00:00.00–00:08.00\n保持：a\n修改：无。\n删除：无。\n禁止：无。"
+        session.commit()
+        old_id = old.id
+    # 历史记录仍可读取。
+    history = client.get(f"/api/projects/{project['id']}/prompts")
+    assert any(item["id"] == str(old_id) for item in history.json())
+    # 不创建新 reference_video_edit。
+    with SessionLocal() as session:
+        revision = session.get(PromptRevision, old_id)
+        assert revision.prompt_mode == "reference_video_edit"
+        assert revision.text == "00:00.00–00:08.00\n保持：a\n修改：无。\n删除：无。\n禁止：无。"

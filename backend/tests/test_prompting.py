@@ -25,7 +25,11 @@ def test_prompt_uses_chinese_timeline_and_product_locking() -> None:
     assert "严格保持参考视频的完整分镜" in text
     assert "不得替换、删除或改变原产品身份" in text
 from fastapi.testclient import TestClient
+from sqlalchemy import select
+from uuid import UUID
 
+from app.db.models import PromptRevision
+from app.db.session import SessionLocal
 from app.main import create_app
 
 
@@ -52,14 +56,33 @@ def test_audio_style_is_added_only_when_selected() -> None:
 
 
 def test_prompt_revisions_are_saved_with_audio_choice() -> None:
+    from unittest.mock import patch
+    from app.services.media import VideoMetadata
     client = TestClient(create_app())
     project = client.post("/api/projects", json={"name": "提示词"}).json()
-
+    with patch("app.api.routes.projects.probe_video", return_value=VideoMetadata(3.0, 1280, 720, 30)):
+        client.post(
+            f"/api/projects/{project['id']}/reference-video",
+            files={"file": ("reference.mp4", b"video-bytes", "video/mp4")},
+        )
+    timeline = client.put(
+        f"/api/projects/{project['id']}/timeline",
+        json={"shots": [{"start_sec": 0, "end_sec": 3}]},
+    ).json()
+    client.put(
+        f"/api/projects/{project['id']}/shots/{timeline['shots'][0]['id']}/edit",
+        json={"action": "展示", "confirmed": True},
+    )
+    text = (
+        "全局规则：原参考视频是时间轴、动作、构图、运镜、节奏和镜头顺序的最高优先级参考。\n"
+        "保持原产品不变，禁止替换、删除或重新设计原产品。\n\n"
+        "00:00.00–00:03.00\n保持：a\n修改：无。\n删除：无。\n禁止：无。"
+    )
     response = client.post(
         f"/api/projects/{project['id']}/prompts",
         json={
             "product_profile": "透明精华瓶，银色瓶盖",
-            "visual_direction": "清晨窗边的产品特写",
+            "visual_direction": text,
             "audio_mode": "add_style",
             "audio_style": "轻盈钢琴",
             "use_ai": False,
@@ -67,8 +90,10 @@ def test_prompt_revisions_are_saved_with_audio_choice() -> None:
     )
 
     assert response.status_code == 201
-    assert response.json() == {
-        "version": 1,
-        "text": "清晨窗边的产品特写",
-        "status": "completed",
-    }
+    assert response.json()["version"] == 1
+    assert response.json()["status"] == "completed"
+    assert response.json()["text"] == text
+    with SessionLocal() as session:
+        revision = session.scalar(select(PromptRevision).where(PromptRevision.project_id == UUID(project["id"])))
+        assert revision.audio_mode == "add_style"
+        assert revision.audio_style == "轻盈钢琴"
