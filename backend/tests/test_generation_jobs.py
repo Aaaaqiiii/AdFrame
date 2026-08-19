@@ -631,3 +631,32 @@ def test_batch_worker_selects_correct_provider_gateway(client, tmp_path, monkeyp
     monkeypatch.setattr("app.worker._generation_gateway", fake_gateway)
     run_once()
     assert seen_models == [provider, provider]
+
+
+def test_batch_worker_corrupt_prompt_fails_not_retries(client, tmp_path, monkeypatch) -> None:
+    """冻结完整提示词损坏 → 批次行 failed（确定性错误），不反复 retryable。"""
+    project = _ready_batch_rows(tmp_path, client.post("/api/projects", json={"name": "corrupt prompt"}).json()["id"])
+    from app.worker import run_once
+    from app.services.seedance import GenerationResult
+    from app.db.models import PromptRevision
+    with SessionLocal() as session:
+        prompt = session.scalar(select(PromptRevision).where(PromptRevision.project_id == project.project_id))
+        prompt.text = prompt.text.replace("00:40.00", "00:39.00")
+        session.commit()
+    class FakePublisher:
+        def publish(self, path, content_type):
+            return type("P", (), {"url": "https://t/1", "expires_at": datetime.now(UTC)})()
+    monkeypatch.setattr("app.worker.TempfilePublisher", FakePublisher)
+    monkeypatch.setattr("app.worker.ensure_segment_clip", lambda *a, **k: (a[1].write_bytes(b"c"), a[1])[1])
+    class FakeGateway:
+        def submit(self, payload):
+            return "t"
+        def get_result(self, task_id):
+            return GenerationResult(task_id=task_id, status="processing")
+    monkeypatch.setattr("app.worker._generation_gateway", lambda settings, provider: (FakeGateway(), "m"))
+    run_once()
+    with SessionLocal() as session:
+        rows = list(session.scalars(select(Generation).where(Generation.project_id == project.project_id)))
+        assert len(rows) == 2
+        assert all(row.status == "failed" for row in rows)
+        assert all("推导失败" in (row.error_message or "") for row in rows)

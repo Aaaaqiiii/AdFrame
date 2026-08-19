@@ -215,17 +215,18 @@ def run_once() -> int:
                     shot_ranges = [(shot.start_sec, shot.end_sec) for shot in session.scalars(select(Shot).where(Shot.timeline_revision_id == prompt.source_timeline_revision_id).order_by(Shot.position))]
                     try:
                         document = validate_full_prompt(prompt.text, shot_ranges)
+                        request_text = derive_segment_prompt(
+                            document,
+                            segment_start_sec=segment.source_start_sec,
+                            segment_end_sec=segment.source_end_sec,
+                            batch_position=generation.batch_position or 0,
+                            batch_size=generation.batch_size or 0,
+                        )
                     except Exception as exc:
-                        generation.status, generation.error_message = "failed", f"冻结完整提示词无效：{exc}"
+                        # 确定性错误（提示词/段不匹配），重试无意义，标 failed 而非 retryable。
+                        generation.status, generation.error_message = "failed", f"批次提示词推导失败：{exc}"
                         session.commit()
                         continue
-                    request_text = derive_segment_prompt(
-                        document,
-                        segment_start_sec=segment.source_start_sec,
-                        segment_end_sec=segment.source_end_sec,
-                        batch_position=generation.batch_position or 0,
-                        batch_size=generation.batch_size or 0,
-                    )
                 if segment is not None:
                     covers_full_source = segment.source_start_sec <= 0.001 and abs(segment.source_end_sec - (video_asset.duration_sec or segment.source_end_sec)) <= 0.001
                     if not covers_full_source:
