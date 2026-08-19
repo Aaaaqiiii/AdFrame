@@ -1487,3 +1487,109 @@ def test_selling_point_optimization_invalid_structure_fails_not_completed() -> N
                 assert False, "缺块卖点优化必须失败"
         session.refresh(new_revision)
         assert new_revision.status != "completed"
+
+
+def test_prompt_history_full_mode_filters_and_orders() -> None:
+    """历史返回 completed full 提示词 newest-first，模式过滤排除历史分段提示词。"""
+    client = TestClient(create_app())
+    project = _full_prompt_project(client)
+    full_text = _full_prompt_text(project)
+    # 建两个 full 完成版本。
+    v1 = client.post(f"/api/projects/{project['id']}/prompts", json={"visual_direction": full_text, "use_ai": False})
+    assert v1.status_code == 201
+    v2_text = full_text.replace("镜头二保持正文", "镜头二保持正文（v2）")
+    v2 = client.post(f"/api/projects/{project['id']}/prompts", json={"visual_direction": v2_text, "use_ai": False})
+    assert v2.status_code == 201
+    # 直插一个历史分段提示词（reference_video_edit）。
+    with SessionLocal() as session:
+        revision = session.scalar(select(TimelineRevision).where(TimelineRevision.project_id == UUID(project["id"])))
+        session.add(PromptRevision(
+            project_id=UUID(project["id"]), version=99, prompt_mode="reference_video_edit",
+            generation_segment_id=None, source_timeline_revision_id=revision.id,
+            text="00:00.00–00:04.00\n保持：旧分段\n修改：无。\n删除：无。\n禁止：无。", status="completed",
+        ))
+        session.commit()
+    # 全部完成版本 newest-first。
+    all_history = client.get(f"/api/projects/{project['id']}/prompts").json()
+    assert [item["version"] for item in all_history][:3] == [99, v2.json()["version"], v1.json()["version"]]
+    # 只取 full 模式，排除历史分段。
+    full_history = client.get(f"/api/projects/{project['id']}/prompts?prompt_mode=full_reference_video_edit").json()
+    versions = [item["version"] for item in full_history]
+    assert 99 not in versions
+    assert versions[0] == v2.json()["version"]
+    assert all(item["prompt_mode"] == "full_reference_video_edit" for item in full_history)
+
+
+def test_prompt_history_latest_completed_not_hidden_by_queued() -> None:
+    """queued/failed 最新版本不隐藏最新 completed 版本。"""
+    client = TestClient(create_app())
+    project = _full_prompt_project(client)
+    v1 = client.post(f"/api/projects/{project['id']}/prompts", json={"visual_direction": _full_prompt_text(project), "use_ai": False})
+    assert v1.status_code == 201
+    # 排一个 queued AI 版本（v2）。
+    queued = client.post(f"/api/projects/{project['id']}/prompts", json={"visual_direction": "保持节奏", "use_ai": True})
+    assert queued.status_code == 202
+    # completed 历史仍显示 v1，不被 queued v2 隐藏。
+    history = client.get(f"/api/projects/{project['id']}/prompts?status=completed").json()
+    assert [item["version"] for item in history] == [v1.json()["version"]]
+
+
+def test_full_prompt_manual_v3_restores_v3_not_v1() -> None:
+    """手动 v3 保存后刷新，恢复 v3 而非 v1。"""
+    client = TestClient(create_app())
+    project = _full_prompt_project(client)
+    v1 = client.post(f"/api/projects/{project['id']}/prompts", json={"visual_direction": _full_prompt_text(project), "use_ai": False})
+    assert v1.status_code == 201
+    v3_text = _full_prompt_text(project).replace("镜头二保持正文", "镜头二保持正文（v3）")
+    v3 = client.post(f"/api/projects/{project['id']}/prompts", json={"visual_direction": v3_text, "use_ai": False})
+    assert v3.status_code == 201
+    # 刷新项目详情，latest_prompt 是 v3。
+    details = client.get(f"/api/projects/{project['id']}").json()
+    assert details["latest_prompt_version"] == v3.json()["version"]
+    assert "（v3）" in details["latest_prompt_text"]
+
+
+def test_queued_optimization_binds_source_text_even_after_new_version() -> None:
+    """从 v1 排队的优化在 v2 保存后仍绑定 v1 文本。"""
+    client = TestClient(create_app())
+    project = _full_prompt_project(client, mode="replace_product")
+    v1 = client.post(f"/api/projects/{project['id']}/prompts", json={"visual_direction": _full_prompt_text(project), "use_ai": False})
+    assert v1.status_code == 201
+    optimized = client.post(
+        f"/api/projects/{project['id']}/prompts/optimize-selling-points",
+        json={"source_version": v1.json()["version"]},
+    )
+    assert optimized.status_code == 202
+    # 保存 v2（新手动版本）。
+    v2_text = _full_prompt_text(project).replace("镜头二保持正文", "镜头二保持正文（v2）")
+    v2 = client.post(f"/api/projects/{project['id']}/prompts", json={"visual_direction": v2_text, "use_ai": False})
+    assert v2.status_code == 201
+    # 排队的优化版本仍绑定 v1 文本。
+    with SessionLocal() as session:
+        queued_opt = session.scalar(select(PromptRevision).where(
+            PromptRevision.project_id == UUID(project["id"]),
+            PromptRevision.version == optimized.json()["version"],
+        ))
+        assert queued_opt.text == _full_prompt_text(project)
+        assert "（v2）" not in queued_opt.text
+
+
+def test_prompt_endpoints_never_create_generation_or_call_seedance() -> None:
+    """提示词创建/精修/优化不创建 Generation，也不调用 Seedance。"""
+    from app.db.models import Generation
+    from app.services.seedance import JsonTaskGateway
+    client = TestClient(create_app())
+    project = _full_prompt_project(client)
+    with patch.object(JsonTaskGateway, "submit", side_effect=AssertionError("Seedance called")):
+        v1 = client.post(f"/api/projects/{project['id']}/prompts", json={"visual_direction": _full_prompt_text(project), "use_ai": False})
+        assert v1.status_code == 201
+        refined = client.post(f"/api/projects/{project['id']}/prompts/refine", json={"instruction": "增强光线", "source_version": v1.json()["version"]})
+        assert refined.status_code == 202
+        optimized = client.post(
+            f"/api/projects/{project['id']}/prompts/optimize-selling-points",
+            json={"source_version": v1.json()["version"]},
+        )
+        assert optimized.status_code == 202
+    with SessionLocal() as session:
+        generations = session.scalars(select(Generation).where(Generation.project_id == UUID(project["id"]))).all()
+        assert generations == []

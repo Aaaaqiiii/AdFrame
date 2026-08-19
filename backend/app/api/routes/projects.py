@@ -3,6 +3,7 @@ import mimetypes
 import json
 from datetime import datetime
 from pathlib import Path
+from typing import Literal
 from uuid import UUID, uuid4
 
 from fastapi import APIRouter, Depends, File, Form, HTTPException, Query, Response, UploadFile, status
@@ -377,6 +378,11 @@ def list_prompt_revisions(
     current_timeline_only: bool = False,
     status_filter: str | None = Query(default=None, alias="status"),
     generation_segment_id: UUID | None = None,
+    prompt_mode: Literal[
+        "full_reference_video_edit",
+        "reference_video_edit",
+        "full_video_description",
+    ] | None = Query(default=None),
     session: Session = Depends(get_session),
 ) -> list[PromptRevision]:
     if session.get(Project, project_id) is None:
@@ -395,6 +401,8 @@ def list_prompt_revisions(
         query = query.where(PromptRevision.source_timeline_revision_id == current.id)
     if generation_segment_id is not None:
         query = query.where(PromptRevision.generation_segment_id == generation_segment_id)
+    if prompt_mode is not None:
+        query = query.where(PromptRevision.prompt_mode == prompt_mode)
     return list(session.scalars(query.order_by(PromptRevision.version.desc())))
 
 
