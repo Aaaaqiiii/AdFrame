@@ -459,3 +459,175 @@ def test_worker_rebuilds_lost_segment_clip(client, tmp_path, monkeypatch) -> Non
         segment = session.get(GenerationSegment, segment_id)
         assert generation.status in {"queued", "processing", "retryable"}
         assert segment.clip_path is not None
+
+
+def _ready_batch_rows(tmp_path, project_id, duration_sec=40.0):
+    """40 秒源：镜头 0-10/10-25/25-40（第三镜头跨越段边界 18），两段 [0,18]/[18,40]。
+    返回 batch 相关行：视频、两 segment、full prompt、两个 batch Generation。"""
+    from uuid import UUID
+    from app.db.models import GenerationSegment
+    from app.services.final_prompt import build_full_prompt_prefix
+    video_path = tmp_path / "reference.mp4"
+    video_path.write_bytes(b"video")
+    pid = UUID(project_id)
+    with SessionLocal() as session:
+        video = Asset(
+            project_id=pid, kind="reference_video", original_path=str(video_path),
+            original_filename="reference.mp4", content_type="video/mp4", duration_sec=duration_sec,
+        )
+        session.add(video)
+        session.flush()
+        revision = TimelineRevision(project_id=pid, version=1, source="human")
+        session.add(revision)
+        session.flush()
+        # 镜头：0-10, 10-25, 25-40（10-25 跨越段边界 18）。
+        shot_ranges = [(0.0, 10.0), (10.0, 25.0), (25.0, 40.0)]
+        for index, (start, end) in enumerate(shot_ranges):
+            shot = Shot(timeline_revision_id=revision.id, position=index, start_sec=start, end_sec=end, analysis_status="succeeded")
+            session.add(shot)
+            session.flush()
+            session.add(ShotEdit(project_id=pid, shot_id=shot.id, action="展示", confirmed=True))
+        segment_a = GenerationSegment(project_id=pid, plan_version=1, position=0, source_start_sec=0.0, source_end_sec=18.0, start_boundary_type="video_edge", end_boundary_type="inside_shot", source_timeline_revision_id=revision.id)
+        segment_b = GenerationSegment(project_id=pid, plan_version=1, position=1, source_start_sec=18.0, source_end_sec=40.0, start_boundary_type="inside_shot", end_boundary_type="video_edge", source_timeline_revision_id=revision.id)
+        session.add_all([segment_a, segment_b])
+        session.flush()
+        prefix = build_full_prompt_prefix(project_mode="preserve_product", product_profile="", product_image_purposes=[], people_reference=None, background_reference=None, audio_mode="keep_original", audio_style="")
+        blocks = []
+        for start, end in shot_ranges:
+            blocks.append(f"{_fmt(start)}–{_fmt(end)}\n保持：镜头 {int(start)} 保持正文\n修改：无。\n删除：无。\n禁止：无。")
+        full_text = prefix + "\n\n" + "\n\n".join(blocks)
+        prompt = PromptRevision(
+            project_id=pid, version=1, prompt_mode="full_reference_video_edit",
+            generation_segment_id=None, source_timeline_revision_id=revision.id,
+            text=full_text, status="completed",
+        )
+        session.add(prompt)
+        session.flush()
+        batch_id = __import__("uuid").uuid4()
+        gen_a = Generation(project_id=pid, version=1, prompt_version=prompt.version, generation_segment_id=segment_a.id, generation_batch_id=batch_id, batch_position=1, batch_size=2, provider="volcengine", ratio="adaptive", duration=-1, status="queued", reference_asset_ids=json.dumps([str(video.id)]))
+        gen_b = Generation(project_id=pid, version=2, prompt_version=prompt.version, generation_segment_id=segment_b.id, generation_batch_id=batch_id, batch_position=2, batch_size=2, provider="volcengine", ratio="adaptive", duration=-1, status="queued", reference_asset_ids=json.dumps([str(video.id)]))
+        session.add_all([gen_a, gen_b])
+        session.commit()
+        return SimpleNamespace(
+            project_id=pid, revision_id=revision.id, video_id=video.id,
+            segment_a_id=segment_a.id, segment_b_id=segment_b.id,
+            prompt_version=prompt.version, batch_id=batch_id,
+            gen_a_id=gen_a.id, gen_b_id=gen_b.id, full_text=full_text,
+        )
+
+
+def _fmt(value: float) -> str:
+    return f"{int(value // 60):02d}:{value % 60:05.2f}"
+
+
+def test_batch_worker_derives_relative_prompts_for_crossing_segments(client, tmp_path, monkeypatch) -> None:
+    """batch worker：跨边界镜头在两段中推导正确相对时间，且逐字保持正文。"""
+    project = _ready_batch_rows(tmp_path, client.post("/api/projects", json={"name": "batch worker"}).json()["id"])
+    from app.worker import run_once
+    from app.services.seedance import GenerationResult
+    seen_payloads = []
+    class FakePublisher:
+        def publish(self, path, content_type):
+            return type("P", (), {"url": f"https://tempfile.org/seg/{len(seen_payloads)}", "expires_at": datetime.now(UTC)})()
+    monkeypatch.setattr("app.worker.TempfilePublisher", FakePublisher)
+    def _fake_ensure(source, destination, start, end, max_sec):
+        destination.write_bytes(b"clip")
+        return destination
+    monkeypatch.setattr("app.worker.ensure_segment_clip", _fake_ensure)
+    class FakeGateway:
+        def submit(self, payload):
+            seen_payloads.append(payload)
+            return f"task-{len(seen_payloads)}"
+        def get_result(self, task_id):
+            return GenerationResult(task_id=task_id, status="processing")
+    monkeypatch.setattr("app.worker._generation_gateway", lambda settings, provider: (FakeGateway(), "model"))
+
+    run_once()
+
+    assert len(seen_payloads) == 2
+    # worker 领行顺序不保证（按 id），用“片段 N/M”识别行分拣两段。
+    texts = {}
+    for payload in seen_payloads:
+        text = payload["content"][0]["text"]
+        if "片段 1/2" in text:
+            texts["seg_a"] = text
+        else:
+            texts["seg_b"] = text
+    # 段 A [0,18]：跨边界镜头 10-25 裁剪到 10-18 相对 0-8（段 A 起点 0）。
+    assert "00:10.00–00:18.00" in texts["seg_a"]
+    # 段 B [18,40]：同一镜头裁剪到 18-25 相对 0-7。
+    assert "00:00.00–00:07.00" in texts["seg_b"]
+    # 段 B 的块头必须是相对时间；绝对 00:18 只允许出现在服务端识别行。
+    block_headers = [line for line in texts["seg_b"].split("\n") if "–" in line and line[:1].isdigit()]
+    assert "00:18.00–00:25.00" not in block_headers
+    # 两段正文逐字保持。
+    assert "镜头 10 保持正文" in texts["seg_a"]
+    assert "镜头 10 保持正文" in texts["seg_b"]
+    # 视频 URL 各自第一个。
+    assert all(payload["content"][1]["type"] == "video_url" for payload in seen_payloads)
+
+
+def test_batch_worker_snapshot_envelope(client, tmp_path, monkeypatch) -> None:
+    """batch worker 快照含 batch/segment/prompt 元数据，无签名串。"""
+    project = _ready_batch_rows(tmp_path, client.post("/api/projects", json={"name": "batch snap"}).json()["id"])
+    from app.worker import run_once
+    from app.services.seedance import GenerationResult
+    class FakePublisher:
+        def publish(self, path, content_type):
+            return type("P", (), {"url": "https://tempfile.org/x?signature=abc", "expires_at": datetime.now(UTC)})()
+    monkeypatch.setattr("app.worker.TempfilePublisher", FakePublisher)
+    def _fake_ensure(source, destination, start, end, max_sec):
+        destination.write_bytes(b"clip")
+        return destination
+    monkeypatch.setattr("app.worker.ensure_segment_clip", _fake_ensure)
+    class FakeGateway:
+        def submit(self, payload):
+            return "task-1"
+        def get_result(self, task_id):
+            return GenerationResult(task_id=task_id, status="processing")
+    monkeypatch.setattr("app.worker._generation_gateway", lambda settings, provider: (FakeGateway(), "model"))
+    run_once()
+    with SessionLocal() as session:
+        gen_a = session.get(Generation, project.gen_a_id)
+        snap = json.loads(gen_a.request_snapshot)
+        assert snap["generation_batch_id"] == str(project.batch_id)
+        assert snap["batch_position"] == 1
+        assert snap["batch_size"] == 2
+        assert snap["generation_segment_id"] == str(project.segment_a_id)
+        assert snap["plan_version"] == 1
+        assert snap["full_prompt_revision_id"]
+        assert snap["prompt_version"] == project.prompt_version
+        assert "signature" not in json.dumps(snap)
+
+
+@pytest.mark.parametrize("provider,expected_model", [
+    ("volcengine", "doubao-seedance-2-5-260628"),
+    ("comfly", "doubao-seedance-2.5"),
+])
+def test_batch_worker_selects_correct_provider_gateway(client, tmp_path, monkeypatch, provider, expected_model) -> None:
+    """batch worker 只选择对应供应商的 gateway 与模型，绝不 fallback。"""
+    project = _ready_batch_rows(tmp_path, client.post("/api/projects", json={"name": "prov"}).json()["id"])
+    from app.worker import run_once
+    from app.services.seedance import GenerationResult
+    # 改两行为指定 provider。
+    with SessionLocal() as session:
+        for g in session.scalars(select(Generation).where(Generation.project_id == project.project_id)):
+            g.provider = provider
+        session.commit()
+    seen_models = []
+    class FakePublisher:
+        def publish(self, path, content_type):
+            return type("P", (), {"url": "https://t/1", "expires_at": datetime.now(UTC)})()
+    monkeypatch.setattr("app.worker.TempfilePublisher", FakePublisher)
+    monkeypatch.setattr("app.worker.ensure_segment_clip", lambda *a, **k: (a[1].write_bytes(b"c"), a[1])[1])
+    class FakeGateway:
+        def submit(self, payload):
+            return "t"
+        def get_result(self, task_id):
+            return GenerationResult(task_id=task_id, status="processing")
+    def fake_gateway(settings, provider):
+        seen_models.append(provider)
+        return FakeGateway(), expected_model
+    monkeypatch.setattr("app.worker._generation_gateway", fake_gateway)
+    run_once()
+    assert seen_models == [provider, provider]

@@ -12,10 +12,11 @@ from datetime import UTC, datetime, timedelta
 from sqlalchemy import or_, select
 
 from app.core.config import Settings
-from app.db.models import Asset, Generation, GenerationSegment, Job, PromptRevision
+from app.db.models import Asset, Generation, GenerationSegment, Job, PromptRevision, Shot
 from app.db.migrations import require_database_at_head
 from app.db.session import SessionLocal
 from app.services.generation_jobs import execute_generation_job
+from app.services.full_prompt import derive_segment_prompt, validate_full_prompt
 from app.services.media import ensure_segment_clip
 from app.services.seedance import JsonTaskGateway, build_seedance_request
 from app.services.tempfile_publisher import TempfilePublisher
@@ -204,6 +205,27 @@ def run_once() -> int:
                 # 按生成片段决定发布原视频还是物理裁片。
                 segment = session.get(GenerationSegment, generation.generation_segment_id) if generation.generation_segment_id else None
                 video_asset = assets[0]
+                request_text = prompt.text
+                if generation.generation_batch_id is not None:
+                    # 批次任务：从冻结 full prompt 推导当前片段的相对时间提示词。
+                    if segment is None or prompt.prompt_mode != "full_reference_video_edit" or prompt.generation_segment_id is not None:
+                        generation.status, generation.error_message = "failed", "批次任务的片段或提示词不匹配"
+                        session.commit()
+                        continue
+                    shot_ranges = [(shot.start_sec, shot.end_sec) for shot in session.scalars(select(Shot).where(Shot.timeline_revision_id == prompt.source_timeline_revision_id).order_by(Shot.position))]
+                    try:
+                        document = validate_full_prompt(prompt.text, shot_ranges)
+                    except Exception as exc:
+                        generation.status, generation.error_message = "failed", f"冻结完整提示词无效：{exc}"
+                        session.commit()
+                        continue
+                    request_text = derive_segment_prompt(
+                        document,
+                        segment_start_sec=segment.source_start_sec,
+                        segment_end_sec=segment.source_end_sec,
+                        batch_position=generation.batch_position or 0,
+                        batch_size=generation.batch_size or 0,
+                    )
                 if segment is not None:
                     covers_full_source = segment.source_start_sec <= 0.001 and abs(segment.source_end_sec - (video_asset.duration_sec or segment.source_end_sec)) <= 0.001
                     if not covers_full_source:
@@ -221,19 +243,23 @@ def run_once() -> int:
                 image_urls = [_publish_if_expired(session, asset, settings) for asset in assets[1:]]
                 payload = build_seedance_request(
                     model,
-                    prompt.text,
+                    request_text,
                     video_url,
                     generation.ratio,
                     generation.duration,
                     generation.generate_audio,
                     image_urls,
                 )
-                # 审计快照：外包 segment/prompt 元数据，保持发给供应商的 payload 不变。
+                # 审计快照：外包 batch/segment/prompt 元数据，保持发给供应商的 payload 不变。
                 snapshot = {
+                    "generation_batch_id": str(generation.generation_batch_id) if generation.generation_batch_id else None,
+                    "batch_position": generation.batch_position,
+                    "batch_size": generation.batch_size,
                     "generation_segment_id": str(segment.id) if segment else None,
                     "plan_version": segment.plan_version if segment else None,
                     "source_start_sec": segment.source_start_sec if segment else None,
                     "source_end_sec": segment.source_end_sec if segment else None,
+                    "full_prompt_revision_id": str(prompt.id),
                     "prompt_version": generation.prompt_version,
                     "provider_request": redact_request_urls(payload),
                 }
