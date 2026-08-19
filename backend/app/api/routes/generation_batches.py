@@ -218,7 +218,8 @@ def create_generation_batch(
         include_person_reference=payload.include_person_reference,
         include_background_reference=payload.include_background_reference,
     )
-    # 活动重复检查：任何当前方案段已有活动批次或活动旧任务 → 409。
+    # 单事务插入：先锁项目行，锁内重新检查活动重复与版本分配，避免并发创建双批次。
+    session.execute(select(Project).where(Project.id == project_id).with_for_update())
     active_statuses = ("queued", "processing", "retryable")
     segment_ids = [segment.id for segment in inputs.segments]
     active = session.scalar(select(Generation.id).where(
@@ -228,8 +229,6 @@ def create_generation_batch(
     ).limit(1))
     if active is not None:
         raise HTTPException(status_code=409, detail="相同输入和设置的活动生成任务已存在")
-    # 单事务插入。
-    session.execute(select(Project).where(Project.id == project_id).with_for_update())
     max_version = session.scalar(select(func.max(Generation.version)).where(Generation.project_id == project_id)) or 0
     batch_id = uuid4()
     batch_size = len(inputs.segments)
