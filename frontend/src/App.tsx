@@ -609,10 +609,10 @@ function App() {
     finally { setRetryingGenerationId(null) }
   }
 
-  async function resolvePosition(generationId: string, resolution: 'submitted' | 'not_submitted') {
+  async function resolvePosition(generationId: string, resolution: 'submitted' | 'not_submitted', externalTaskId?: string) {
     if (!projectId) return
     try {
-      await resolveGeneration(projectId, generationId, resolution === 'submitted' ? 'attach_task' : 'confirm_not_created')
+      await resolveGeneration(projectId, generationId, resolution === 'submitted' ? 'attach_task' : 'confirm_not_created', externalTaskId)
       await refreshBatch()
       setNotice('已提交人工解析。')
     } catch (error) { setNotice(`解析失败：${errorMessage(error)}`) }

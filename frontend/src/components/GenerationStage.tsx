@@ -1,3 +1,4 @@
+import { useState } from 'react'
 import type { GenerationBatch, GenerationSummary } from '../api'
 import { generationContentUrl, generationDownloadUrl } from '../api'
 import { batchStatusLabel, canResolveUncertain, canRetryGeneration, generationStatusLabel, latestGenerationPerPosition } from '../generationDomain'
@@ -6,7 +7,7 @@ type Props = {
   batch: GenerationBatch | null
   retryingGenerationId: string | null
   onRetry: (generationId: string) => Promise<void>
-  onResolve: (generationId: string, resolution: 'submitted' | 'not_submitted') => Promise<void>
+  onResolve: (generationId: string, resolution: 'submitted' | 'not_submitted', externalTaskId?: string) => Promise<void>
   onRefresh: () => Promise<void>
   onBackToPrompt: () => void
 }
@@ -16,10 +17,11 @@ function ResultCard(p: {
   projectId: string
   retrying: boolean
   onRetry: () => void
-  onResolve: (resolution: 'submitted' | 'not_submitted') => void
+  onResolve: (resolution: 'submitted' | 'not_submitted', externalTaskId?: string) => void
 }) {
   const { generation, projectId } = p
   const status = generation.status
+  const [resolveTaskId, setResolveTaskId] = useState('')
   return <div className="generation-result-card">
     <div className="generation-result-head">
       <strong>片段 {generation.batch_position ?? '?'}</strong>
@@ -38,7 +40,8 @@ function ResultCard(p: {
     {canResolveUncertain(generation) && (
       <div className="generation-result-resolve">
         <span>提交状态不确定，请确认供应商是否创建了任务：</span>
-        <button type="button" className="button secondary" onClick={() => p.onResolve('submitted')}>已创建任务</button>
+        <label>供应商任务 ID <input value={resolveTaskId} onChange={(event) => setResolveTaskId(event.target.value)} placeholder="粘贴供应商返回的任务 ID" /></label>
+        <button type="button" className="button secondary" disabled={!resolveTaskId.trim()} onClick={() => p.onResolve('submitted', resolveTaskId.trim())}>已创建任务</button>
         <button type="button" className="button secondary" onClick={() => p.onResolve('not_submitted')}>未创建任务</button>
       </div>
     )}
