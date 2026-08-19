@@ -460,3 +460,22 @@ def test_generation_list_response_includes_batch_fields(client, generation_facto
     assert "generation_batch_id" in payload
     assert "batch_position" in payload
     assert "batch_size" in payload
+
+
+def test_retry_preserves_batch_identity(client, generation_factory) -> None:
+    """重试失败 batch 生成时保留 batch_id、position、size。"""
+    from uuid import uuid4
+    with SessionLocal() as session:
+        generation = session.get(Generation, generation_factory(status="failed").id)
+        batch_id = uuid4()
+        generation.generation_batch_id = batch_id
+        generation.batch_position = 2
+        generation.batch_size = 3
+        session.commit()
+        project_id = generation.project_id
+    response = client.post(f"/api/projects/{project_id}/generations/{generation.id}/retry")
+    assert response.status_code == 202
+    payload = response.json()
+    assert payload["generation_batch_id"] == str(batch_id)
+    assert payload["batch_position"] == 2
+    assert payload["batch_size"] == 3
