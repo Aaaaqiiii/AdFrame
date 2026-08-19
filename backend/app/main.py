@@ -8,6 +8,7 @@ from app.api.routes.timeline import router as timeline_router
 from app.api.routes.analysis import router as analysis_router
 from app.api.routes.generations import router as generations_router
 from app.api.routes.generation_segments import router as generation_segments_router
+from app.api.routes.generation_batches import router as generation_batches_router
 from app.db.migrations import require_database_at_head
 from app.core.config import Settings
 from app.core.license import LicenseError, verify_license
@@ -54,6 +55,7 @@ def create_app() -> FastAPI:
     app.include_router(analysis_router)
     app.include_router(generations_router)
     app.include_router(generation_segments_router)
+    app.include_router(generation_batches_router)
 
     @app.get("/api/health")
     def health() -> dict[str, str]:
