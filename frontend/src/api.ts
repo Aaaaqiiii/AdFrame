@@ -282,5 +282,5 @@ export function retryGeneration(projectId: string, generationId: string) { retur
 export function generationContentUrl(projectId: string, generationId: string) { return mediaUrl(`/api/projects/${projectId}/generations/${generationId}/content`) }
 export function generationDownloadUrl(projectId: string, generationId: string) { return mediaUrl(`/api/projects/${projectId}/generations/${generationId}/content?download=true`) }
 export function optimizePromptSellingPoints(projectId: string, sourceVersion: number) {
-  return request<PromptRevisionSummary>(`/api/projects/${projectId}/prompts/optimize-selling-points`, { method: 'POST', ...json({ source_version: sourceVersion }) })
+  return request<{ version: number; text: string; status: string }>(`/api/projects/${projectId}/prompts/optimize-selling-points`, { method: 'POST', ...json({ source_version: sourceVersion }) })
 }
