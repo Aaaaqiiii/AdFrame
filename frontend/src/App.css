@@ -440,3 +440,19 @@ button, .button { border: 0; font: inherit; cursor: pointer; }
 .generation-controls-row select { padding: 6px 10px; border: 1px solid var(--line); border-radius: 6px; }
 .generation-controls > .button { width: 100%; }
 .generation-placeholder { padding: 40px; text-align: center; color: var(--muted); border: 1px dashed var(--line); border-radius: 12px; margin: 18px 30px; }
+
+/* 批次生成结果 */
+.generation-stage-actions { display: flex; gap: 8px; align-items: center; }
+.generation-batch-summary { margin: 18px 30px 0; padding: 14px 16px; border: 1px solid var(--line); border-radius: 12px; background: #fff; display: flex; gap: 16px; align-items: center; flex-wrap: wrap; font-size: 13px; }
+.generation-batch-summary strong { font-size: 14px; }
+.generation-batch-summary span { color: var(--muted); }
+.generation-results { margin: 18px 30px; display: grid; gap: 14px; }
+.generation-result-card { border: 1px solid var(--line); border-radius: 12px; padding: 14px 16px; background: #fff; }
+.generation-result-head { display: flex; align-items: center; justify-content: space-between; }
+.generation-result-head strong { font-size: 14px; }
+.generation-result-error { margin-top: 8px; color: var(--danger); font-size: 12px; }
+.generation-result-video { margin-top: 10px; display: grid; gap: 8px; }
+.generation-result-video video { width: 100%; max-height: 320px; background: #000; border-radius: 8px; }
+.generation-result-resolve { margin-top: 10px; display: flex; gap: 8px; align-items: center; font-size: 12px; color: var(--muted); flex-wrap: wrap; }
+.generation-result-card > .button { margin-top: 10px; }
+.status-badge.warn { background: var(--warn-soft, #fff3cd); color: var(--warn, #856404); }

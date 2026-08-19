@@ -30,6 +30,29 @@ export function batchProgress(batch: GenerationBatch): { done: number; total: nu
   return { done, total: Math.max(batch.batch_size, rows.length) }
 }
 
+/** 单任务状态 → 中文标签。 */
+export function generationStatusLabel(status: string): string {
+  const labels: Record<string, string> = {
+    queued: '排队中', processing: '生成中', retryable: '等待重试',
+    completed: '已完成', failed: '失败', submission_uncertain: '提交状态不确定',
+  }
+  return labels[status] || '未知状态'
+}
+
+/** 仅 submission_uncertain 需要人工解析（而非 retry）。 */
+export function canResolveUncertain(generation: GenerationSummary): boolean {
+  return generation.status === 'submission_uncertain'
+}
+
+/** 批次状态 → 中文标签。 */
+export function batchStatusLabel(status: BatchStatus): string {
+  const labels: Record<BatchStatus, string> = {
+    queued: '排队中', processing: '生成中', complete: '已完成', partial: '部分完成',
+    failed: '已失败', uncertain: '需人工解析',
+  }
+  return labels[status] || '未知状态'
+}
+
 /** 选择最高版本的 completed full 提示词；忽略 queued/failed 与 legacy 模式。 */
 export function chooseLatestFullPrompt(revisions: PromptRevisionSummary[]): PromptRevisionSummary | null {
   let chosen: PromptRevisionSummary | null = null

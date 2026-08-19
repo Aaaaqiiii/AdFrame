@@ -284,3 +284,8 @@ export function generationDownloadUrl(projectId: string, generationId: string) {
 export function optimizePromptSellingPoints(projectId: string, sourceVersion: number) {
   return request<{ version: number; text: string; status: string }>(`/api/projects/${projectId}/prompts/optimize-selling-points`, { method: 'POST', ...json({ source_version: sourceVersion }) })
 }
+export function resolveGeneration(projectId: string, generationId: string, action: 'attach_task' | 'confirm_not_created', externalTaskId?: string) {
+  return request<GenerationSummary>(`/api/projects/${projectId}/generations/${generationId}/resolve`, {
+    method: 'POST', ...json({ action, external_task_id: externalTaskId }),
+  })
+}

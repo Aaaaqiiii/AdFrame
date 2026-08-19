@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest'
-import { batchProgress, canRetryGeneration, chooseLatestFullPrompt, isBatchActive, latestGenerationPerPosition } from './generationDomain'
+import { batchProgress, batchStatusLabel, canResolveUncertain, canRetryGeneration, chooseLatestFullPrompt, generationStatusLabel, isBatchActive, latestGenerationPerPosition } from './generationDomain'
 import type { GenerationBatch, GenerationSummary, PromptRevisionSummary } from './api'
 
 const gen = (overrides: Partial<GenerationSummary> = {}): GenerationSummary => ({
@@ -85,5 +85,31 @@ describe('generation domain', () => {
     ]
     const chosen = chooseLatestFullPrompt(revisions)
     expect(chosen?.version).toBe(1) // v3 queued 忽略，v2 legacy 忽略，v1 full completed
+  })
+})
+
+describe('generation stage domain', () => {
+  it('maps generation statuses to labels', () => {
+    expect(generationStatusLabel('queued')).toBe('排队中')
+    expect(generationStatusLabel('processing')).toBe('生成中')
+    expect(generationStatusLabel('retryable')).toBe('等待重试')
+    expect(generationStatusLabel('completed')).toBe('已完成')
+    expect(generationStatusLabel('failed')).toBe('失败')
+    expect(generationStatusLabel('submission_uncertain')).toBe('提交状态不确定')
+    expect(generationStatusLabel('unknown')).toBe('未知状态')
+  })
+
+  it('uncertain generation needs manual resolve, not retry', () => {
+    expect(canResolveUncertain(gen({ status: 'submission_uncertain' }))).toBe(true)
+    expect(canResolveUncertain(gen({ status: 'failed' }))).toBe(false)
+  })
+
+  it('batch status labels', () => {
+    expect(batchStatusLabel('queued')).toBe('排队中')
+    expect(batchStatusLabel('processing')).toBe('生成中')
+    expect(batchStatusLabel('complete')).toBe('已完成')
+    expect(batchStatusLabel('partial')).toBe('部分完成')
+    expect(batchStatusLabel('failed')).toBe('已失败')
+    expect(batchStatusLabel('uncertain')).toBe('需人工解析')
   })
 })

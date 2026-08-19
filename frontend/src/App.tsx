@@ -30,7 +30,7 @@ import {
   uploadReferenceVideo,
 } from './api'
 import type { AnalysisJob, AssetKind, ConnectionCheck, GenerationBatch, GenerationSegmentInput, GenerationSegmentPlan, Project, ProjectDetails, PromptRevisionSummary, SettingsSaveResult, Timeline, TimelineShot } from './api'
-import { autoPlanGenerationSegments, createGenerationBatch, getGenerationSegments, optimizePromptSellingPoints, saveGenerationSegments } from './api'
+import { autoPlanGenerationSegments, createGenerationBatch, getGenerationBatch, getGenerationSegments, listGenerationBatches, optimizePromptSellingPoints, resolveGeneration, retryGeneration, saveGenerationSegments } from './api'
 import { AppHeader } from './components/AppHeader'
 import { AnalysisStage } from './components/AnalysisStage'
 import { MaterialsStage } from './components/MaterialsStage'
@@ -41,6 +41,7 @@ import { PromptStage } from './components/PromptStage'
 import { ShotWorkspace } from './components/ShotWorkspace'
 import type { EditDraft } from './components/ShotWorkspace'
 import { GenerationSegmentsEditor } from './components/GenerationSegmentsEditor'
+import { GenerationStage } from './components/GenerationStage'
 import { TimelineEditor } from './components/TimelineEditor'
 import { WorkflowRail } from './components/WorkflowRail'
 import { inferProductProfile } from './productProfile'
@@ -113,6 +114,7 @@ function App() {
   const [optimizeBusy, setOptimizeBusy] = useState(false)
   const [generationBusy, setGenerationBusy] = useState(false)
   const [selectedBatch, setSelectedBatch] = useState<GenerationBatch | null>(null)
+  const [retryingGenerationId, setRetryingGenerationId] = useState<string | null>(null)
   const [selectedIds, setSelectedIds] = useState<string[]>([])
   const [selectedBoundary, setSelectedBoundary] = useState<number | null>(null)
   const [playhead, setPlayhead] = useState(0)
@@ -200,6 +202,11 @@ function App() {
       setSelectedSegmentId(null)
     }
     await restorePromptVersions(project.id, undefined, true)
+    // restore 顺序最后：批次列表，选最新批次。
+    try {
+      const batches = await listGenerationBatches(project.id)
+      setSelectedBatch(batches[0] ?? null)
+    } catch { /* 无批次或批次接口错误时保留空状态 */ }
     return project
   }, [restorePromptVersions])
 
@@ -275,6 +282,24 @@ function App() {
   useEffect(() => {
     if (success(globalStatus) && timeline?.source === 'vision_hybrid') setAiRevisionId(timeline.revision_id)
   }, [globalStatus, timeline])
+
+  // 批次轮询：仅 selectedBatch 为 queued/processing 时轮询，terminal/unmount 停止。
+  useEffect(() => {
+    if (!projectId || !selectedBatch) return
+    if (selectedBatch.status !== 'queued' && selectedBatch.status !== 'processing') return
+    let cancelled = false
+    let inFlight = false
+    const timer = window.setInterval(async () => {
+      if (inFlight) return
+      inFlight = true
+      try {
+        const batch = await getGenerationBatch(projectId, selectedBatch.generation_batch_id)
+        if (!cancelled) setSelectedBatch(batch)
+      } catch { /* 网络错误由下一次轮询或手动刷新覆盖 */ }
+      finally { inFlight = false }
+    }, 3000)
+    return () => { cancelled = true; window.clearInterval(timer) }
+  }, [projectId, selectedBatch])
 
   async function ensureProject(name = '未命名参考广告') {
     if (projectId) return projectId
@@ -562,6 +587,34 @@ function App() {
     finally { setGenerationBusy(false) }
   }
 
+  async function refreshBatch() {
+    if (!projectId || !selectedBatch) return
+    try {
+      const batch = await getGenerationBatch(projectId, selectedBatch.generation_batch_id)
+      setSelectedBatch(batch)
+    } catch (error) { setNotice(`刷新批次失败：${errorMessage(error)}`) }
+  }
+
+  async function retryPosition(generationId: string) {
+    if (!projectId) return
+    setRetryingGenerationId(generationId)
+    try {
+      await retryGeneration(projectId, generationId)
+      await refreshBatch()
+      setNotice('已提交本段重试。')
+    } catch (error) { setNotice(`重试失败：${errorMessage(error)}`) }
+    finally { setRetryingGenerationId(null) }
+  }
+
+  async function resolvePosition(generationId: string, resolution: 'submitted' | 'not_submitted') {
+    if (!projectId) return
+    try {
+      await resolveGeneration(projectId, generationId, resolution === 'submitted' ? 'attach_task' : 'confirm_not_created')
+      await refreshBatch()
+      setNotice('已提交人工解析。')
+    } catch (error) { setNotice(`解析失败：${errorMessage(error)}`) }
+  }
+
   async function beginShotAnalysis() {
     if (!projectId || !timelineConfirmed) return
     try {
@@ -692,7 +745,7 @@ function App() {
         {stage === 'analysis' && <AnalysisStage shots={shots} jobs={jobs} onOpenShots={() => { if (!projectId) return; void restoreProject(projectId).then(() => setStage('shots')).catch((error) => setNotice(`读取分镜事实失败：${errorMessage(error)}`)) }} />}
         {stage === 'timeline' && timeline && <TimelineEditor videoUrl={video.previewUrl} videoRatio={videoRatio} videoRef={videoRef} shots={shots} selectedIds={selectedIds} selectedBoundary={selectedBoundary} playhead={playhead} fps={fps} dirty={timelineDirty} saving={timelineSaving} canContinue={timelineConfirmed} onMetadata={(width, height) => { setVideoRatio(`${width} / ${height}`); const element = videoRef.current; if (element && Number.isFinite(element.duration) && element.duration > 0) setFps(25) }} onPlayhead={seekTimeline} onSelectShot={selectTimelineShot} onSelectBoundary={setSelectedBoundary} onMoveBoundary={moveTimelineBoundary} onSplit={splitAtPlayhead} onMerge={mergeSelected} onRestore={() => void restoreAi()} onSave={() => void saveHumanTimeline()} onContinue={() => void beginShotAnalysis()} />}
         {stage === 'segments' && timeline && generationPlan && <GenerationSegmentsEditor projectId={projectId} planVersion={generationPlan.plan_version} timelineRevisionId={generationPlan.timeline_revision_id} segments={generationPlan.segments} shots={timeline.shots} durationSec={videoRef.current?.duration || shots[shots.length - 1]?.end_sec || 0} maxSegmentSeconds={generationPlan.max_segment_seconds} recommendedMinSeconds={generationPlan.recommended_min_seconds} busy={segmentBusy} selectedSegmentId={selectedSegmentId} onSelectSegment={setSelectedSegmentId} onAutoPlan={() => void autoPlanSegments()} onSave={(inputs) => void saveSegmentPlan(inputs)} onRestoreAuto={() => { if (!timelineConfirmed) return; void autoPlanSegments() }} />}
-        {stage === 'generation' && <section className="stage-content generation-stage"><div className="stage-heading"><div><span className="eyebrow">第七步</span><h1>生成与结果</h1><p>批次生成任务与结果在此展示。</p></div><span className="version-badge">{selectedBatch ? `${selectedBatch.provider} · ${selectedBatch.batch_size} 段 · ${selectedBatch.status}` : '尚未提交批次'}</span></div><div className="generation-placeholder">生成结果组件将在下一步接入。</div></section>}
+        {stage === 'generation' && <GenerationStage batch={selectedBatch} retryingGenerationId={retryingGenerationId} onRetry={retryPosition} onResolve={resolvePosition} onRefresh={() => refreshBatch()} onBackToPrompt={() => setStage('prompt')} />}
         {stage === 'shots' && <ShotWorkspace shots={shots} selectedId={selectedShotId} jobs={jobs} edit={shotEdit} saving={shotSaving} mode={MODE} compatibility={null} onSelect={setSelectedShotId} onEdit={setShotEdit} onSave={(confirmed) => void saveCurrentShot(confirmed)} onAdoptAI={(id) => void adoptLatestAI(id)} onRetry={(id) => {
           // 重跑只产生新的 AI 总结，人工保存版本始终保留。
           if (!window.confirm('重新理解将产生一个新的 AI 总结版本，当前人工版本会继续保留。是否继续？')) return
