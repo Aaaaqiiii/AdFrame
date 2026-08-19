@@ -219,6 +219,15 @@ def create_generation(project_id: UUID, payload: CreateGenerationRequest, sessio
     duplicate = session.scalar(select(Generation).where(Generation.project_id == project_id, Generation.submission_fingerprint == fingerprint, Generation.status.in_(active_statuses)))
     if duplicate is not None:
         raise HTTPException(status_code=409, detail="相同输入和设置的生成任务已存在")
+    # 旧单端点不得与活动批次任务冲突：该段已有活动 batch 行 → 409。
+    active_batch = session.scalar(select(Generation).where(
+        Generation.project_id == project_id,
+        Generation.generation_segment_id == segment.id,
+        Generation.generation_batch_id.is_not(None),
+        Generation.status.in_(active_statuses),
+    ).limit(1))
+    if active_batch is not None:
+        raise HTTPException(status_code=409, detail="该生成片段已有活动批次任务")
 
     version = (session.scalar(select(func.max(Generation.version)).where(Generation.project_id == project_id)) or 0) + 1
     generation = Generation(

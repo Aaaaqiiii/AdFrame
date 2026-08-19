@@ -3,6 +3,7 @@ from types import SimpleNamespace
 from uuid import UUID, uuid4
 
 from fastapi.testclient import TestClient
+from sqlalchemy import select
 
 from app.db.models import Asset, Generation, GenerationSegment, Project, PromptRevision, Shot, ShotEdit, TimelineRevision
 from app.db.session import SessionLocal
@@ -225,3 +226,32 @@ def test_batch_creation_rejects_stale_plan(client, tmp_path) -> None:
     response = client.post(project.batch_url, json=project.payload)
     assert response.status_code == 422
     assert _generation_count(client, project.project_id) == 0
+
+
+def test_legacy_single_endpoint_conflicts_with_active_batch(client, tmp_path) -> None:
+    """旧单 Generation 端点对已有活动批次任务的片段返回 409。"""
+    project = _batch_project(client, tmp_path)
+    batch = client.post(project.batch_url, json=project.payload)
+    assert batch.status_code == 201
+    # 旧单端点用历史 reference_video_edit 提示词 + 同一 segment。
+    from app.db.models import GenerationSegment
+    with SessionLocal() as session:
+        segment = session.scalar(select(GenerationSegment).where(
+            GenerationSegment.project_id == UUID(project.project_id),
+            GenerationSegment.position == 0,
+        ))
+        legacy = PromptRevision(
+            project_id=UUID(project.project_id), version=98, prompt_mode="reference_video_edit",
+            generation_segment_id=segment.id,
+            source_timeline_revision_id=UUID(project.revision_id),
+            text="00:00.00–00:12.50\n保持：a\n修改：无。\n删除：无。\n禁止：无。", status="completed",
+        )
+        session.add(legacy)
+        session.commit()
+        legacy_version = legacy.version
+    response = client.post(
+        f"/api/projects/{project.project_id}/generations",
+        json={"provider": "volcengine", "prompt_version": legacy_version, "generation_segment_id": str(segment.id)},
+    )
+    assert response.status_code == 409
+    assert "活动批次" in str(response.json()["detail"])
