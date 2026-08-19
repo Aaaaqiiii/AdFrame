@@ -3,8 +3,8 @@ import type { PromptRevisionSummary } from './api'
 import { choosePromptRevision, latestPromptJob, promptTaskFromJobs } from './promptWorkflow'
 
 const revisions: PromptRevisionSummary[] = [
-  { id: 'p3', version: 3, text: 'third', status: 'completed', source_timeline_revision_id: 't2', replace_product: false, replace_person: false, created_at: '2026-08-15T03:00:00Z' },
-  { id: 'p1', version: 1, text: 'first', status: 'completed', source_timeline_revision_id: 't2', replace_product: false, replace_person: false, created_at: '2026-08-15T01:00:00Z' },
+  { id: 'p3', version: 3, text: 'third', status: 'completed', prompt_mode: 'full_reference_video_edit', generation_segment_id: null, source_timeline_revision_id: 't2', replace_product: false, replace_person: false, created_at: '2026-08-15T03:00:00Z' },
+  { id: 'p1', version: 1, text: 'first', status: 'completed', prompt_mode: 'full_reference_video_edit', generation_segment_id: null, source_timeline_revision_id: 't2', replace_product: false, replace_person: false, created_at: '2026-08-15T01:00:00Z' },
 ]
 
 describe('prompt-only recovery', () => {

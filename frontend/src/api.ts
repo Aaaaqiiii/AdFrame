@@ -49,7 +49,32 @@ export type TimelineShot = {
   has_new_ai_summary?: boolean
 }
 export type Timeline = { revision_id: string; source: string; shots: TimelineShot[]; affected_shot_ids?: string[] }
-export type GenerationSummary = { id: string; version: number; status: string; provider: string; result_url?: string | null; local_video_url?: string | null; error_message?: string | null }
+export type GenerationSummary = {
+  id: string
+  version: number
+  status: string
+  provider: string
+  prompt_version?: number
+  generation_segment_id?: string | null
+  generation_batch_id?: string | null
+  batch_position?: number | null
+  batch_size?: number | null
+  result_url?: string | null
+  local_video_url?: string | null
+  error_message?: string | null
+  created_at?: string
+  completed_at?: string | null
+}
+export type BatchStatus = 'queued' | 'processing' | 'complete' | 'partial' | 'failed' | 'uncertain'
+export type GenerationBatch = {
+  generation_batch_id: string
+  project_id: string
+  provider: 'volcengine' | 'comfly'
+  prompt_version: number
+  batch_size: number
+  status: BatchStatus
+  generations: GenerationSummary[]
+}
 
 export type Project = {
   id: string
@@ -101,11 +126,15 @@ export type AnalysisJob = {
   error_message?: string | null
   attempts?: number
 }
+export type PromptMode = 'full_reference_video_edit' | 'reference_video_edit' | 'full_video_description'
 export type PromptRevisionSummary = {
   id: string
   version: number
   text: string
   status: AnalysisState
+  prompt_mode: PromptMode
+  generation_segment_id: string | null
+  error_message?: string | null
   source_timeline_revision_id: string | null
   replace_product: boolean
   replace_person: boolean
@@ -235,8 +264,23 @@ export function saveGenerationSegments(projectId: string, segments: GenerationSe
 export function saveShotEdit(projectId: string, shotId: string, payload: ShotEdit) { return request<ShotEdit>(`/api/projects/${projectId}/shots/${shotId}/edit`, { method: 'PUT', ...json(payload) }) }
 export function getProductCompatibility(projectId: string) { return request<ProductCompatibility>(`/api/projects/${projectId}/product-compatibility`) }
 export function createPrompt(projectId: string, payload: { product_profile: string; visual_direction: string; audio_mode: string; audio_style: string; replace_product: boolean; replace_person: boolean; use_ai: boolean }) { return request<{ version: number; text: string; status: AnalysisState }>(`/api/projects/${projectId}/prompts`, { method: 'POST', ...json(payload) }) }
-export function listPromptRevisions(projectId: string) { return request<PromptRevisionSummary[]>(`/api/projects/${projectId}/prompts?current_timeline_only=true&status=completed`) }
+export function listPromptRevisions(projectId: string, promptMode?: PromptMode) {
+  const query = promptMode ? `&prompt_mode=${promptMode}` : ''
+  return request<PromptRevisionSummary[]>(`/api/projects/${projectId}/prompts?current_timeline_only=true&status=completed${query}`)
+}
 export function refinePrompt(projectId: string, instruction: string, sourceVersion?: number) { return request<{ version: number; text: string; status: AnalysisState }>(`/api/projects/${projectId}/prompts/refine`, { method: 'POST', ...json({ instruction, source_version: sourceVersion }) }) }
 export function publishReferenceVideo(projectId: string) { return request<{ url: string; expires_at: string; notice: string }>(`/api/projects/${projectId}/reference-video/publish`, { method: 'POST' }) }
 export function createGeneration(projectId: string, payload: { provider: string; prompt_version: number; ratio: string; duration: number; generate_audio: boolean; include_person_reference: boolean; include_background_reference: boolean }) { return request<{ id: string; status: string; error_message?: string | null }>(`/api/projects/${projectId}/generations`, { method: 'POST', ...json(payload) }) }
 export function getGeneration(projectId: string, generationId: string) { return request<{ id: string; status: string; result_url?: string | null; local_video_url?: string | null; error_message?: string | null }>(`/api/projects/${projectId}/generations/${generationId}`) }
+
+export function listGenerationBatches(projectId: string) { return request<GenerationBatch[]>(`/api/projects/${projectId}/generation-batches`) }
+export function getGenerationBatch(projectId: string, batchId: string) { return request<GenerationBatch>(`/api/projects/${projectId}/generation-batches/${batchId}`) }
+export function createGenerationBatch(projectId: string, input: { provider: 'volcengine' | 'comfly'; prompt_version: number; generate_audio: boolean; include_person_reference: boolean; include_background_reference: boolean }) {
+  return request<GenerationBatch>(`/api/projects/${projectId}/generation-batches`, { method: 'POST', ...json(input) })
+}
+export function retryGeneration(projectId: string, generationId: string) { return request<GenerationSummary>(`/api/projects/${projectId}/generations/${generationId}/retry`, { method: 'POST' }) }
+export function generationContentUrl(projectId: string, generationId: string) { return mediaUrl(`/api/projects/${projectId}/generations/${generationId}/content`) }
+export function generationDownloadUrl(projectId: string, generationId: string) { return mediaUrl(`/api/projects/${projectId}/generations/${generationId}/content?download=true`) }
+export function optimizePromptSellingPoints(projectId: string, sourceVersion: number) {
+  return request<PromptRevisionSummary>(`/api/projects/${projectId}/prompts/optimize-selling-points`, { method: 'POST', ...json({ source_version: sourceVersion }) })
+}
