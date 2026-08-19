@@ -32,6 +32,8 @@ class Generation(Base):
         Index("ix_generations_project_status", "project_id", "status"),
         Index("ix_generations_status_next_attempt", "status", "next_attempt_at"),
         Index("ix_generations_submission_fingerprint", "submission_fingerprint"),
+        Index("ix_generations_project_batch", "project_id", "generation_batch_id"),
+        Index("ix_generations_batch_position", "generation_batch_id", "batch_position"),
     )
 
     id: Mapped[UUID] = mapped_column(primary_key=True, default=uuid4)
