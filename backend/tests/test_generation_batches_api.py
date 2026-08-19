@@ -11,7 +11,7 @@ from app.main import create_app
 
 
 def _batch_project(client: TestClient, tmp_path, duration_sec=50.0, mode="preserve_product", confirm_shots=True):
-    """50 秒视频 + 4 镜头 + 自动两段方案 + 完整提示词（full_reference_video_edit）。"""
+    """duration_sec 秒视频 + 4 等分镜头 + 自动两段方案 + 完整提示词（full_reference_video_edit）。"""
     project = client.post("/api/projects", json={"name": "batch-project", "mode": mode}).json()
     project_id = UUID(project["id"])
     video_path = tmp_path / "reference.mp4"
@@ -25,7 +25,8 @@ def _batch_project(client: TestClient, tmp_path, duration_sec=50.0, mode="preser
         session.add_all([video, revision])
         session.flush()
         shot_ids = []
-        for index, (start, end) in enumerate([(0.0, 12.5), (12.5, 25.0), (25.0, 37.5), (37.5, 50.0)]):
+        shot_ranges = [(duration_sec * i / 4, duration_sec * (i + 1) / 4) for i in range(4)]
+        for index, (start, end) in enumerate(shot_ranges):
             shot = Shot(timeline_revision_id=revision.id, position=index, start_sec=start, end_sec=end, analysis_status="succeeded")
             session.add(shot)
             session.flush()
@@ -60,7 +61,7 @@ def _batch_project(client: TestClient, tmp_path, duration_sec=50.0, mode="preser
             people_reference=None, background_reference=None, audio_mode="keep_original", audio_style="",
         )
     blocks = []
-    for start, end in [(0.0, 12.5), (12.5, 25.0), (25.0, 37.5), (37.5, 50.0)]:
+    for start, end in shot_ranges:
         blocks.append(f"{_fmt(start)}–{_fmt(end)}\n保持：镜头 {start} 保持正文\n修改：无。\n删除：无。\n禁止：无。")
     full_text = prefix + "\n\n" + "\n\n".join(blocks)
     if confirm_shots:
@@ -255,3 +256,20 @@ def test_legacy_single_endpoint_conflicts_with_active_batch(client, tmp_path) ->
     )
     assert response.status_code == 409
     assert "活动批次" in str(response.json()["detail"])
+
+
+def test_batch_creation_allows_explicitly_accepted_short_segment(client, tmp_path) -> None:
+    """短段已明确确认且方案整体合法时，批次创建成功。"""
+    project = _batch_project(client, tmp_path, duration_sec=40.0)
+    # 手动 3 段方案：0-5(短已确认) 5-29 29-40。
+    plan = client.put(f"/api/projects/{project.project_id}/generation-segments", json={"segments": [
+        {"source_start_sec": 0, "source_end_sec": 5, "start_boundary_type": "video_edge", "end_boundary_type": "inside_shot", "short_segment_accepted": True},
+        {"source_start_sec": 5, "source_end_sec": 29, "start_boundary_type": "inside_shot", "end_boundary_type": "inside_shot", "short_segment_accepted": False},
+        {"source_start_sec": 29, "source_end_sec": 40, "start_boundary_type": "inside_shot", "end_boundary_type": "video_edge", "short_segment_accepted": False},
+    ]})
+    assert plan.status_code == 201
+    response = client.post(project.batch_url, json=project.payload)
+    assert response.status_code == 201
+    body = response.json()
+    assert body["batch_size"] == 3
+    assert [item["batch_position"] for item in body["generations"]] == [1, 2, 3]
