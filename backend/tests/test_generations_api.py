@@ -438,3 +438,25 @@ def test_retry_failed_generation_revalidates_current_segment(client, tmp_path) -
     with SessionLocal() as session:
         generations = session.scalars(select(Generation).where(Generation.project_id == project.project_id)).all()
         assert len(generations) == 1  # 没有创建新任务
+
+
+def test_generation_response_has_nullable_batch_fields(client, tmp_path) -> None:
+    """历史单任务 Generation 响应包含可空 batch 字段（null）。"""
+    ready = _ready_project(client, tmp_path)
+    response = client.post(ready.generations_url, json=ready.payload)
+    assert response.status_code == 202
+    payload = response.json()
+    assert payload["generation_batch_id"] is None
+    assert payload["batch_position"] is None
+    assert payload["batch_size"] is None
+
+
+def test_generation_list_response_includes_batch_fields(client, generation_factory) -> None:
+    """列表响应也包含 batch 字段（null）。"""
+    generation = generation_factory(version=1, status="failed")
+    response = client.get(f"/api/projects/{generation.project_id}/generations")
+    assert response.status_code == 200
+    payload = response.json()[0]
+    assert "generation_batch_id" in payload
+    assert "batch_position" in payload
+    assert "batch_size" in payload

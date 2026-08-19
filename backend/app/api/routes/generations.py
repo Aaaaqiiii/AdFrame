@@ -36,6 +36,9 @@ class GenerationResponse(BaseModel):
     version: int
     prompt_version: int
     generation_segment_id: UUID | None
+    generation_batch_id: UUID | None = None
+    batch_position: int | None = None
+    batch_size: int | None = None
     provider: str
     status: str
     generate_audio: bool
@@ -55,6 +58,9 @@ def generation_response(project_id: UUID, generation: Generation) -> GenerationR
         version=generation.version,
         prompt_version=generation.prompt_version,
         generation_segment_id=generation.generation_segment_id,
+        generation_batch_id=generation.generation_batch_id,
+        batch_position=generation.batch_position,
+        batch_size=generation.batch_size,
         provider=generation.provider,
         status=generation.status,
         generate_audio=generation.generate_audio,

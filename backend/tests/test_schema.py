@@ -4,10 +4,10 @@ from alembic.config import Config
 from alembic.script import ScriptDirectory
 
 
-def test_alembic_has_one_head_at_segment_generations() -> None:
+def test_alembic_has_one_head_at_generation_batches() -> None:
     config = Config(str(Path(__file__).parents[1] / "alembic.ini"))
     script = ScriptDirectory.from_config(config)
-    assert script.get_heads() == ["0005_segment_generations"]
+    assert script.get_heads() == ["0006_generation_batches"]
 
 
 def test_application_does_not_create_production_schema(monkeypatch) -> None:
