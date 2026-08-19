@@ -151,6 +151,13 @@ def _require_batch_retry_inputs(session: Session, project_id: UUID, generation: 
     if prompt.source_timeline_revision_id != current_revision.id:
         raise HTTPException(status_code=422, detail="提示词来自旧时间轴，请重新生成提示词")
     shots = _current_shots(session, current_revision)
+    if not shots:
+        raise HTTPException(status_code=422, detail="当前时间轴没有镜头")
+    unconfirmed = [shot for shot in shots if not session.scalar(
+        select(ShotEdit).where(ShotEdit.project_id == project_id, ShotEdit.shot_id == shot.id, ShotEdit.confirmed.is_(True))
+    )]
+    if unconfirmed:
+        raise HTTPException(status_code=422, detail="时间轴存在未确认镜头，请先确认全部镜头")
     shot_ranges = [(shot.start_sec, shot.end_sec) for shot in shots]
     try:
         validate_full_prompt(prompt.text, shot_ranges)
