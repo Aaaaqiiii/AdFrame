@@ -80,6 +80,34 @@ def _confirmed_product_assets(session: Session, project_id: UUID) -> list[Asset]
     return confirmed
 
 
+def derive_batch_status(statuses: list[str]) -> str:
+    """从各行的持久化状态派生批次状态。
+
+    优先级：
+    1. uncertain：任一 submission_uncertain；
+    2. queued：全部 queued；
+    3. processing：任一 queued/processing/retryable（非全 queued 时）；
+    4. complete：全部 completed；
+    5. partial：至少一个 completed 且至少一个 failed；
+    6. failed：全部 failed。
+    """
+    if not statuses:
+        return "failed"
+    if any(status == "submission_uncertain" for status in statuses):
+        return "uncertain"
+    if all(status == "queued" for status in statuses):
+        return "queued"
+    if any(status in {"queued", "processing", "retryable"} for status in statuses):
+        return "processing"
+    if all(status == "completed" for status in statuses):
+        return "complete"
+    if any(status == "completed" for status in statuses) and any(status == "failed" for status in statuses):
+        return "partial"
+    if all(status == "failed" for status in statuses):
+        return "failed"
+    return "failed"
+
+
 def _provider_key_available(settings: Settings, provider: str) -> bool:
     if provider == "volcengine":
         return bool(settings.volcengine_api_key)
@@ -269,4 +297,58 @@ def create_generation_batch(
         generation_batch_id=batch_id, project_id=project_id, provider=payload.provider,
         prompt_version=payload.prompt_version, batch_size=batch_size, status="queued",
         generations=serialized,
+    )
+
+
+def _batch_generation_rows(session: Session, project_id: UUID, batch_id: UUID) -> list[Generation]:
+    """取批次全部行，每个位置取最新 Generation.version（retry 后旧版本被新版本替代）。"""
+    rows = list(session.scalars(select(Generation).where(
+        Generation.project_id == project_id,
+        Generation.generation_batch_id == batch_id,
+    ).order_by(Generation.batch_position, Generation.version.desc())))
+    latest: dict[int, Generation] = {}
+    for row in rows:
+        latest.setdefault(row.batch_position or 0, row)
+    return [latest[pos] for pos in sorted(latest)]
+
+
+@router.get("", response_model=list[GenerationBatchResponse])
+def list_generation_batches(project_id: UUID, session: Session = Depends(get_session)) -> list[GenerationBatchResponse]:
+    if session.get(Project, project_id) is None:
+        raise HTTPException(status_code=404, detail="项目不存在")
+    batch_ids = session.scalars(
+        select(Generation.generation_batch_id)
+        .where(Generation.project_id == project_id, Generation.generation_batch_id.is_not(None))
+        .distinct()
+    ).all()
+    batches: list[GenerationBatchResponse] = []
+    for batch_id in batch_ids:
+        rows = _batch_generation_rows(session, project_id, batch_id)
+        if not rows:
+            continue
+        first = rows[0]
+        batches.append(GenerationBatchResponse(
+            generation_batch_id=batch_id, project_id=project_id, provider=first.provider,
+            prompt_version=first.prompt_version, batch_size=len(rows),
+            status=derive_batch_status([row.status for row in rows]),
+            generations=[generation_response(project_id, row) for row in rows],
+        ))
+    # 最新批次优先：按任一行的 created_at 排序。
+    batches.sort(key=lambda batch: batch.generations[0].created_at, reverse=True)
+    return batches
+
+
+@router.get("/{batch_id}", response_model=GenerationBatchResponse)
+def get_generation_batch(project_id: UUID, batch_id: UUID, session: Session = Depends(get_session)) -> GenerationBatchResponse:
+    if session.get(Project, project_id) is None:
+        raise HTTPException(status_code=404, detail="项目不存在")
+    rows = _batch_generation_rows(session, project_id, batch_id)
+    if not rows:
+        raise HTTPException(status_code=404, detail="批次不存在")
+    first = rows[0]
+    return GenerationBatchResponse(
+        generation_batch_id=batch_id, project_id=project_id, provider=first.provider,
+        prompt_version=first.prompt_version, batch_size=len(rows),
+        status=derive_batch_status([row.status for row in rows]),
+        generations=[generation_response(project_id, row) for row in rows],
     )

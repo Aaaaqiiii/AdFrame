@@ -5,7 +5,7 @@ from pathlib import Path
 from datetime import datetime, timezone
 from typing import Literal
 
-from fastapi import APIRouter, Depends, HTTPException, status
+from fastapi import APIRouter, Depends, HTTPException, Query, status
 from fastapi.responses import FileResponse
 from pydantic import BaseModel, ConfigDict, Field
 from sqlalchemy import func, select
@@ -120,6 +120,42 @@ def _person_profile_confirmed(asset: Asset | None) -> bool:
 
 def _asset_ids(assets: list[Asset]) -> str:
     return json.dumps([str(asset.id) for asset in assets], ensure_ascii=False)
+
+
+def _require_batch_retry_inputs(session: Session, project_id: UUID, generation: Generation) -> None:
+    """批次行重试校验：full prompt 当前有效 + 该段属于当前最新方案，不查活动重复（单段重试不受兄弟影响）。"""
+    from app.services.full_prompt import FullPromptValidationError, validate_full_prompt
+    current_revision = _current_timeline_revision(session, project_id)
+    if current_revision is None or generation.generation_segment_id is None:
+        raise HTTPException(status_code=422, detail="生成分段已过期，请重新确认分段")
+    segment = session.get(GenerationSegment, generation.generation_segment_id)
+    if segment is None or segment.project_id != project_id or segment.source_timeline_revision_id != current_revision.id:
+        raise HTTPException(status_code=422, detail="生成分段已过期，请重新确认分段")
+    latest_plan = session.scalar(
+        select(func.max(GenerationSegment.plan_version)).where(
+            GenerationSegment.project_id == project_id,
+            GenerationSegment.source_timeline_revision_id == current_revision.id,
+        )
+    )
+    if latest_plan is None or segment.plan_version != latest_plan:
+        raise HTTPException(status_code=422, detail="生成分段已过期，请重新确认分段")
+    if segment.source_end_sec - segment.source_start_sec > Settings().effective_segment_limit_seconds:
+        raise HTTPException(status_code=422, detail="生成片段超过安全时长上限")
+    prompt = session.scalar(select(PromptRevision).where(
+        PromptRevision.project_id == project_id, PromptRevision.version == generation.prompt_version,
+    ))
+    if prompt is None or prompt.status != "completed" or not (prompt.text or "").strip():
+        raise HTTPException(status_code=422, detail="请先生成或保存一份完整提示词")
+    if prompt.prompt_mode != "full_reference_video_edit" or prompt.generation_segment_id is not None:
+        raise HTTPException(status_code=422, detail="批次生成必须使用完整视频编辑提示词")
+    if prompt.source_timeline_revision_id != current_revision.id:
+        raise HTTPException(status_code=422, detail="提示词来自旧时间轴，请重新生成提示词")
+    shots = _current_shots(session, current_revision)
+    shot_ranges = [(shot.start_sec, shot.end_sec) for shot in shots]
+    try:
+        validate_full_prompt(prompt.text, shot_ranges)
+    except FullPromptValidationError as exc:
+        raise HTTPException(status_code=422, detail=f"完整提示词结构无效：{exc}") from exc
 
 
 def _require_current_segment_prompt(session: Session, project_id: UUID, generation_segment_id: UUID, prompt_version: int):
@@ -284,7 +320,10 @@ def retry_generation(project_id: UUID, generation_id: UUID, session: Session = D
         raise HTTPException(status_code=422, detail="只有失败的生成任务可以重试")
     # 分段任务重试必须重新验证片段/提示词/时间轴/方案仍是当前最新且互相匹配，
     # 避免时间轴更新后仍提交旧裁片。
-    if generation.generation_segment_id:
+    if generation.generation_batch_id is not None:
+        # 批次行重试：校验 full prompt 仍是当前完整提示词 + 该段属于当前最新方案。
+        _require_batch_retry_inputs(session, project_id, generation)
+    elif generation.generation_segment_id:
         _require_current_segment_prompt(
             session, project_id, generation.generation_segment_id, generation.prompt_version,
         )
@@ -335,7 +374,12 @@ def resolve_generation(project_id: UUID, generation_id: UUID, payload: ResolveGe
 
 
 @router.get("/{generation_id}/content")
-def get_generated_video(project_id: UUID, generation_id: UUID, session: Session = Depends(get_session)) -> FileResponse:
+def get_generated_video(
+    project_id: UUID,
+    generation_id: UUID,
+    download: bool = Query(False),
+    session: Session = Depends(get_session),
+) -> FileResponse:
     generation = session.get(Generation, generation_id)
     if generation is None or generation.project_id != project_id:
         raise HTTPException(status_code=404, detail="Generation does not exist")
@@ -348,4 +392,9 @@ def get_generated_video(project_id: UUID, generation_id: UUID, session: Session 
     resolved = path.resolve()
     if allowed_root not in resolved.parents and resolved != allowed_root:
         raise HTTPException(status_code=404, detail="Generated video file is not accessible")
+    if download:
+        # attachment：文件名含批次位置，便于按段下载。
+        position = generation.batch_position or generation.version
+        filename = f"segment-{position}.mp4"
+        return FileResponse(path, media_type="video/mp4", filename=filename, content_disposition_type="attachment")
     return FileResponse(path, media_type="video/mp4", filename=path.name)

@@ -462,20 +462,21 @@ def test_generation_list_response_includes_batch_fields(client, generation_facto
     assert "batch_size" in payload
 
 
-def test_retry_preserves_batch_identity(client, generation_factory) -> None:
-    """重试失败 batch 生成时保留 batch_id、position、size。"""
-    from uuid import uuid4
+def test_retry_preserves_batch_identity(client, tmp_path) -> None:
+    """重试失败 batch 生成时保留 batch_id、position、size（需完整 batch 上下文）。"""
+    from tests.test_generation_batches_api import _batch_project
+    project = _batch_project(client, tmp_path)
+    created = client.post(project.batch_url, json=project.payload)
+    assert created.status_code == 201
+    gen_a = created.json()["generations"][0]
     with SessionLocal() as session:
-        generation = session.get(Generation, generation_factory(status="failed").id)
-        batch_id = uuid4()
-        generation.generation_batch_id = batch_id
-        generation.batch_position = 2
-        generation.batch_size = 3
+        generation = session.get(Generation, UUID(gen_a["id"]))
+        generation.status = "failed"
         session.commit()
-        project_id = generation.project_id
-    response = client.post(f"/api/projects/{project_id}/generations/{generation.id}/retry")
+        batch_id = generation.generation_batch_id
+    response = client.post(f"/api/projects/{project.project_id}/generations/{generation.id}/retry")
     assert response.status_code == 202
     payload = response.json()
     assert payload["generation_batch_id"] == str(batch_id)
-    assert payload["batch_position"] == 2
-    assert payload["batch_size"] == 3
+    assert payload["batch_position"] == 1
+    assert payload["batch_size"] == 2

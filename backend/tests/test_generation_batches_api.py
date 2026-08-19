@@ -273,3 +273,92 @@ def test_batch_creation_allows_explicitly_accepted_short_segment(client, tmp_pat
     body = response.json()
     assert body["batch_size"] == 3
     assert [item["batch_position"] for item in body["generations"]] == [1, 2, 3]
+
+
+def test_derive_batch_status_combinations() -> None:
+    from app.api.routes.generation_batches import derive_batch_status
+    assert derive_batch_status(["submission_uncertain", "completed"]) == "uncertain"
+    assert derive_batch_status(["queued", "queued"]) == "queued"
+    assert derive_batch_status(["queued", "processing"]) == "processing"
+    assert derive_batch_status(["processing", "retryable"]) == "processing"
+    assert derive_batch_status(["completed", "completed"]) == "complete"
+    assert derive_batch_status(["completed", "failed"]) == "partial"
+    assert derive_batch_status(["failed", "failed"]) == "failed"
+    assert derive_batch_status([]) == "failed"
+
+
+def test_batch_list_and_detail_status(client, tmp_path) -> None:
+    """list/detail 返回派生状态；detail 404 当批次不属于项目。"""
+    project = _batch_project(client, tmp_path)
+    created = client.post(project.batch_url, json=project.payload)
+    assert created.status_code == 201
+    batch_id = created.json()["generation_batch_id"]
+    # 全 queued → queued。
+    listed = client.get(f"/api/projects/{project.project_id}/generation-batches").json()
+    assert len(listed) == 1
+    assert listed[0]["status"] == "queued"
+    detail = client.get(f"/api/projects/{project.project_id}/generation-batches/{batch_id}").json()
+    assert detail["status"] == "queued"
+    assert [g["batch_position"] for g in detail["generations"]] == [1, 2]
+    # 改一行 completed、一行 failed → partial。
+    with SessionLocal() as session:
+        rows = list(session.scalars(select(Generation).where(Generation.project_id == UUID(project.project_id)).order_by(Generation.batch_position)))
+        rows[0].status = "completed"
+        rows[1].status = "failed"
+        session.commit()
+    detail2 = client.get(f"/api/projects/{project.project_id}/generation-batches/{batch_id}").json()
+    assert detail2["status"] == "partial"
+    # 其他项目批次 → 404。
+    other = client.post("/api/projects", json={"name": "other", "mode": "preserve_product"}).json()
+    missing = client.get(f"/api/projects/{other['id']}/generation-batches/{batch_id}")
+    assert missing.status_code == 404
+
+
+def test_batch_retry_preserves_slot_and_reruns_validation(client, tmp_path) -> None:
+    """retry 失败 batch 行保持槽位；旧时间轴时 422 不建行。"""
+    project = _batch_project(client, tmp_path)
+    created = client.post(project.batch_url, json=project.payload)
+    assert created.status_code == 201
+    rows = created.json()["generations"]
+    gen_a = rows[0]
+    # 标 failed。
+    with SessionLocal() as session:
+        g = session.get(Generation, UUID(gen_a["id"]))
+        g.status = "failed"
+        session.commit()
+    retried = client.post(f"/api/projects/{project.project_id}/generations/{gen_a['id']}/retry")
+    assert retried.status_code == 202
+    payload = retried.json()
+    assert payload["generation_batch_id"] == gen_a["generation_batch_id"]
+    assert payload["batch_position"] == 1
+    assert payload["batch_size"] == 2
+    # 旧时间轴时 retry 422。
+    with SessionLocal() as session:
+        newer = TimelineRevision(project_id=UUID(project.project_id), version=2, source="human")
+        session.add(newer)
+        session.commit()
+    blocked = client.post(f"/api/projects/{project.project_id}/generations/{gen_a['id']}/retry")
+    assert blocked.status_code == 422
+
+
+def test_batch_content_download_filename_has_position(client, tmp_path) -> None:
+    """download=true 时 content 返回 attachment，文件名含批次位置。"""
+    from app.db.models import Generation
+    project = _batch_project(client, tmp_path)
+    created = client.post(project.batch_url, json=project.payload)
+    assert created.status_code == 201
+    from app.core.config import Settings
+    with SessionLocal() as session:
+        row = session.scalar(select(Generation).where(Generation.project_id == UUID(project.project_id), Generation.batch_position == 2))
+        row.status = "completed"
+        result_dir = Settings().media_root / str(project.project_id) / "generated"
+        result_dir.mkdir(parents=True, exist_ok=True)
+        result = result_dir / "v2.mp4"
+        result.write_bytes(b"video")
+        row.result_path = str(result)
+        session.commit()
+        gen_id = row.id
+    response = client.get(f"/api/projects/{project.project_id}/generations/{gen_id}/content?download=true")
+    assert response.status_code == 200
+    assert "attachment" in response.headers.get("content-disposition", "")
+    assert "segment-2.mp4" in response.headers.get("content-disposition", "")
