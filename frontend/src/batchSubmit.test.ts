@@ -25,6 +25,7 @@ describe('batch submit', () => {
     expect(canCreateBatch(plan({ segments: [] }), prompt(), false)).not.toBeNull()
     expect(canCreateBatch(plan(), prompt({ status: 'queued' }), false)).not.toBeNull()
     expect(canCreateBatch(plan(), prompt({ prompt_mode: 'reference_video_edit' }), false)).not.toBeNull()
+    expect(canCreateBatch(plan(), prompt({ text: '' }), false)).not.toBeNull()
     expect(canCreateBatch(plan(), prompt(), true)).not.toBeNull()
   })
 
