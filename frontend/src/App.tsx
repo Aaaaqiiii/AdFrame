@@ -283,23 +283,26 @@ function App() {
     if (success(globalStatus) && timeline?.source === 'vision_hybrid') setAiRevisionId(timeline.revision_id)
   }, [globalStatus, timeline])
 
-  // 批次轮询：仅 selectedBatch 为 queued/processing 时轮询，terminal/unmount 停止。
+  // 批次轮询：仅批次为 queued/processing 时轮询；依赖稳定标识（batch_id + status），
+  // 避免每次 setSelectedBatch 重建 timer；terminal/unmount/项目变更停止。
+  const pollingBatchId = selectedBatch?.generation_batch_id ?? null
+  const pollingBatchStatus = selectedBatch?.status ?? null
   useEffect(() => {
-    if (!projectId || !selectedBatch) return
-    if (selectedBatch.status !== 'queued' && selectedBatch.status !== 'processing') return
+    if (!projectId || !pollingBatchId) return
+    if (pollingBatchStatus !== 'queued' && pollingBatchStatus !== 'processing') return
     let cancelled = false
     let inFlight = false
     const timer = window.setInterval(async () => {
       if (inFlight) return
       inFlight = true
       try {
-        const batch = await getGenerationBatch(projectId, selectedBatch.generation_batch_id)
+        const batch = await getGenerationBatch(projectId, pollingBatchId)
         if (!cancelled) setSelectedBatch(batch)
       } catch { /* 网络错误由下一次轮询或手动刷新覆盖 */ }
       finally { inFlight = false }
     }, 3000)
     return () => { cancelled = true; window.clearInterval(timer) }
-  }, [projectId, selectedBatch])
+  }, [projectId, pollingBatchId, pollingBatchStatus])
 
   async function ensureProject(name = '未命名参考广告') {
     if (projectId) return projectId
