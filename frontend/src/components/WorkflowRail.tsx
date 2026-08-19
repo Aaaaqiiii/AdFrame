@@ -7,6 +7,7 @@ const items: Array<{ id: WorkflowStage; number: string; label: string; note: str
   { id: 'analysis', number: '04', label: '理解分镜', note: '豆包与 GPT 逐镜理解' },
   { id: 'shots', number: '05', label: '确认分镜事实', note: '修改并确认最终总结' },
   { id: 'prompt', number: '06', label: '生成提示词', note: 'GPT 整理，人工校对' },
+  { id: 'generation', number: '07', label: '生成与结果', note: '分批提交并下载结果' },
 ]
 
 type Props = { active: WorkflowStage; unlocked: WorkflowStage[]; onSelect: (stage: WorkflowStage) => void }

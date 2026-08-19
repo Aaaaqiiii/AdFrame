@@ -29,8 +29,8 @@ import {
   uploadReferenceImage,
   uploadReferenceVideo,
 } from './api'
-import type { AnalysisJob, AssetKind, ConnectionCheck, GenerationSegmentInput, GenerationSegmentPlan, Project, ProjectDetails, PromptRevisionSummary, SettingsSaveResult, Timeline, TimelineShot } from './api'
-import { autoPlanGenerationSegments, getGenerationSegments, saveGenerationSegments } from './api'
+import type { AnalysisJob, AssetKind, ConnectionCheck, GenerationBatch, GenerationSegmentInput, GenerationSegmentPlan, Project, ProjectDetails, PromptRevisionSummary, SettingsSaveResult, Timeline, TimelineShot } from './api'
+import { autoPlanGenerationSegments, createGenerationBatch, getGenerationSegments, optimizePromptSellingPoints, saveGenerationSegments } from './api'
 import { AppHeader } from './components/AppHeader'
 import { AnalysisStage } from './components/AnalysisStage'
 import { MaterialsStage } from './components/MaterialsStage'
@@ -106,6 +106,13 @@ function App() {
   const [generationPlan, setGenerationPlan] = useState<GenerationSegmentPlan | null>(null)
   const [segmentBusy, setSegmentBusy] = useState(false)
   const [selectedSegmentId, setSelectedSegmentId] = useState<string | null>(null)
+  const [selectedProvider, setSelectedProvider] = useState<'volcengine' | 'comfly'>('volcengine')
+  const [generateAudio, setGenerateAudio] = useState(false)
+  const [includePersonReference, setIncludePersonReference] = useState(false)
+  const [includeBackgroundReference, setIncludeBackgroundReference] = useState(false)
+  const [optimizeBusy, setOptimizeBusy] = useState(false)
+  const [generationBusy, setGenerationBusy] = useState(false)
+  const [selectedBatch, setSelectedBatch] = useState<GenerationBatch | null>(null)
   const [selectedIds, setSelectedIds] = useState<string[]>([])
   const [selectedBoundary, setSelectedBoundary] = useState<number | null>(null)
   const [playhead, setPlayhead] = useState(0)
@@ -525,6 +532,35 @@ function App() {
     finally { setSegmentBusy(false) }
   }
 
+  async function optimizeSellingPoints() {
+    if (!projectId || !promptVersion) return
+    setOptimizeBusy(true)
+    try {
+      await optimizePromptSellingPoints(projectId, promptVersion)
+      setNotice('卖点优化任务已进入后台，完成后会生成新的提示词版本。')
+      await refreshJobs()
+    } catch (error) { setNotice(`卖点优化失败：${errorMessage(error)}`) }
+    finally { setOptimizeBusy(false) }
+  }
+
+  async function createBatch() {
+    if (!projectId || !generationPlan || !promptVersion) return
+    setGenerationBusy(true)
+    try {
+      const batch = await createGenerationBatch(projectId, {
+        provider: selectedProvider,
+        prompt_version: promptVersion,
+        generate_audio: generateAudio,
+        include_person_reference: includePersonReference,
+        include_background_reference: includeBackgroundReference,
+      })
+      setSelectedBatch(batch)
+      setStage('generation')
+      setNotice(`已创建 ${batch.batch_size} 个生成任务（${batch.provider}）。`)
+    } catch (error) { setNotice(`创建批次失败：${errorMessage(error)}`) }
+    finally { setGenerationBusy(false) }
+  }
+
   async function beginShotAnalysis() {
     if (!projectId || !timelineConfirmed) return
     try {
@@ -655,12 +691,13 @@ function App() {
         {stage === 'analysis' && <AnalysisStage shots={shots} jobs={jobs} onOpenShots={() => { if (!projectId) return; void restoreProject(projectId).then(() => setStage('shots')).catch((error) => setNotice(`读取分镜事实失败：${errorMessage(error)}`)) }} />}
         {stage === 'timeline' && timeline && <TimelineEditor videoUrl={video.previewUrl} videoRatio={videoRatio} videoRef={videoRef} shots={shots} selectedIds={selectedIds} selectedBoundary={selectedBoundary} playhead={playhead} fps={fps} dirty={timelineDirty} saving={timelineSaving} canContinue={timelineConfirmed} onMetadata={(width, height) => { setVideoRatio(`${width} / ${height}`); const element = videoRef.current; if (element && Number.isFinite(element.duration) && element.duration > 0) setFps(25) }} onPlayhead={seekTimeline} onSelectShot={selectTimelineShot} onSelectBoundary={setSelectedBoundary} onMoveBoundary={moveTimelineBoundary} onSplit={splitAtPlayhead} onMerge={mergeSelected} onRestore={() => void restoreAi()} onSave={() => void saveHumanTimeline()} onContinue={() => void beginShotAnalysis()} />}
         {stage === 'segments' && timeline && generationPlan && <GenerationSegmentsEditor projectId={projectId} planVersion={generationPlan.plan_version} timelineRevisionId={generationPlan.timeline_revision_id} segments={generationPlan.segments} shots={timeline.shots} durationSec={videoRef.current?.duration || shots[shots.length - 1]?.end_sec || 0} maxSegmentSeconds={generationPlan.max_segment_seconds} recommendedMinSeconds={generationPlan.recommended_min_seconds} busy={segmentBusy} selectedSegmentId={selectedSegmentId} onSelectSegment={setSelectedSegmentId} onAutoPlan={() => void autoPlanSegments()} onSave={(inputs) => void saveSegmentPlan(inputs)} onRestoreAuto={() => { if (!timelineConfirmed) return; void autoPlanSegments() }} />}
+        {stage === 'generation' && <section className="stage-content generation-stage"><div className="stage-heading"><div><span className="eyebrow">第七步</span><h1>生成与结果</h1><p>批次生成任务与结果在此展示。</p></div><span className="version-badge">{selectedBatch ? `${selectedBatch.provider} · ${selectedBatch.batch_size} 段 · ${selectedBatch.status}` : '尚未提交批次'}</span></div><div className="generation-placeholder">生成结果组件将在下一步接入。</div></section>}
         {stage === 'shots' && <ShotWorkspace shots={shots} selectedId={selectedShotId} jobs={jobs} edit={shotEdit} saving={shotSaving} mode={MODE} compatibility={null} onSelect={setSelectedShotId} onEdit={setShotEdit} onSave={(confirmed) => void saveCurrentShot(confirmed)} onAdoptAI={(id) => void adoptLatestAI(id)} onRetry={(id) => {
           // 重跑只产生新的 AI 总结，人工保存版本始终保留。
           if (!window.confirm('重新理解将产生一个新的 AI 总结版本，当前人工版本会继续保留。是否继续？')) return
           void retryShotAnalysis(projectId, id).then(refreshJobs).catch((error) => setNotice(`重试失败：${errorMessage(error)}`))
         }} onOpenPrompt={() => setStage('prompt')} />}
-        {stage === 'prompt' && <PromptStage mode={MODE} prompt={promptText} direction={promptDirection} refinement={promptRefinement} promptVersion={promptVersion} versions={promptVersions} selectedVersion={promptVersion} taskStatus={latestPromptJob(jobs)} personReady={success(materials.person.status) && Boolean(materials.person.profile.trim())} replacePerson={replacePerson} busy={promptTask} blockingReason={!timelineConfirmed ? '人工时间轴尚未确认。' : !allShotJobsDone ? '逐镜理解尚未全部完成。' : !shots.every((shot) => shot.edit?.confirmed) ? '请先确认每个镜头的最终事实。' : ''} onPrompt={setPromptText} onDirection={setPromptDirection} onRefinement={setPromptRefinement} onReplacePerson={setReplacePerson} onSelectVersion={(version) => { const selected = choosePromptRevision(promptVersions, version); setPromptVersion(selected?.version ?? 0); setPromptText(selected?.text ?? '') }} onSave={() => void savePrompt(false)} onGenerate={() => void savePrompt(true)} onRefine={() => void refineCurrentPrompt()} person={materials.person} onPerson={(file) => void uploadImage('person', file)} onPersonRetry={() => void retryProfile('person')} onPersonProfile={(profile) => setMaterials((old) => ({ ...old, person: { ...old.person, profile } }))} onPersonProfileSave={() => void saveProfile('person')} />}
+        {stage === 'prompt' && <PromptStage mode={MODE} prompt={promptText} direction={promptDirection} refinement={promptRefinement} promptVersion={promptVersion} versions={promptVersions} selectedVersion={promptVersion} taskStatus={latestPromptJob(jobs)} personReady={success(materials.person.status) && Boolean(materials.person.profile.trim())} replacePerson={replacePerson} busy={promptTask} blockingReason={!timelineConfirmed ? '人工时间轴尚未确认。' : !allShotJobsDone ? '逐镜理解尚未全部完成。' : !shots.every((shot) => shot.edit?.confirmed) ? '请先确认每个镜头的最终事实。' : ''} onPrompt={setPromptText} onDirection={setPromptDirection} onRefinement={setPromptRefinement} onReplacePerson={setReplacePerson} onSelectVersion={(version) => { const selected = choosePromptRevision(promptVersions, version); setPromptVersion(selected?.version ?? 0); setPromptText(selected?.text ?? '') }} onSave={() => void savePrompt(false)} onGenerate={() => void savePrompt(true)} onRefine={() => void refineCurrentPrompt()} person={materials.person} onPerson={(file) => void uploadImage('person', file)} onPersonRetry={() => void retryProfile('person')} onPersonProfile={(profile) => setMaterials((old) => ({ ...old, person: { ...old.person, profile } }))} onPersonProfileSave={() => void saveProfile('person')} generationPlan={generationPlan} selectedPromptRevision={choosePromptRevision(promptVersions, promptVersion) ?? null} selectedProvider={selectedProvider} generateAudio={generateAudio} includePersonReference={includePersonReference} includeBackgroundReference={includeBackgroundReference} optimizeBusy={optimizeBusy} generationBusy={generationBusy} onOptimizeSellingPoints={() => void optimizeSellingPoints()} onProviderChange={setSelectedProvider} onGenerateAudioChange={setGenerateAudio} onIncludePersonReferenceChange={setIncludePersonReference} onIncludeBackgroundReferenceChange={setIncludeBackgroundReference} onCreateBatch={() => void createBatch()} />}
       </div>
     </div>
     <div className="global-notice" role="status"><i />{notice}</div>

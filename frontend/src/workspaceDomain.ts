@@ -1,5 +1,5 @@
 export type ProjectMode = 'preserve_product' | 'replace_product'
-export type WorkflowStage = 'materials' | 'analysis' | 'timeline' | 'segments' | 'shots' | 'prompt'
+export type WorkflowStage = 'materials' | 'analysis' | 'timeline' | 'segments' | 'shots' | 'prompt' | 'generation'
 
 export function modeFromPath(pathname: string): ProjectMode {
   return pathname.startsWith('/replace-product') ? 'replace_product' : 'preserve_product'

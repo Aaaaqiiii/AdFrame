@@ -429,3 +429,14 @@ button, .button { border: 0; font: inherit; cursor: pointer; }
 .segment-actions .segment-inside-toggle { margin-left: auto; }
 .segment-card.not-selectable { cursor: not-allowed; opacity: 0.85; }
 .segment-short-accept.muted { color: var(--muted); }
+
+/* 批次生成控制 */
+.generation-controls { margin: 18px 30px 0; padding: 16px; border: 1px solid var(--line); border-radius: 12px; background: #fff; }
+.generation-controls-heading { display: flex; align-items: baseline; gap: 10px; margin-bottom: 12px; }
+.generation-controls-heading strong { font-size: 15px; }
+.generation-controls-heading span { color: var(--muted); font-size: 12px; }
+.generation-controls-row { display: flex; gap: 14px; align-items: center; flex-wrap: wrap; margin-bottom: 12px; }
+.generation-controls-row label { display: inline-flex; align-items: center; gap: 6px; font-size: 13px; }
+.generation-controls-row select { padding: 6px 10px; border: 1px solid var(--line); border-radius: 6px; }
+.generation-controls > .button { width: 100%; }
+.generation-placeholder { padding: 40px; text-align: center; color: var(--muted); border: 1px dashed var(--line); border-radius: 12px; margin: 18px 30px; }
