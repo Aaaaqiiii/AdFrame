@@ -447,9 +447,10 @@ def transform_full_prompt(
     """
     source_document = validate_full_prompt(source_text, expected_shot_ranges, required_prefixes=required_prefixes)
     source_prefix = source_document.global_prefix
-    # 源正文（仅时间块部分）。
-    source_body = source_text[source_text.index("00:"):].rstrip() if "00:" in source_text else ""
     labels = expected_full_prompt_labels(expected_shot_ranges)
+    # 源正文（仅时间块部分）：用第一个预期标签精确定位，避免前缀中的 “00:” 被误切。
+    first_label = labels[0] if labels else ""
+    source_body = source_text[source_text.index(first_label):].rstrip() if first_label and first_label in source_text else ""
     # 只发送时间块正文给 GPT，避免模型改写前缀。
     revised = _chat(settings, [
         {"role": "system", "content": (

@@ -224,3 +224,25 @@ def test_segment_derivation_repeated_is_byte_identical():
     first = derive_segment_prompt(document, segment_start_sec=18.0, segment_end_sec=32.0, batch_position=2, batch_size=3)
     second = derive_segment_prompt(document, segment_start_sec=18.0, segment_end_sec=32.0, batch_position=2, batch_size=3)
     assert first == second
+
+
+def test_transform_source_body_not_misled_by_prefix_colon():
+    """源正文定位用第一个时间标签，前缀中的 00: 不会被误切成正文起点。"""
+    from unittest.mock import patch
+    from app.services.final_prompt import build_full_prompt_prefix, transform_full_prompt
+    from app.core.config import Settings
+    prefix = (
+        "全局规则：视频第 00:12 秒开始，音量 00:00。\n"
+        + build_full_prompt_prefix(project_mode="preserve_product", product_profile="", product_image_purposes=[], people_reference=None, background_reference=None, audio_mode="keep_original", audio_style="")
+    )
+    source = prefix + "\n\n" + "00:00.00–00:04.00\n保持：a\n修改：无。\n删除：无。\n禁止：无。"
+    with patch("app.services.final_prompt._chat", return_value="00:00.00–00:04.00\n保持：a\n修改：无。\n删除：无。\n禁止：无。"):
+        result = transform_full_prompt(
+            settings=Settings(comfly_api_key="x"),
+            source_text=source,
+            instruction="增强光线",
+            expected_shot_ranges=[(0.0, 4.0)],
+            required_prefixes=("原参考视频是时间轴", "禁止新增字幕"),
+            project_mode="preserve_product",
+        )
+    assert result.startswith(prefix)
