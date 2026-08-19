@@ -44,7 +44,7 @@
 ### 自动化测试总数（本环境 FFmpeg 可用，0 跳过）
 
 - 后端全量：**279 passed**（含媒体测试，无环境跳过）
-- 前端：**57 tests passed**，lint 干净，build 通过
+- 前端：**59 tests passed**（14 个测试文件），lint 干净，build 通过
 - Alembic head：`0006_generation_batches`
 
 ## 2. 无花销本地/API 冒烟（未向任何供应商发送）
