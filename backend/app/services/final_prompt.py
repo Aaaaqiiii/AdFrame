@@ -662,16 +662,24 @@ def execute_selling_point_optimization_job(session: Session, job: Job, settings:
     if not source_text or revision.prompt_mode != "full_reference_video_edit":
         raise ValueError("待优化版本不是完整提示词快照")
     shot_ranges = [(shot.start_sec, shot.end_sec) for shot in session.scalars(select(Shot).where(Shot.timeline_revision_id == revision.source_timeline_revision_id).order_by(Shot.position))]
-    instruction = (
-        "根据已确认产品卖点优化各镜头的产品表现：决定每个卖点最适合出现在哪些已存在镜头；"
-        "把抽象卖点转换为可生成的材质、光影、动作结果或产品状态；减少多个镜头对同一卖点的机械重复；"
-        "保持前后镜头营销逻辑一致。只可编辑时间块的 修改 栏目。"
-        "不得改变时间标签、分镜数量或顺序；不得删除任何栏目；"
-        "不得为表现卖点增加不存在的新场景或人物动作；"
-        "不得虚构用户未提供的功效、认证、成分、数据或包装文字；"
-        "不得添加字幕、卖点贴纸、浮层文字或水印；"
-        "不得把无法自然表现的卖点强行塞入所有镜头。"
-    )
+    if project.mode == "replace_product":
+        instruction = (
+            "根据已确认产品卖点优化各镜头的产品表现：决定每个卖点最适合出现在哪些已存在镜头；"
+            "把抽象卖点转换为可生成的材质、光影、动作结果或产品状态；减少多个镜头对同一卖点的机械重复；"
+            "保持前后镜头营销逻辑一致。只可编辑时间块的 修改 栏目。"
+            "不得改变时间标签、分镜数量或顺序；不得删除任何栏目；"
+            "不得为表现卖点增加不存在的新场景或人物动作；"
+            "不得虚构用户未提供的功效、认证、成分、数据或包装文字；"
+            "不得添加字幕、卖点贴纸、浮层文字或水印；"
+            "不得把无法自然表现的卖点强行塞入所有镜头。"
+        )
+    else:
+        instruction = (
+            "优化各镜头对原产品的表现：减少机械重复、提升表现清晰度，保持原产品不变。"
+            "只可编辑时间块的 修改 栏目。不得改变时间标签、分镜数量或顺序；不得删除任何栏目；"
+            "不得为表现增加不存在的新场景或人物动作；不得虚构功效、认证、成分、数据或包装文字；"
+            "不得添加字幕、贴纸、浮层文字或水印。"
+        )
     try:
         optimized = transform_full_prompt(
             settings=settings,
