@@ -14,7 +14,8 @@ describe('prompt-only recovery', () => {
     expect(choosePromptRevision([])).toBeUndefined()
   })
 
-  it('restores an active refinement or generation task', () => {
+  it('restores an active refinement, generation, or optimization task', () => {
+    expect(promptTaskFromJobs([{ job_id: 'o', kind: 'prompt_selling_point_optimization', status: 'queued' }])).toBe('optimize')
     expect(promptTaskFromJobs([{ job_id: 'r', kind: 'prompt_refinement', status: 'retryable' }])).toBe('refine')
     expect(promptTaskFromJobs([{ job_id: 'g', kind: 'final_prompt_generation', status: 'queued' }])).toBe('generate')
     expect(promptTaskFromJobs([{ job_id: 'f', kind: 'prompt_refinement', status: 'failed' }])).toBeNull()

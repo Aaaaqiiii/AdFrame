@@ -127,7 +127,7 @@ function App() {
   const [promptDirection, setPromptDirection] = useState('保持原视频的镜头时长、动作节奏、构图、运镜与原BGM。')
   const [promptRefinement, setPromptRefinement] = useState('')
   const [replacePerson, setReplacePerson] = useState(false)
-  const [promptTask, setPromptTask] = useState<'generate' | 'refine' | null>(null)
+  const [promptTask, setPromptTask] = useState<'generate' | 'refine' | 'optimize' | null>(null)
   const [promptVersion, setPromptVersion] = useState(0)
   const [promptVersions, setPromptVersions] = useState<PromptRevisionSummary[]>([])
   const [preflight, setPreflight] = useState<Record<string, { ready: boolean; model: string; endpoint: string }> | null>(null)
@@ -539,6 +539,7 @@ function App() {
       await optimizePromptSellingPoints(projectId, promptVersion)
       setNotice('卖点优化任务已进入后台，完成后会生成新的提示词版本。')
       await refreshJobs()
+      await restorePromptVersions(projectId, promptVersion)
     } catch (error) { setNotice(`卖点优化失败：${errorMessage(error)}`) }
     finally { setOptimizeBusy(false) }
   }

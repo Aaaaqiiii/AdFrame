@@ -11,7 +11,7 @@ type Props = {
   promptVersion: number
   personReady: boolean
   replacePerson: boolean
-  busy: 'generate' | 'refine' | null
+  busy: 'generate' | 'refine' | 'optimize' | null
   versions: PromptRevisionSummary[]
   selectedVersion: number
   taskStatus?: AnalysisJob
