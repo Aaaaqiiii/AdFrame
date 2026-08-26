@@ -74,7 +74,7 @@ Invoke-RestMethod http://127.0.0.1:8011/api/health
 
 ## 6. 检查 Worker 进程
 
-后台会启动一个隐藏 PowerShell 运行 `python -m app.worker`。确认其存在：
+后台默认会启动 3 个 AI Worker 与 2 个生成 Worker。AI Worker 并行处理逐镜视觉分析和提示词；生成 Worker 每次只领取一个片段，避免某段参考素材上传超时阻塞整个批次。可通过启动脚本的 `-AiWorkers`、`-GenerationWorkers` 调整并发数。确认其存在：
 
 ```powershell
 Get-CimInstance Win32_Process -Filter "Name='python.exe'" | Where-Object { $_.CommandLine -match 'app.worker' }

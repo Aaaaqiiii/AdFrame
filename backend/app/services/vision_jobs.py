@@ -16,7 +16,7 @@ from app.services.worker_state import MAX_ATTEMPTS, retry_at
 def _write_shot_facts(shot: Shot, content: str) -> None:
     bundle = __import__("json").loads(content)
     final = bundle.get("final", bundle)
-    # 用户只看到综合结果；豆包与GPT原始输出另存后台审计表。
+    # 用户只看到规范化结果；Qwen原始输出另存后台审计表。
     facts = parse_vision_facts(__import__("json").dumps({"summary": "", "shots": [{"start_sec": 0, "end_sec": 1, **final}], "observations": ""}, ensure_ascii=False))
     fact = facts.shots[0] if facts.shots else None
     shot.people = fact.people if fact else None
@@ -85,11 +85,9 @@ def execute_vision_job(session: Session, job: Job, gateway: VisionGateway) -> Jo
                 if shot is None:
                     raise ValueError("The selected shot is missing")
                 bundle = __import__("json").loads(result.content)
-                # 两份中间判断只在后台保留，既不返回前端，也不参与最终提示词。
-                for provider in ("doubao_full_shot", "gpt_keyframes"):
-                    key = "doubao" if provider.startswith("doubao") else "gpt"
-                    if key in bundle:
-                        session.add(VideoAnalysis(project_id=job.project_id, job_id=job.id, shot_id=shot.id, provider=provider, raw_content=__import__("json").dumps(bundle[key], ensure_ascii=False)))
+                # 原始模型判断只在后台保留，既不返回前端，也不参与最终提示词。
+                if "qwen" in bundle:
+                    session.add(VideoAnalysis(project_id=job.project_id, job_id=job.id, shot_id=shot.id, provider="qwen_full_shot", raw_content=__import__("json").dumps(bundle["qwen"], ensure_ascii=False)))
                 latest_version = session.scalar(select(func.max(ShotAISummary.version)).where(ShotAISummary.shot_id == shot.id)) or 0
                 session.add(ShotAISummary(shot_id=shot.id, version=latest_version + 1, content=__import__("json").dumps(bundle.get("final", bundle), ensure_ascii=False)))
                 _write_shot_facts(shot, result.content)

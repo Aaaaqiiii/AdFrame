@@ -94,8 +94,8 @@ def test_prompt_revisions_are_saved_with_audio_choice() -> None:
     assert response.status_code == 201
     assert response.json()["version"] == 1
     assert response.json()["status"] == "completed"
-    assert response.json()["text"] == text
+    assert "完整移除原片全部包装外字幕" in response.json()["text"]
     with SessionLocal() as session:
         revision = session.scalar(select(PromptRevision).where(PromptRevision.project_id == UUID(project["id"])))
-        assert revision.audio_mode == "add_style"
+        assert revision.audio_mode == "custom"
         assert revision.audio_style == "轻盈钢琴"

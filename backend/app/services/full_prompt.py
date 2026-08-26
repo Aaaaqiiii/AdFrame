@@ -36,6 +36,10 @@ class FullPromptDocument:
     blocks: tuple[PromptBlock, ...]
 
 
+def _floor_centiseconds(value: float) -> int:
+    return math.floor(value * 100 + 1e-9)
+
+
 def format_time_label(start_sec: float, end_sec: float) -> str:
     """Format an absolute source-time label; supports more than one minute digit.
 
@@ -43,7 +47,7 @@ def format_time_label(start_sec: float, end_sec: float) -> str:
     from arithmetic) always maps to the same label as the intended 4.12.
     """
     def stamp(value: float) -> str:
-        total_centis = math.floor(value * 100 + 1e-9)
+        total_centis = _floor_centiseconds(value)
         minutes, centis = divmod(total_centis, 6000)
         seconds, centis = divmod(centis, 100)
         return f"{minutes:02d}:{seconds:02d}.{centis:02d}"
@@ -186,21 +190,24 @@ def derive_segment_prompt(
     batch_position: int,
     batch_size: int,
 ) -> str:
-    """Deterministically derive a segment-relative provider prompt.
+    """Derive the concise, segment-relative prompt actually sent to the provider.
 
-    Clips each intersecting block to the segment and converts to segment-relative
-    time. The original deterministic prefix plus a server-owned batch/segment
-    identification line are preserved. Bodies are copied byte-for-byte after
-    newline normalization.
+    The editable four-column document remains the audit/source format. Provider
+    input deliberately omits ``keep`` because source content is only a weak
+    reference: the video locks shot form and motion, while ``modify/delete/forbid``
+    state the intended result without re-locking obsolete people, products or text.
     """
     if segment_end_sec - segment_start_sec <= EPSILON:
         raise FullPromptValidationError("生成片段为空")
-    if segment_start_sec < -EPSILON or segment_end_sec > document.blocks[-1].source_end_sec + EPSILON:
+    if (
+        segment_start_sec < -EPSILON
+        or _floor_centiseconds(segment_end_sec) > _floor_centiseconds(document.blocks[-1].source_end_sec)
+    ):
         raise FullPromptValidationError("生成片段超出提示词覆盖范围")
     parts: list[str] = []
     if document.global_prefix:
         parts.append(document.global_prefix)
-    parts.append(f"片段 {batch_position}/{batch_size}：原视频 {format_time_label(segment_start_sec, segment_end_sec)} 的局部编辑指令")
+    parts.append(f"片段 {batch_position}/{batch_size}：对应视频1 {format_time_label(segment_start_sec, segment_end_sec)}")
     block_count = 0
     for block in document.blocks:
         overlap_start = max(block.source_start_sec, segment_start_sec)
@@ -211,9 +218,10 @@ def derive_segment_prompt(
         relative_end = overlap_end - segment_start_sec
         block_count += 1
         parts.append(format_time_label(relative_start, relative_end))
-        parts.append(f"保持：{block.keep}")
-        parts.append(f"修改：{block.modify}")
-        parts.append(f"删除：{block.delete}")
+        parts.append("镜头形式：参考视频1对应时间段的原视频格式、镜头边界、机位、构图、运镜、动作轨迹和节奏。")
+        parts.append("未改内容：除下列改动、清理和禁止项外，其余已确认画面事实沿用视频1；不得恢复已要求替换的人物、产品或包装外文字。")
+        parts.append(f"改后动作：{block.modify}")
+        parts.append(f"画面清理：{block.delete}")
         parts.append(f"禁止：{block.forbid}")
         parts.append("")
     if block_count == 0:

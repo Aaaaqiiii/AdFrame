@@ -11,7 +11,16 @@ from app.db.session import SessionLocal
 from app.main import create_app
 from app.services.final_prompt import generate_final_prompt, refine_prompt
 from app.services.media import VideoMetadata
-from app.services.reference_profiles import _consolidate_product_profiles, load_structure
+from app.services.reference_profiles import (
+    _consolidate_product_profiles,
+    _is_transient_profile_error,
+    _post_chat,
+    build_selling_point_cards,
+    compact_person_profile,
+    load_structure,
+    parse_product_profile_output,
+    product_prompt_profile,
+)
 
 
 def test_generated_replacement_prompt_always_contains_product_lock() -> None:
@@ -100,10 +109,108 @@ def test_prompt_request_retries_a_transient_proxy_disconnect() -> None:
     sleep.assert_called_once_with(1)
 
 
+def test_reference_profile_request_retries_a_transient_proxy_disconnect() -> None:
+    success = MagicMock()
+    settings = type("Settings", (), {
+        "comfly_api_key": "configured",
+        "comfly_vision_base_url": "https://example.invalid",
+    })()
+
+    with (
+        patch(
+            "app.services.reference_profiles.requests.post",
+            side_effect=[requests.exceptions.ProxyError("temporary disconnect"), success],
+        ) as post,
+        patch("app.services.reference_profiles.time.sleep") as sleep,
+    ):
+        assert _post_chat(settings, {"model": "test-model", "messages": []}) is success
+
+    assert post.call_count == 2
+    sleep.assert_called_once_with(1)
+
+
+def test_reference_profile_job_only_retries_transient_provider_errors() -> None:
+    retryable_response = requests.Response()
+    retryable_response.status_code = 503
+    retryable = requests.exceptions.HTTPError(response=retryable_response)
+    terminal_response = requests.Response()
+    terminal_response.status_code = 400
+    terminal = requests.exceptions.HTTPError(response=terminal_response)
+
+    assert _is_transient_profile_error(requests.exceptions.ProxyError("disconnect")) is True
+    assert _is_transient_profile_error(retryable) is True
+    assert _is_transient_profile_error(terminal) is False
+    assert _is_transient_profile_error(ValueError("bad payload")) is False
+
+
+def test_person_profile_is_one_compact_server_rendered_anchor() -> None:
+    raw = """```json
+{"basic":"年轻成年女性，身形修长","hair":"黑色中高丸子头","clothing":"灰褐色短袖上衣与同色长裤","distinctive":"无"}
+```"""
+
+    profile = compact_person_profile(raw)
+
+    assert profile == (
+        "年轻成年女性，身形修长，黑色中高丸子头，灰褐色短袖上衣与同色长裤。"
+        "身份、基础发色和体型跨镜头一致；发型、湿干状态、表情和服装按已确认镜头适配，连续场景内保持一致。"
+    )
+    assert len(profile) <= 140
+    assert "五官" not in profile
+    assert len(compact_person_profile(
+        '{"basic":"年轻女性","hair":"黑色长发","clothing":"' + "灰" * 200 + '","distinctive":"无"}'
+    )) == 140
+
+
+def test_product_profile_separates_editable_facts_from_runtime_anchor() -> None:
+    fact_sheet, structure = parse_product_profile_output('''```json
+{"fact_sheet":"同一发膜罐的正面、背面和开口图。","visual_anchor":"低矮圆形乳白罐，圆盖，开口后可见白色膏体。","interaction_rules":["可手持、旋转、开盖和取用膏体"],"immutable":["罐体比例与标签位置不变"],"uncertainties":[]}
+```''')
+    asset = Asset(
+        kind="product_reference_image", original_path="unused.png",
+        profile_text=fact_sheet,
+        profile_json=__import__("json").dumps({
+            "product_name": "舒蕾发膜", "product_category": "发膜", "package_form": "jar",
+            **structure,
+        }, ensure_ascii=False),
+    )
+
+    runtime = product_prompt_profile([asset])
+
+    assert fact_sheet == "同一发膜罐的正面、背面和开口图。"
+    assert "产品名称：舒蕾发膜；产品类别：发膜；主包装：罐装" in runtime
+    assert "视觉锚点：低矮圆形乳白罐" in runtime
+    assert "允许互动：可手持、旋转、开盖和取用膏体" in runtime
+    assert "同一发膜罐的正面" not in runtime
+
+
+def test_selling_point_cards_keep_claims_and_mark_non_visual_claims() -> None:
+    cards = build_selling_point_cards("产品核心卖点：\n白色膏体质地轻盈；72小时长效顺滑；双重蛋白配方")
+
+    assert [card["claim"] for card in cards] == ["白色膏体质地轻盈", "72小时长效顺滑", "双重蛋白配方"]
+    assert cards[0]["presentation"] == "visual"
+    assert cards[1]["presentation"] == "audio"
+    assert cards[2]["presentation"] == "audio"
+
+
+def test_selling_point_cards_deduplicate_and_preserve_audience_pains() -> None:
+    cards = build_selling_point_cards("""产品核心卖点：
+0硅油配方（不闷头皮，不压塌发根）；双重蛋白配方；四重神经酰胺复配
+核心卖点（使用体验转化点）
+乳霜质地；冲水不滑腻；吹干自然水光；不塌发根；香型高级；持久留香；0硅油配方
+人群痛点（转化点）
+频繁烫染导致干枯分叉；天生粗硬炸毛；发根容易扁塌；通勤人群没有时间去理发店护理""")
+
+    assert sum("0硅油" in card["claim"] for card in cards) == 1
+    assert any(card["type"] == "audience_pain" and "干枯分叉" in card["claim"] for card in cards)
+    assert any(card["type"] == "audience_pain" and "扁塌" in card["claim"] for card in cards)
+    assert len(cards) <= 24
+    assert [card["id"] for card in cards] == [f"SP{index}" for index in range(1, len(cards) + 1)]
+
+
 def test_person_profile_can_be_created_without_an_image() -> None:
     """没有人物照片时，纯文字档案也必须持久化并可恢复。"""
     client = TestClient(create_app())
-    project = client.post("/api/projects", json={"name": "text-person", "mode": "replace_product"}).json()
+    project = client.post("/api/projects", json={"name": "text-person", "mode": "preserve_product"}).json()
     description = "25岁左右女性，黑色齐肩直发，白色衬衫，自然妆容，亲和微笑"
 
     saved = client.put(
@@ -117,6 +224,53 @@ def test_person_profile_can_be_created_without_an_image() -> None:
     assert details["person_reference_image_name"] is None
     assert details["person_profile"] == description
 
+    timeline = client.put(
+        f"/api/projects/{project['id']}/timeline",
+        json={"shots": [{"start_sec": 0, "end_sec": 3}]},
+    ).json()
+    saved_shot = client.put(
+        f"/api/projects/{project['id']}/shots/{timeline['shots'][0]['id']}/edit",
+        json={"people": "原视频男性出镜", "action": "正面展示", "confirmed": True},
+    )
+    assert saved_shot.status_code == 200
+
+    prompt = client.post(
+        f"/api/projects/{project['id']}/prompts",
+        json={"visual_direction": "替换人物", "replace_person": True, "use_ai": True},
+    )
+    assert prompt.status_code == 202
+    assert "已确认人物文字档案是人物身份和整体外观的最高优先级" in prompt.json()["text"]
+    assert "人物参考图" not in prompt.json()["text"]
+
+
+def test_saving_multi_image_profile_returns_the_combined_failure_status() -> None:
+    """Saving the latest view must not hide a failed sibling behind a success badge."""
+    client = TestClient(create_app())
+    project = client.post("/api/projects", json={"name": "combined status", "mode": "replace_product"}).json()
+    with SessionLocal() as session:
+        session.add(Asset(
+            project_id=UUID(project["id"]), kind="product_reference_image",
+            original_path="failed-front.png", original_filename="front.png",
+            analysis_status="failed", analysis_error="参考图片理解失败：temporary disconnect",
+            profile_json='{"view_label":"front","display_name":"正面"}',
+        ))
+        session.add(Asset(
+            project_id=UUID(project["id"]), kind="product_reference_image",
+            original_path="back.png", original_filename="back.png",
+            analysis_status="succeeded", profile_text="背面可见事实",
+            profile_json='{"view_label":"back","display_name":"背面"}',
+        ))
+        session.commit()
+
+    saved = client.put(
+        f"/api/projects/{project['id']}/product-profile",
+        json={"profile": "人工确认的产品事实", "structure": {"summary_confirmed": True}},
+    )
+
+    assert saved.status_code == 200
+    assert saved.json()["status"] == "failed"
+    assert "temporary disconnect" in saved.json()["error"]
+
 
 def test_page_two_collects_product_images_and_forces_replacement() -> None:
     """页面二的产品多图必须属于同一项目，且替换规则不能被请求关闭。"""
@@ -129,7 +283,11 @@ def test_page_two_collects_product_images_and_forces_replacement() -> None:
         for name, view in (("front.png", "front"), ("side.png", "right")):
             response = client.post(
                 f"/api/projects/{project['id']}/reference-images/product",
-                data={"view_label": view, "note": f"{view} view", "product_name": "测试产品", "selling_points": "清晰展示包装"},
+                data={
+                    "view_label": view, "note": f"{view} view",
+                    "product_name": "测试产品", "product_category": "发膜",
+                    "package_form": "jar", "selling_points": "清晰展示包装",
+                },
                 files={"file": (name, b"stored-image", "image/png")},
             )
             assert response.status_code == 202
@@ -153,7 +311,11 @@ def test_page_two_collects_product_images_and_forces_replacement() -> None:
 
     confirmed = client.put(
         f"/api/projects/{project['id']}/product-profile",
-        json={"profile": details["product_profile"], "structure": {"product_name": "测试产品", "selling_points": "清晰展示包装", "summary_confirmed": True}},
+        json={"profile": details["product_profile"], "structure": {
+            "product_name": "测试产品", "product_category": "发膜",
+            "package_form": "jar", "selling_points": "清晰展示包装",
+            "summary_confirmed": True,
+        }},
     )
     assert confirmed.status_code == 200
 
@@ -171,12 +333,13 @@ def test_page_two_collects_product_images_and_forces_replacement() -> None:
         json={"action": "展示", "confirmed": True},
     )
     from app.services.final_prompt import build_full_prompt_prefix
-    from app.api.routes.projects import _combined_reference_profile
+    from app.services.reference_profiles import product_prompt_profile, product_selling_point_cards
     with SessionLocal() as session:
         assets = session.scalars(select(Asset).where(
             Asset.project_id == UUID(project["id"]), Asset.kind == "product_reference_image",
         ).order_by(Asset.id)).all()
-        product_profile = _combined_reference_profile(assets) or ""
+        product_profile = product_prompt_profile(assets)
+        selling_point_cards = product_selling_point_cards(assets)
         purposes = []
         for asset in assets:
             structure = load_structure(asset)
@@ -187,6 +350,7 @@ def test_page_two_collects_product_images_and_forces_replacement() -> None:
         build_full_prompt_prefix(
             project_mode="replace_product", product_profile=product_profile,
             product_image_purposes=purposes,
+            selling_point_cards=selling_point_cards,
             people_reference=None, background_reference=None,
             audio_mode="keep_original", audio_style="",
         ) + "\n\n"

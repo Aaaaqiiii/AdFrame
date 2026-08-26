@@ -18,14 +18,17 @@ type Props = {
   deferMultiple?: boolean
   images?: Array<{ filename: string; previewUrl: string }>
   allowManualProfile?: boolean
+  profileHint?: string
+  deleting?: boolean
   onFile: (file: File) => void
   onFiles?: (files: File[]) => void
   onRetry?: () => void
   onProfile?: (value: string) => void
   onSaveProfile?: () => void
+  onDelete?: () => void
 }
 
-export function AssetCard({ title, description, required, filename, previewUrl, accept, status, error, profile, uploading, multiple, deferMultiple, images = [], allowManualProfile, onFile, onFiles, onRetry, onProfile, onSaveProfile }: Props) {
+export function AssetCard({ title, description, required, filename, previewUrl, accept, status, error, profile, uploading, multiple, deferMultiple, images = [], allowManualProfile, profileHint, deleting, onFile, onFiles, onRetry, onProfile, onSaveProfile, onDelete }: Props) {
   const input = useRef<HTMLInputElement>(null)
   const [pendingFiles, setPendingFiles] = useState<Array<{ file: File; previewUrl: string }>>([])
   const [dragging, setDragging] = useState(false)
@@ -65,7 +68,7 @@ export function AssetCard({ title, description, required, filename, previewUrl, 
   const storedImages = images.length ? images : previewUrl ? [{ filename: filename || title, previewUrl }] : []
   const displayedImages = [...storedImages, ...pendingFiles.map((item) => ({ filename: item.file.name, previewUrl: item.previewUrl }))]
   return <article className={`asset-card ${filename ? 'has-file' : ''}`}>
-    <header><div><span className="eyebrow">{required ? '必填素材' : '可选素材'}</span><h3>{title}</h3></div>{filename && <StatusBadge status={status} />}</header>
+    <header><div><span className="eyebrow">{required ? '必填素材' : '可选素材'}</span><h3>{title}</h3></div><div className="asset-header-actions">{filename && <StatusBadge status={status} />}{onDelete && (filename || profile) && <button type="button" className="button danger compact" disabled={deleting} onClick={onDelete}>{deleting ? '删除中…' : '删除'}</button>}</div></header>
     <p>{description}</p>
     {!image && previewUrl && <video className="asset-video-preview" src={previewUrl} controls preload="metadata">浏览器无法播放这个视频。</video>}
     <div className={`asset-drop ${dragging ? 'dragging' : ''}`} onClick={() => input.current?.click()} onDragEnter={(event) => { event.preventDefault(); setDragging(true) }} onDragOver={(event) => { event.preventDefault(); setDragging(true) }} onDragLeave={() => setDragging(false)} onDrop={dropped} role="button" tabIndex={0} onKeyDown={(event) => { if (event.key === 'Enter') input.current?.click() }}>
@@ -80,7 +83,7 @@ export function AssetCard({ title, description, required, filename, previewUrl, 
     {dropError && <div className="inline-error"><span>{dropError}</span></div>}
     {error && <div className="inline-error"><span>{error}</span>{onRetry && <button onClick={onRetry}>重试理解</button>}</div>}
     {(filename || allowManualProfile) && image && <div className="profile-editor">
-      <label>{filename ? 'AI 文字档案' : '人物文字档案'} <small>{filename ? '图片不会默认提交给 Seedance' : '没有照片也可以直接填写'}</small></label>
+      <label>{filename ? 'AI 文字档案' : '人物文字档案'} <small>{filename ? profileHint || '图片仅用于生成已确认的文字档案' : '没有照片也可以直接填写'}</small></label>
       <textarea autoComplete="off" value={profile || ''} onChange={(event) => onProfile?.(event.target.value)} placeholder={allowManualProfile && !filename ? '例如：25岁左右女性，黑色齐肩直发，白色衬衫，自然妆容，亲和微笑。' : status === 'failed' ? '理解失败，可重试；也可以人工填写档案。' : 'AI 理解完成后会在这里生成可编辑文字档案。'} />
       {profile && onSaveProfile && <button className="button compact" onClick={onSaveProfile}>{filename ? '保存人工校对' : '保存人物文字档案'}</button>}
     </div>}

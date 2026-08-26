@@ -15,6 +15,8 @@ from app.core.config import Settings
 from app.db.models import Asset, Generation, GenerationSegment, Project, PromptRevision, Shot, ShotEdit, TimelineRevision
 from app.db.session import get_session
 from app.services.product_compatibility import check_product_compatibility
+from app.services.final_prompt import generation_prompt_contract_ready, person_replacement_contract_ready
+from app.services.product_rules import confirmed_generation_product_assets
 from app.services.reference_profiles import load_structure
 from app.services.seedance import JsonTaskGateway, build_seedance_request
 
@@ -27,6 +29,7 @@ class CreateGenerationRequest(BaseModel):
     prompt_version: int = Field(gt=0)
     generation_segment_id: UUID
     generate_audio: bool = False
+    # 兼容旧客户端；服务端始终根据提示词和已上传素材自动附加参考图。
     include_person_reference: bool = False
     include_background_reference: bool = False
 
@@ -101,17 +104,8 @@ def _current_shots(session: Session, revision: TimelineRevision) -> list[Shot]:
 
 
 def _confirmed_product_assets(session: Session, project_id: UUID) -> list[Asset]:
-    assets = list(session.scalars(select(Asset).where(Asset.project_id == project_id, Asset.kind == "product_reference_image").order_by(Asset.id)))
-    confirmed = []
-    for asset in assets:
-        if not asset.profile_text or not asset.profile_text.strip():
-            continue
-        if asset.analysis_status not in {"succeeded", "completed"}:
-            continue
-        if not load_structure(asset).get("summary_confirmed"):
-            continue
-        confirmed.append(asset)
-    return confirmed
+    project = session.get(Project, project_id)
+    return confirmed_generation_product_assets(session, project) if project else []
 
 
 def _person_profile_confirmed(asset: Asset | None) -> bool:
@@ -148,6 +142,10 @@ def _require_batch_retry_inputs(session: Session, project_id: UUID, generation: 
         raise HTTPException(status_code=422, detail="请先生成或保存一份完整提示词")
     if prompt.prompt_mode != "full_reference_video_edit" or prompt.generation_segment_id is not None:
         raise HTTPException(status_code=422, detail="批次生成必须使用完整视频编辑提示词")
+    if prompt.replace_person and not person_replacement_contract_ready(prompt.text):
+        raise HTTPException(status_code=422, detail="当前人物替换提示词仍使用旧版冲突规则，请重新生成提示词后再提交视频")
+    if not generation_prompt_contract_ready(prompt.text, prompt.visual_direction):
+        raise HTTPException(status_code=422, detail="当前提示词仍使用旧版参考范围或文字清理规则，请重新生成提示词后再提交视频")
     if prompt.source_timeline_revision_id != current_revision.id:
         raise HTTPException(status_code=422, detail="提示词来自旧时间轴，请重新生成提示词")
     shots = _current_shots(session, current_revision)
@@ -208,6 +206,8 @@ def create_generation(project_id: UUID, payload: CreateGenerationRequest, sessio
     segment, prompt, current_revision, shots = _require_current_segment_prompt(
         session, project_id, payload.generation_segment_id, payload.prompt_version,
     )
+    if prompt.replace_person and not person_replacement_contract_ready(prompt.text):
+        raise HTTPException(status_code=422, detail="当前人物替换提示词仍使用旧版冲突规则，请重新生成提示词后再提交视频")
     video = session.scalar(select(Asset).where(Asset.project_id == project_id, Asset.kind == "reference_video").order_by(Asset.id.desc()))
     if video is None:
         raise HTTPException(status_code=422, detail="请先上传参考视频")
@@ -215,6 +215,7 @@ def create_generation(project_id: UUID, payload: CreateGenerationRequest, sessio
     _require_provider_key(payload.provider)
 
     assets: list[Asset] = [video]
+    prompt_reference_assets: list[Asset] = []
     if project.mode == "replace_product":
         product_assets = _confirmed_product_assets(session, project_id)
         if not product_assets:
@@ -228,21 +229,32 @@ def create_generation(project_id: UUID, payload: CreateGenerationRequest, sessio
                 "conflicts": conflicts,
             })
         assets.extend(product_assets)
+        prompt_reference_assets.extend(product_assets)
+    person = session.scalar(select(Asset).where(Asset.project_id == project_id, Asset.kind == "person_reference_image").order_by(Asset.id.desc()))
     if prompt.replace_person:
-        person = session.scalar(select(Asset).where(Asset.project_id == project_id, Asset.kind == "person_reference_image").order_by(Asset.id.desc()))
         if person is None or not _person_profile_confirmed(person):
-            raise HTTPException(status_code=422, detail="选择替换人物前，请先上传并确认人物图片档案")
-        if not payload.include_person_reference:
-            raise HTTPException(status_code=422, detail="提示词已开启人物替换，必须包含人物参考图")
-        assets.append(person)
-    elif payload.include_person_reference:
-        raise HTTPException(status_code=422, detail="提示词未开启人物替换，不能包含人物参考图")
-    if payload.include_background_reference:
-        background = session.scalar(select(Asset).where(Asset.project_id == project_id, Asset.kind == "background_reference_image").order_by(Asset.id.desc()))
-        if background is None:
-            raise HTTPException(status_code=422, detail="请求包含背景参考图，但项目没有背景参考图素材")
+            raise HTTPException(status_code=422, detail="选择替换人物前，请先确认人物文字档案或人物图片档案")
+    if person is not None:
+        prompt_reference_assets.append(person)
+        if (person.original_path or "").strip():
+            assets.append(person)
+    background = session.scalar(select(Asset).where(Asset.project_id == project_id, Asset.kind == "background_reference_image").order_by(Asset.id.desc()))
+    if background is not None:
         assets.append(background)
+        prompt_reference_assets.append(background)
+    if prompt.reference_asset_ids:
+        try:
+            frozen_ids = [UUID(value) for value in json.loads(prompt.reference_asset_ids)]
+        except (TypeError, ValueError, json.JSONDecodeError) as exc:
+            raise HTTPException(status_code=422, detail="提示词参考素材快照损坏，请重新生成提示词") from exc
+        frozen_assets = [asset for asset_id in frozen_ids if (asset := session.get(Asset, asset_id)) is not None and asset.project_id == project_id]
+        if len(frozen_assets) != len(frozen_ids):
+            raise HTTPException(status_code=422, detail="提示词引用的参考素材已不存在，请重新生成提示词")
+        if {asset.id for asset in frozen_assets} != {asset.id for asset in prompt_reference_assets}:
+            raise HTTPException(status_code=422, detail="人物、产品或背景参考素材已更新，请重新生成或保存提示词后再提交视频")
+        assets = [video, *(asset for asset in frozen_assets if (asset.original_path or "").strip())]
 
+    generate_audio = prompt.audio_mode in {"auto", "custom", "add_style"}
     fingerprint_payload = {
         "project_id": str(project.id),
         "timeline_revision_id": str(current_revision.id),
@@ -252,7 +264,7 @@ def create_generation(project_id: UUID, payload: CreateGenerationRequest, sessio
         "segment_end_sec": segment.source_end_sec,
         "prompt_revision_id": str(prompt.id),
         "provider": payload.provider,
-        "generate_audio": payload.generate_audio,
+        "generate_audio": generate_audio,
         "asset_ids": [str(item.id) for item in assets],
     }
     fingerprint = hashlib.sha256(
@@ -281,7 +293,7 @@ def create_generation(project_id: UUID, payload: CreateGenerationRequest, sessio
         provider=payload.provider,
         ratio="adaptive",
         duration=-1,
-        generate_audio=payload.generate_audio,
+        generate_audio=generate_audio,
         status="queued",
         reference_asset_ids=_asset_ids(assets),
         submission_fingerprint=fingerprint,
@@ -334,6 +346,20 @@ def retry_generation(project_id: UUID, generation_id: UUID, session: Session = D
         _require_current_segment_prompt(
             session, project_id, generation.generation_segment_id, generation.prompt_version,
         )
+    if "reference video duration could not be read" in (generation.error_message or "").lower():
+        # 已被供应商拒绝的公网对象不能在新任务中继续复用；片段和整段两条路径都清理。
+        segment = session.get(GenerationSegment, generation.generation_segment_id) if generation.generation_segment_id else None
+        if segment is not None:
+            segment.public_url = None
+            segment.public_url_expires_at = None
+        try:
+            video_id = UUID(json.loads(generation.reference_asset_ids or "[]")[0])
+        except (IndexError, TypeError, ValueError, json.JSONDecodeError):
+            video_id = None
+        video = session.get(Asset, video_id) if video_id else None
+        if video is not None and video.kind == "reference_video":
+            video.public_url = None
+            video.public_url_expires_at = None
     version = (session.scalar(select(func.max(Generation.version)).where(Generation.project_id == project_id)) or 0) + 1
     retried = Generation(
         project_id=project_id,
@@ -344,8 +370,8 @@ def retry_generation(project_id: UUID, generation_id: UUID, session: Session = D
         batch_position=generation.batch_position,
         batch_size=generation.batch_size,
         provider=generation.provider,
-        ratio="adaptive",
-        duration=-1,
+        ratio=generation.ratio,
+        duration=generation.duration,
         generate_audio=generation.generate_audio,
         status="queued",
         reference_asset_ids=generation.reference_asset_ids,

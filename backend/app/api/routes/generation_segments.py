@@ -118,6 +118,9 @@ def _validated_current_plan_context(session: Session, project_id: UUID) -> tuple
 def _persist_plan(session: Session, project_id: UUID, revision: TimelineRevision, drafts: list[SegmentDraft]) -> GenerationSegmentPlanResponse:
     """Lock the project row, bump plan_version, and persist one immutable plan."""
     session.execute(select(Project).where(Project.id == project_id).with_for_update())
+    current_revision = _current_timeline_revision(session, project_id)
+    if current_revision is None or current_revision.id != revision.id:
+        raise HTTPException(status_code=409, detail="时间轴刚刚被其他页面更新，请基于最新时间轴重新规划")
     plan_version = _next_project_plan_version(session, project_id)
     rows = [
         GenerationSegment(

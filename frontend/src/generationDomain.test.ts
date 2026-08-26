@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest'
-import { batchProgress, batchStatusLabel, canResolveUncertain, canRetryGeneration, chooseLatestFullPrompt, generationStatusLabel, isBatchActive, latestGenerationPerPosition } from './generationDomain'
+import { batchProgress, batchStatusLabel, canResolveUncertain, canRetryGeneration, chooseLatestFullPrompt, chooseRestoredGenerationBatch, generationPhaseLabel, generationStatusLabel, isBatchActive, latestGenerationPerPosition } from './generationDomain'
 import type { GenerationBatch, GenerationSummary, PromptRevisionSummary } from './api'
 
 const gen = (overrides: Partial<GenerationSummary> = {}): GenerationSummary => ({
@@ -89,6 +89,17 @@ describe('generation domain', () => {
 })
 
 describe('generation stage domain', () => {
+  it('keeps historical results reachable after returning to a different prompt version', () => {
+    const older: GenerationBatch = {
+      generation_batch_id: 'b1', project_id: 'p1', provider: 'volcengine',
+      prompt_version: 3, batch_size: 1, status: 'complete', generations: [],
+    }
+    const latest: GenerationBatch = { ...older, generation_batch_id: 'b2', prompt_version: 5 }
+    expect(chooseRestoredGenerationBatch([latest, older], 3)?.generation_batch_id).toBe('b1')
+    expect(chooseRestoredGenerationBatch([latest, older], 8)?.generation_batch_id).toBe('b2')
+    expect(chooseRestoredGenerationBatch([], 8)).toBeNull()
+  })
+
   it('maps generation statuses to labels', () => {
     expect(generationStatusLabel('queued')).toBe('排队中')
     expect(generationStatusLabel('processing')).toBe('生成中')
@@ -97,6 +108,12 @@ describe('generation stage domain', () => {
     expect(generationStatusLabel('failed')).toBe('失败')
     expect(generationStatusLabel('submission_uncertain')).toBe('提交状态不确定')
     expect(generationStatusLabel('unknown')).toBe('未知状态')
+  })
+
+  it('distinguishes reference upload from provider generation', () => {
+    expect(generationPhaseLabel(gen({ status: 'processing', external_task_id: null }))).toBe('正在上传参考素材…')
+    expect(generationPhaseLabel(gen({ status: 'processing', external_task_id: 'task-1' }))).toBe('生成中')
+    expect(generationPhaseLabel(gen({ status: 'retryable', external_task_id: null }))).toBe('参考素材上传失败，等待自动重试')
   })
 
   it('uncertain generation needs manual resolve, not retry', () => {

@@ -6,20 +6,26 @@ from pathlib import Path
 from typing import Literal
 from uuid import UUID, uuid4
 
-from fastapi import APIRouter, Depends, File, Form, HTTPException, Query, Response, UploadFile, status
+from fastapi import APIRouter, Depends, File, Form, Header, HTTPException, Query, Response, UploadFile, status
 from fastapi.responses import FileResponse
 from pydantic import BaseModel, ConfigDict, Field
-from sqlalchemy import func, select
+from sqlalchemy import delete, func, select
 from sqlalchemy.orm import Session
 
 from app.core.config import Settings
-from app.db.models import Asset, GenerationSegment, Job, Project, PromptRevision, Shot, ShotAISummary, ShotEdit, ShotEvidence, TimelineRevision
-from app.services.final_prompt import actionable_segment_text, build_full_prompt_prefix, expected_segment_labels, missing_segment_prompt_blocks
+from app.db.models import Asset, Generation, GenerationSegment, Job, Project, PromptRevision, Shot, ShotAISummary, ShotEdit, ShotEvidence, TimelineRevision, VideoAnalysis
+from app.services.final_prompt import actionable_segment_text, build_full_prompt_prefix, expected_segment_labels, missing_segment_prompt_blocks, normalize_full_prompt_contract, validate_recreation_prompt
 from app.services.full_prompt import FullPromptValidationError, parse_full_prompt, validate_full_prompt
 from app.db.session import get_session
 from app.services.media import MediaToolUnavailableError, probe_video
 from app.services.tempfile_publisher import TempfilePublisher
-from app.services.reference_profiles import load_structure, queue_profile_job
+from app.services.reference_profiles import (
+    build_selling_point_cards,
+    load_structure,
+    product_prompt_profile,
+    product_selling_point_cards,
+    queue_profile_job,
+)
 from app.services.product_compatibility import check_product_compatibility
 from app.services.product_rules import confirmed_target_product_assets, contains_product_replacement
 
@@ -29,9 +35,20 @@ IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".webp"}
 PRODUCT_VIEW_LABELS = {"front", "left", "right", "back", "top", "bottom", "packaging", "logo", "opening", "detail", "other"}
 
 
+def _next_prompt_version(session: Session, project_id: UUID) -> int:
+    session.execute(select(Project).where(Project.id == project_id).with_for_update())
+    return (session.scalar(
+        select(func.max(PromptRevision.version)).where(PromptRevision.project_id == project_id)
+    ) or 0) + 1
+
+
 class CreateProjectRequest(BaseModel):
     name: str = Field(min_length=1, max_length=200)
     mode: str = Field(default="preserve_product", pattern="^(preserve_product|replace_product)$")
+
+
+class UpdateProjectRequest(BaseModel):
+    name: str = Field(min_length=1, max_length=200)
 
 
 class ProjectResponse(BaseModel):
@@ -107,6 +124,8 @@ class ProjectDetailsResponse(ProjectResponse):
     product_analysis_status: str | None
     product_analysis_error: str | None
     product_name: str = ""
+    product_category: str = ""
+    product_package_form: str = ""
     product_selling_points: str = ""
     product_profile_confirmed: bool = False
     target_product_reference_image_name: str | None
@@ -186,13 +205,14 @@ class PromptValidationRequest(BaseModel):
 
 
 class CreatePromptRequest(BaseModel):
-    product_profile: str = Field(default="", max_length=4000)
-    visual_direction: str = Field(min_length=1, max_length=8000)
+    visual_direction: str = Field(default="", max_length=8000)
+    prompt_text: str = Field(default="", max_length=200_000)
     audio_mode: str = "keep_original"
     audio_style: str = Field(default="", max_length=500)
     replace_product: bool = False
     replace_person: bool = False
     use_ai: bool = True
+    prompt_mode: Literal["full_reference_video_edit", "standalone_video_recreation"] = "full_reference_video_edit"
     generation_segment_id: UUID | None = None
 
 
@@ -226,6 +246,8 @@ class PromptResponse(BaseModel):
     version: int
     text: str
     status: str = "completed"
+    adaptation_count: int = 0
+    adaptation_conflicts: list[dict] = Field(default_factory=list)
 
 
 class PromptRevisionSummary(BaseModel):
@@ -238,6 +260,9 @@ class PromptRevisionSummary(BaseModel):
     generation_segment_id: UUID | None = None
     replace_product: bool
     replace_person: bool
+    visual_direction: str
+    audio_mode: str
+    audio_style: str
     created_at: datetime
 
 
@@ -283,6 +308,8 @@ def get_project(project_id: UUID, session: Session = Depends(get_session)) -> Pr
         .where(TimelineRevision.project_id == project_id)
         .order_by(TimelineRevision.version.desc())
     )
+    if revision and revision.source == "reference_replaced":
+        revision = None
     timeline = None
     if revision:
         shots = session.scalars(
@@ -316,9 +343,10 @@ def get_project(project_id: UUID, session: Session = Depends(get_session)) -> Pr
     target_product_asset = target_product_assets[-1] if target_product_assets else None
     latest_prompt = session.scalar(select(PromptRevision).where(
         PromptRevision.project_id == project_id,
+        PromptRevision.source_timeline_revision_id == revision.id,
         PromptRevision.status == "completed",
         PromptRevision.text != "",
-    ).order_by(PromptRevision.version.desc()))
+    ).order_by(PromptRevision.version.desc())) if revision else None
     return ProjectDetailsResponse(
         id=project.id,
         name=project.name,
@@ -345,6 +373,8 @@ def get_project(project_id: UUID, session: Session = Depends(get_session)) -> Pr
         product_analysis_status=_combined_analysis_status(product_assets),
         product_analysis_error="\n".join(item.analysis_error for item in product_assets if item.analysis_error) or None,
         product_name=str((load_structure(product_asset) if product_asset else {}).get("product_name") or ""),
+        product_category=str((load_structure(product_asset) if product_asset else {}).get("product_category") or ""),
+        product_package_form=str((load_structure(product_asset) if product_asset else {}).get("package_form") or ""),
         product_selling_points=str((load_structure(product_asset) if product_asset else {}).get("selling_points") or ""),
         product_profile_confirmed=_product_profile_confirmed(product_assets),
         target_product_reference_image_name=target_product_asset.original_filename if target_product_asset else None,
@@ -372,6 +402,82 @@ def get_project(project_id: UUID, session: Session = Depends(get_session)) -> Pr
     )
 
 
+@router.patch("/{project_id}", response_model=ProjectResponse)
+def update_project(
+    project_id: UUID,
+    payload: UpdateProjectRequest,
+    session: Session = Depends(get_session),
+) -> Project:
+    project = session.get(Project, project_id)
+    if project is None:
+        raise HTTPException(status_code=404, detail="项目不存在")
+    name = payload.name.strip()
+    if not name:
+        raise HTTPException(status_code=422, detail="项目名称不能为空")
+    project.name = name
+    session.commit()
+    session.refresh(project)
+    return project
+
+
+@router.delete("/{project_id}")
+def delete_project(project_id: UUID, session: Session = Depends(get_session)) -> dict[str, bool]:
+    project = session.scalar(select(Project).where(Project.id == project_id).with_for_update())
+    if project is None:
+        raise HTTPException(status_code=404, detail="项目不存在")
+    active_job = session.scalar(select(Job.id).where(
+        Job.project_id == project_id,
+        Job.kind != "extract_media",
+        Job.status.in_(["queued", "uploaded", "processing", "retryable"]),
+    ).limit(1))
+    active_generation = session.scalar(select(Generation.id).where(
+        Generation.project_id == project_id,
+        Generation.status.in_(["queued", "processing", "retryable", "submission_uncertain"]),
+    ).limit(1))
+    if active_job is not None or active_generation is not None:
+        raise HTTPException(status_code=409, detail="项目仍有活动任务，请等待任务结束或处理状态不确定的生成任务后再删除")
+
+    media_root = Settings().media_root.resolve()
+    project_dir = (media_root / str(project_id)).resolve()
+    if project_dir.parent != media_root:
+        raise HTTPException(status_code=500, detail="项目媒体目录不安全，已拒绝删除")
+    trash_dir: Path | None = None
+    if project_dir.is_dir():
+        trash_dir = media_root / ".trash" / f"{project_id}-{uuid4().hex}"
+        trash_dir.parent.mkdir(parents=True, exist_ok=True)
+        project_dir.replace(trash_dir)
+
+    timeline_ids = select(TimelineRevision.id).where(TimelineRevision.project_id == project_id)
+    shot_ids = select(Shot.id).where(Shot.timeline_revision_id.in_(timeline_ids))
+    try:
+        session.execute(delete(VideoAnalysis).where(VideoAnalysis.project_id == project_id))
+        session.execute(delete(Generation).where(Generation.project_id == project_id))
+        session.execute(delete(Job).where(Job.project_id == project_id))
+        session.execute(delete(PromptRevision).where(PromptRevision.project_id == project_id))
+        session.execute(delete(GenerationSegment).where(GenerationSegment.project_id == project_id))
+        session.execute(delete(ShotAISummary).where(ShotAISummary.shot_id.in_(shot_ids)))
+        session.execute(delete(ShotEvidence).where(ShotEvidence.shot_id.in_(shot_ids)))
+        session.execute(delete(ShotEdit).where(ShotEdit.project_id == project_id))
+        session.execute(delete(Shot).where(Shot.timeline_revision_id.in_(timeline_ids)))
+        session.execute(delete(TimelineRevision).where(TimelineRevision.project_id == project_id))
+        session.execute(delete(Asset).where(Asset.project_id == project_id))
+        session.execute(delete(Project).where(Project.id == project_id))
+        session.commit()
+    except Exception:
+        session.rollback()
+        if trash_dir and trash_dir.exists() and not project_dir.exists():
+            trash_dir.replace(project_dir)
+        raise
+
+    media_deleted = True
+    if trash_dir and trash_dir.exists():
+        try:
+            shutil.rmtree(trash_dir)
+        except OSError:
+            media_deleted = False
+    return {"deleted": True, "media_deleted": media_deleted}
+
+
 @router.get("/{project_id}/prompts", response_model=list[PromptRevisionSummary])
 def list_prompt_revisions(
     project_id: UUID,
@@ -380,6 +486,7 @@ def list_prompt_revisions(
     generation_segment_id: UUID | None = None,
     prompt_mode: Literal[
         "full_reference_video_edit",
+        "standalone_video_recreation",
         "reference_video_edit",
         "full_video_description",
     ] | None = Query(default=None),
@@ -524,6 +631,61 @@ def get_reference_image_asset_content(project_id: UUID, reference_kind: str, ass
     return FileResponse(path, media_type=asset.content_type or mimetypes.guess_type(path.name)[0] or "image/jpeg", filename=asset.original_filename or path.name)
 
 
+@router.delete("/{project_id}/reference-images/{reference_kind}")
+def delete_reference_image(project_id: UUID, reference_kind: str, session: Session = Depends(get_session)) -> dict[str, int | bool]:
+    if reference_kind not in {"person", "background"}:
+        raise HTTPException(status_code=422, detail="这里只能删除人物或背景参考图")
+    if session.get(Project, project_id) is None:
+        raise HTTPException(status_code=404, detail="项目不存在")
+    assets = _reference_images(session, project_id, _asset_kind(reference_kind))
+    if not assets:
+        return {"deleted": 0, "media_deleted": True}
+
+    asset_ids = {str(asset.id) for asset in assets}
+    active_generation = None
+    for item in session.scalars(select(Generation).where(
+        Generation.project_id == project_id,
+        Generation.status.in_(["queued", "processing", "retryable", "submission_uncertain"]),
+    )):
+        try:
+            referenced_ids = json.loads(item.reference_asset_ids or "[]")
+        except json.JSONDecodeError:
+            continue
+        if asset_ids.intersection(referenced_ids):
+            active_generation = item
+            break
+    if active_generation is not None:
+        raise HTTPException(status_code=409, detail="该参考图正在用于视频生成，请等待当前生成任务结束后再删除")
+
+    profile_jobs = list(session.scalars(select(Job).where(
+        Job.project_id == project_id,
+        Job.kind == "reference_profile_analysis",
+        Job.provider_input_id.in_(asset_ids),
+        Job.status.in_(["pending", "queued", "uploaded", "processing", "retryable"]),
+    )))
+    if any(job.leased_at is not None or job.status in {"uploaded", "processing"} for job in profile_jobs):
+        raise HTTPException(status_code=409, detail="该参考图仍在分析中，请等待分析结束后再删除")
+    for job in profile_jobs:
+        job.status, job.error_message = "superseded", "参考图已删除，旧分析任务已作废"
+
+    paths = [Path(asset.original_path) for asset in assets if asset.original_path]
+    session.execute(delete(Asset).where(Asset.id.in_([asset.id for asset in assets])))
+    session.commit()
+
+    media_root = Settings().media_root.resolve()
+    media_deleted = True
+    for path in paths:
+        resolved = path.resolve()
+        if not resolved.is_relative_to(media_root):
+            media_deleted = False
+            continue
+        try:
+            resolved.unlink(missing_ok=True)
+        except OSError:
+            media_deleted = False
+    return {"deleted": len(assets), "media_deleted": media_deleted}
+
+
 @router.patch("/{project_id}/reference-images/{reference_kind}/{asset_id}", response_model=ReferenceImageDetails)
 def update_reference_image(
     project_id: UUID,
@@ -605,6 +767,38 @@ def upload_reference_video(
         destination.unlink(missing_ok=True)
         raise HTTPException(status_code=422, detail="视频文件无法解码，请确认文件能正常播放，并优先使用 H.264 编码的 MP4") from exc
 
+    session.execute(select(Project).where(Project.id == project_id).with_for_update())
+    previous_assets = list(session.scalars(select(Asset).where(
+        Asset.project_id == project_id,
+        Asset.kind == "reference_video",
+    ).with_for_update()))
+    previous_asset = previous_assets[0] if previous_assets else None
+    active_video_job_kinds = {
+        "extract_media", "vision_analysis", "vision_shot_analysis",
+        "final_prompt_generation", "prompt_refinement", "prompt_selling_point_optimization",
+    }
+    active_jobs = list(session.scalars(select(Job).where(
+        Job.project_id == project_id,
+        Job.kind.in_(active_video_job_kinds),
+        Job.status.in_(["pending", "queued", "uploaded", "processing", "retryable"]),
+    ).with_for_update()))
+    blocking_jobs = [job for job in active_jobs if job.leased_at is not None or job.status in {"uploaded", "processing"}]
+    if previous_asset is not None and blocking_jobs:
+        destination.unlink(missing_ok=True)
+        raise HTTPException(status_code=409, detail="当前仍有参考视频任务正在处理，请等待任务结束后再替换视频")
+    if previous_asset is not None:
+        for old_job in active_jobs:
+            old_job.status, old_job.error_message = "superseded", "参考视频已替换，旧任务已作废"
+            old_job.leased_at, old_job.leased_by = None, None
+            if old_job.provider_input_id and old_job.kind in {
+                "final_prompt_generation", "prompt_refinement", "prompt_selling_point_optimization",
+            }:
+                old_prompt = session.get(PromptRevision, UUID(old_job.provider_input_id))
+                if old_prompt:
+                    old_prompt.status, old_prompt.error_message = "superseded", "参考视频已替换，旧提示词任务已作废"
+        for old_asset in previous_assets:
+            old_asset.kind = "reference_video_history"
+
     asset = Asset(
         project_id=project_id, kind="reference_video", original_path=str(destination), original_filename=filename,
         content_type=mimetypes.guess_type(filename)[0] or file.content_type, size_bytes=total_bytes,
@@ -612,6 +806,16 @@ def upload_reference_video(
     )
     job = Job(project_id=project_id, kind="extract_media", status="pending")
     session.add_all([asset, job])
+    if previous_asset is not None:
+        latest_timeline = session.scalar(select(TimelineRevision).where(
+            TimelineRevision.project_id == project_id,
+        ).order_by(TimelineRevision.version.desc()))
+        if latest_timeline is not None:
+            session.add(TimelineRevision(
+                project_id=project_id,
+                version=latest_timeline.version + 1,
+                source="reference_replaced",
+            ))
     session.commit()
     return UploadReferenceVideoResponse(asset_kind=asset.kind, job_kind=job.kind)
 
@@ -626,6 +830,8 @@ def upload_reference_image(
     display_name: str = Form(default="", max_length=40),
     note: str = Form(default=""),
     product_name: str = Form(default=""),
+    product_category: str = Form(default=""),
+    package_form: str = Form(default=""),
     selling_points: str = Form(default=""),
     session: Session = Depends(get_session),
 ) -> dict[str, str | None]:
@@ -660,7 +866,10 @@ def upload_reference_image(
             "display_name": display_name.strip(),
             "note": note.strip()[:1000],
             "product_name": product_name.strip()[:200],
+            "product_category": product_category.strip()[:100],
+            "package_form": package_form.strip()[:30],
             "selling_points": selling_points.strip()[:3000],
+            "selling_point_cards": build_selling_point_cards(selling_points.strip()[:3000]),
             "summary_confirmed": False,
         }
         # 新图片或产品信息变化会让旧总结失效，但不会删除旧图片和旧文字。
@@ -668,7 +877,10 @@ def upload_reference_image(
             existing_metadata = load_structure(existing)
             existing_metadata.update({
                 "product_name": metadata["product_name"],
+                "product_category": metadata["product_category"],
+                "package_form": metadata["package_form"],
                 "selling_points": metadata["selling_points"],
+                "selling_point_cards": metadata["selling_point_cards"],
                 "summary_generated": False,
                 "summary_confirmed": False,
             })
@@ -734,10 +946,37 @@ def update_reference_profile(project_id: UUID, reference_kind: str, payload: Ref
     asset.profile_text = payload.profile.strip()
     structure = load_structure(asset)
     structure.update(payload.structure)
+    if reference_kind in {"product", "target_product"} and "selling_points" in payload.structure:
+        structure["selling_point_cards"] = build_selling_point_cards(str(payload.structure.get("selling_points") or ""))
     asset.profile_json = json.dumps(structure, ensure_ascii=False)
     asset.profile_user_edited = True
-    asset.analysis_status, asset.analysis_error = "succeeded", None
+    if reference_kind in {"product", "target_product"}:
+        # This edit confirms the aggregate fact sheet; it must not launder a
+        # failed per-image analysis into success. Copy only aggregate identity
+        # flags so every usable view sees the same explicit confirmation.
+        shared_keys = {
+            "product_name", "product_category", "package_form", "selling_points",
+            "selling_point_cards", "summary_confirmed",
+        }
+        shared_structure = {key: value for key, value in payload.structure.items() if key in shared_keys}
+        product_assets = _reference_images(session, project_id, kind)
+        for product_asset in product_assets:
+            if product_asset.id == asset.id:
+                continue
+            product_structure = load_structure(product_asset)
+            product_structure.update(shared_structure)
+            product_asset.profile_json = json.dumps(product_structure, ensure_ascii=False)
+        if len(product_assets) == 1:
+            # A manually supplied single-image fact sheet is a complete escape
+            # hatch when vision is unavailable, matching the existing workflow.
+            asset.analysis_status, asset.analysis_error = "succeeded", None
+    else:
+        asset.analysis_status, asset.analysis_error = "succeeded", None
     session.commit()
+    if reference_kind in {"product", "target_product"}:
+        # A product card represents all uploaded views. Returning only the last
+        # asset used to hide a failed sibling behind a false "分析成功" badge.
+        return get_reference_profile(project_id, reference_kind, session)
     return _profile_response(asset, reference_kind)
 
 
@@ -794,7 +1033,13 @@ def _shot_edit_response(session: Session, project_id: UUID, shot_id: UUID) -> Sh
 
 
 @router.put("/{project_id}/shots/{shot_id}/edit", response_model=ShotEditResponse)
-def save_shot_edit(project_id: UUID, shot_id: UUID, payload: ShotEditRequest, session: Session = Depends(get_session)) -> ShotEditResponse:
+def save_shot_edit(
+    project_id: UUID,
+    shot_id: UUID,
+    payload: ShotEditRequest,
+    if_match: str | None = Header(default=None, alias="If-Match"),
+    session: Session = Depends(get_session),
+) -> ShotEditResponse:
     shot = session.get(Shot, shot_id)
     if shot is None or shot.timeline_revision.project_id != project_id:
         raise HTTPException(status_code=404, detail="Shot does not exist")
@@ -803,6 +1048,18 @@ def save_shot_edit(project_id: UUID, shot_id: UUID, payload: ShotEditRequest, se
     if project and project.mode == "preserve_product" and contains_product_replacement(edited_text):
         raise HTTPException(status_code=422, detail="页面一固定保留原商品，镜头修改不能替换产品。")
     edit = session.scalar(select(ShotEdit).where(ShotEdit.project_id == project_id, ShotEdit.shot_id == shot_id))
+    if if_match is not None:
+        try:
+            expected_version = int(if_match.strip('"'))
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail="If-Match 必须是镜头编辑版本号") from exc
+        current_version = edit.version or 0 if edit else 0
+        if expected_version != current_version:
+            raise HTTPException(status_code=409, detail={
+                "message": "镜头已被其他页面更新，请刷新后再保存",
+                "expected_version": expected_version,
+                "current_version": current_version,
+            })
     if edit is None:
         edit = ShotEdit(project_id=project_id, shot_id=shot_id)
         session.add(edit)
@@ -842,25 +1099,35 @@ def create_prompt_revision(
     response: Response,
     session: Session = Depends(get_session),
 ) -> PromptResponse:
-    project = session.get(Project, project_id)
+    project = session.scalar(select(Project).where(Project.id == project_id).with_for_update())
     if project is None:
         raise HTTPException(status_code=404, detail="项目不存在")
+    visual_direction = payload.visual_direction.strip()
+    manual_text = (payload.prompt_text or payload.visual_direction).strip()
+    if payload.use_ai and not visual_direction:
+        raise HTTPException(status_code=422, detail="请填写提示词生成要求")
+    if not payload.use_ai and not manual_text:
+        raise HTTPException(status_code=422, detail="当前没有可保存的提示词")
     if project.mode == "preserve_product" and payload.replace_product:
         raise HTTPException(status_code=422, detail="保留产品模式不能开启产品替换。")
     replace_product = project.mode == "replace_product"
+    prompt_mode = payload.prompt_mode
     product_assets = confirmed_target_product_assets(session, project)
-    product_profile = _combined_reference_profile(product_assets)
+    product_fact_sheet = _combined_reference_profile(product_assets)
+    product_profile = product_prompt_profile(product_assets)
+    selling_point_cards = product_selling_point_cards(product_assets)
     person_asset = _reference_image(session, project_id, "person_reference_image")
     if payload.replace_person and (person_asset is None or not person_asset.profile_text or _api_analysis_status(person_asset.analysis_status) != "succeeded"):
-        raise HTTPException(status_code=422, detail="选择替换人物前，请先上传并确认人物图片档案")
-    if payload.audio_mode not in {"keep_original", "add_style"}:
-        raise HTTPException(status_code=422, detail="未知的音频选项")
-    if payload.audio_mode == "add_style" and not payload.audio_style.strip():
-        raise HTTPException(status_code=422, detail="请选择音频风格")
+        raise HTTPException(status_code=422, detail="选择替换人物前，请先填写并确认人物文字档案，或上传并确认人物图片")
+    audio_mode = {"keep_original": "none", "add_style": "custom"}.get(payload.audio_mode, payload.audio_mode)
+    audio_style = payload.audio_style.strip()
+    if audio_mode not in {"none", "auto", "custom"}:
+        raise HTTPException(status_code=422, detail="音频只支持无音频、自动生成音频或用户填写音频要求")
+    if audio_mode == "custom" and not audio_style:
+        raise HTTPException(status_code=422, detail="请填写音频要求")
     revision = session.scalar(select(TimelineRevision).where(TimelineRevision.project_id == project_id).order_by(TimelineRevision.version.desc()))
     current_shots = list(session.scalars(select(Shot).where(Shot.timeline_revision_id == revision.id).order_by(Shot.position))) if revision else []
     # 新工作流：一份覆盖完整时间轴的提示词。不接受生成片段绑定。
-    prompt_mode = "full_reference_video_edit"
     segment: GenerationSegment | None = None
     if payload.generation_segment_id is not None:
         raise HTTPException(status_code=422, detail="已改为完整提示词工作流，不再按生成片段创建提示词")
@@ -873,15 +1140,25 @@ def create_prompt_revision(
         if payload.use_ai:
             raise HTTPException(status_code=422, detail="保留产品模式的提示词不能替换产品。")
     if replace_product:
-        _, conflicts = check_product_compatibility(product_profile or "", current_shots)
-        if conflicts:
-            raise HTTPException(status_code=422, detail={
-                "message": "目标产品形态与部分原镜头动作不兼容，请先修正这些镜头",
-                "shot_ids": [conflict["shot_id"] for conflict in conflicts],
-                "conflicts": conflicts,
-            })
-    if replace_product and (not product_profile or _combined_analysis_status(product_assets) != "succeeded" or not _product_profile_confirmed(product_assets)):
-        raise HTTPException(status_code=422, detail="选择替换产品前，请先上传并确认产品图片档案")
+        product_status = _combined_analysis_status(product_assets)
+        product_confirmed = _product_profile_confirmed(product_assets)
+        if not product_assets or not product_fact_sheet:
+            raise HTTPException(status_code=422, detail="选择替换产品前，请先上传产品图片并生成产品档案")
+        if product_status == "queued":
+            raise HTTPException(status_code=422, detail="产品图片仍在理解或等待自动重试，请完成后再生成提示词")
+        if product_status == "failed" and not product_confirmed:
+            failed_labels = []
+            for asset in product_assets:
+                if _api_analysis_status(asset.analysis_status) == "failed":
+                    structure = load_structure(asset)
+                    failed_labels.append(str(structure.get("display_name") or structure.get("view_label") or asset.original_filename or "未命名图片"))
+            label_text = "、".join(failed_labels) or "部分产品图"
+            raise HTTPException(
+                status_code=422,
+                detail=f"{label_text}理解失败。请点击重试；若档案内容已经足够，也可以人工校对并确认后继续。",
+            )
+        if not product_confirmed:
+            raise HTTPException(status_code=422, detail="请先校对并确认产品档案")
     # 服务端确定性前缀：用当前已确认资料生成，人工保存严格比对、AI 入队时冻结。
     product_purpose_lines = []
     if replace_product:
@@ -898,18 +1175,23 @@ def create_prompt_revision(
     background_asset = _reference_image(session, project_id, "background_reference_image")
     if background_asset and background_asset.profile_text:
         background_reference = background_asset.profile_text.strip()
+    # 旧客户端在人工保存时把完整正文放在 visual_direction；新客户端用
+    # prompt_text 承载正文、visual_direction 单独承载最高优先级改编要求。
+    prefix_user_direction = visual_direction if payload.use_ai or payload.prompt_text.strip() else ""
     expected_prefix = build_full_prompt_prefix(
         project_mode=project.mode,
         product_profile=product_profile,
         product_image_purposes=product_purpose_lines,
-        people_reference=people_reference,
+        selling_point_cards=selling_point_cards if replace_product else [],
+        people_reference=people_reference if payload.replace_person else None,
         background_reference=background_reference,
-        audio_mode=payload.audio_mode,
-        audio_style=payload.audio_style.strip(),
+        audio_mode=audio_mode,
+        audio_style=audio_style,
+        replace_person=payload.replace_person,
+        user_direction=prefix_user_direction,
+        people_reference_has_image=bool(person_asset and (person_asset.original_path or "").strip()),
     )
-    version = (session.scalar(
-        select(func.max(PromptRevision.version)).where(PromptRevision.project_id == project_id)
-    ) or 0) + 1
+    version = _next_prompt_version(session, project_id)
     shot_instructions = []
     if revision:
         for shot in current_shots:
@@ -918,15 +1200,32 @@ def create_prompt_revision(
             if edit is None or not edit.confirmed:
                 raise HTTPException(status_code=422, detail=f"镜头 {shot.position + 1} 的事实尚未确认")
             shot_instructions.append({
+                "shot_id": str(shot.id),
                 "start_sec": shot.start_sec, "end_sec": shot.end_sec,
                 "facts": {"people": edit.people, "action": edit.action, "product": edit.product, "product_interaction": edit.product_interaction, "background": edit.background, "camera": edit.camera, "lighting": edit.lighting, "visual_style": edit.visual_style, "visible_text": edit.visible_text, "uncertainties": edit.uncertainties},
                 "changes": {},
                 "keep": edit.keep_unchanged.splitlines() if edit.keep_unchanged else [],
                 "has_product": bool(shot.product_interaction),
             })
+    adaptation_conflicts: list[dict] = []
+    if replace_product:
+        _, conflicts = check_product_compatibility(product_profile or "", shot_instructions)
+        blocking_conflicts = [item for item in conflicts if item.get("severity") == "blocked"]
+        if blocking_conflicts:
+            raise HTTPException(status_code=422, detail={
+                "message": "目标产品与部分镜头动作根本不兼容，请先修正这些镜头",
+                "shot_ids": [item["shot_id"] for item in blocking_conflicts],
+                "conflicts": blocking_conflicts,
+            })
+        adaptation_conflicts = [item for item in conflicts if item.get("severity") == "adaptable"]
+    text = expected_prefix if payload.use_ai and prompt_mode == "full_reference_video_edit" else "" if payload.use_ai else manual_text
+    prompt_reference_assets = [*product_assets]
+    if person_asset is not None:
+        prompt_reference_assets.append(person_asset)
+    if background_asset is not None:
+        prompt_reference_assets.append(background_asset)
     # AI生成放到Worker，避免浏览器等待数分钟后超时；人工版本仍立即保存。
     # AI 入队时冻结服务端确定性前缀到 text，Worker 使用该快照，完成后再替换为完整提示词。
-    text = expected_prefix if payload.use_ai else payload.visual_direction.strip()
     if not payload.use_ai and prompt_mode == "full_reference_video_edit":
         # 人工保存：预期绝对时间标签来自数据库当前 Shot，而非待验证文本自身。
         if revision is None:
@@ -943,10 +1242,23 @@ def create_prompt_revision(
             # 只对修改/删除正文执行替换检测。
             if contains_product_replacement(_actionable_bodies(text)):
                 raise HTTPException(status_code=422, detail="保留产品模式的提示词不能替换产品。")
+        text = normalize_full_prompt_contract(
+            text,
+            shot_ranges,
+            shot_instructions,
+            project_mode=project.mode,
+            replace_person=payload.replace_person,
+        )
+    if not payload.use_ai and prompt_mode == "standalone_video_recreation":
+        try:
+            validate_recreation_prompt(text, [(shot.start_sec, shot.end_sec) for shot in current_shots], project.mode)
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
     prompt_revision = PromptRevision(
         project_id=project_id, version=version, text=text,
-        visual_direction=payload.visual_direction.strip(), audio_mode=payload.audio_mode,
-        audio_style=payload.audio_style.strip(), replace_product=replace_product,
+        visual_direction=prefix_user_direction, audio_mode=audio_mode,
+        reference_asset_ids=json.dumps([str(asset.id) for asset in prompt_reference_assets]),
+        audio_style=audio_style, replace_product=replace_product,
         replace_person=payload.replace_person, source_timeline_revision_id=revision.id if revision else None,
         prompt_mode=prompt_mode,
         generation_segment_id=None,
@@ -959,7 +1271,10 @@ def create_prompt_revision(
         # 异步入队：AI 创建返回 202，人工保存返回 201。
         response.status_code = status.HTTP_202_ACCEPTED
     session.commit()
-    return PromptResponse(version=version, text=text, status=prompt_revision.status)
+    return PromptResponse(
+        version=version, text=text, status=prompt_revision.status,
+        adaptation_count=len(adaptation_conflicts), adaptation_conflicts=adaptation_conflicts,
+    )
 
 
 @router.post("/{project_id}/prompts/refine", response_model=PromptResponse, status_code=status.HTTP_202_ACCEPTED)
@@ -969,7 +1284,7 @@ def refine_prompt_revision(
     session: Session = Depends(get_session),
 ) -> PromptResponse:
     """基于选定的完整提示词创建一个新的 GPT 修改版本，旧版本保持不变。"""
-    project = session.get(Project, project_id)
+    project = session.scalar(select(Project).where(Project.id == project_id).with_for_update())
     if project is None:
         raise HTTPException(status_code=404, detail="项目不存在")
     source_query = select(PromptRevision).where(
@@ -985,15 +1300,16 @@ def refine_prompt_revision(
     if source is None:
         raise HTTPException(status_code=422, detail="请先生成或保存一份完整提示词")
     # 精修只接受已完成的完整提示词。
-    if source.prompt_mode != "full_reference_video_edit":
-        raise HTTPException(status_code=422, detail="只能精修完整视频编辑提示词")
+    if source.prompt_mode not in {"full_reference_video_edit", "standalone_video_recreation"}:
+        raise HTTPException(status_code=422, detail="只能精修完整提示词")
     current_revision = session.scalar(select(TimelineRevision).where(TimelineRevision.project_id == project_id).order_by(TimelineRevision.version.desc()))
     if current_revision is None or source.source_timeline_revision_id != current_revision.id:
         raise HTTPException(status_code=422, detail="提示词来自旧时间轴，请重新生成提示词")
-    version = (session.scalar(select(func.max(PromptRevision.version)).where(PromptRevision.project_id == project_id)) or 0) + 1
+    version = _next_prompt_version(session, project_id)
     revision = PromptRevision(
         project_id=project_id, version=version, text=source.text,
-        visual_direction=payload.instruction.strip(), audio_mode=source.audio_mode,
+        visual_direction=source.visual_direction, operation_instruction=payload.instruction.strip(),
+        reference_asset_ids=source.reference_asset_ids, audio_mode=source.audio_mode,
         audio_style=source.audio_style, replace_product=project.mode == "replace_product",
         replace_person=source.replace_person, source_timeline_revision_id=source.source_timeline_revision_id,
         prompt_mode=source.prompt_mode, generation_segment_id=source.generation_segment_id,
@@ -1022,7 +1338,7 @@ def optimize_prompt_selling_points(
     session: Session = Depends(get_session),
 ) -> PromptResponse:
     """基于选定的完整提示词创建卖点优化的新版本，源版本保持不变。"""
-    project = session.get(Project, project_id)
+    project = session.scalar(select(Project).where(Project.id == project_id).with_for_update())
     if project is None:
         raise HTTPException(status_code=404, detail="项目不存在")
     source = session.scalar(select(PromptRevision).where(
@@ -1043,10 +1359,11 @@ def optimize_prompt_selling_points(
         product_assets = confirmed_target_product_assets(session, project)
         if not product_assets or not _product_profile_confirmed(product_assets):
             raise HTTPException(status_code=422, detail="卖点优化前请先确认目标产品档案")
-    version = (session.scalar(select(func.max(PromptRevision.version)).where(PromptRevision.project_id == project_id)) or 0) + 1
+    version = _next_prompt_version(session, project_id)
     revision = PromptRevision(
         project_id=project_id, version=version, text=source.text,
-        visual_direction="根据已确认产品卖点优化各镜头的产品表现",
+        visual_direction=source.visual_direction,
+        reference_asset_ids=source.reference_asset_ids,
         audio_mode=source.audio_mode, audio_style=source.audio_style,
         replace_product=project.mode == "replace_product", replace_person=source.replace_person,
         source_timeline_revision_id=source.source_timeline_revision_id,
@@ -1061,20 +1378,38 @@ def optimize_prompt_selling_points(
 
 
 @router.get("/{project_id}/product-compatibility")
-def get_product_compatibility(project_id: UUID, session: Session = Depends(get_session)) -> dict:
+def get_product_compatibility(
+    project_id: UUID,
+    prompt_mode: Literal["full_reference_video_edit", "standalone_video_recreation"] = Query(default="full_reference_video_edit"),
+    session: Session = Depends(get_session),
+) -> dict:
     project = session.get(Project, project_id)
     if project is None:
         raise HTTPException(status_code=404, detail="项目不存在")
     if project.mode == "preserve_product":
         return {"status": "compatible", "summary": "页面一锁定原产品，不执行目标产品替换。", "product_kind": None, "conflicts": []}
-    asset = _reference_image(session, project_id, "product_reference_image")
+    product_assets = _reference_images(session, project_id, "product_reference_image")
+    asset = product_assets[-1] if product_assets else None
     revision = session.scalar(select(TimelineRevision).where(TimelineRevision.project_id == project_id).order_by(TimelineRevision.version.desc()))
     if asset is None or not asset.profile_text or _api_analysis_status(asset.analysis_status) != "succeeded" or revision is None:
         return {"status": "pending", "summary": "请先上传并确认目标产品档案，然后完成镜头理解。", "product_kind": None, "conflicts": []}
     shots = session.scalars(select(Shot).where(Shot.timeline_revision_id == revision.id).order_by(Shot.position)).all()
-    product_kind, conflicts = check_product_compatibility(asset.profile_text, shots)
+    compatibility_shots = []
+    for shot in shots:
+        edit = session.scalar(select(ShotEdit).where(ShotEdit.project_id == project_id, ShotEdit.shot_id == shot.id))
+        compatibility_shots.append({
+            "shot_id": str(shot.id), "start_sec": shot.start_sec, "end_sec": shot.end_sec,
+            "facts": {
+                "action": edit.action if edit and edit.confirmed else shot.action,
+                "product_interaction": edit.product_interaction if edit and edit.confirmed else shot.product_interaction,
+            },
+        })
+    product_kind, conflicts = check_product_compatibility(product_prompt_profile(product_assets), compatibility_shots)
     if conflicts:
-        return {"status": "blocked", "summary": f"发现 {len(conflicts)} 个目标产品与原动作冲突的镜头。", "product_kind": product_kind, "conflicts": conflicts}
+        blocking = [item for item in conflicts if item.get("severity") == "blocked"]
+        if not blocking:
+            return {"status": "warning", "summary": f"发现 {len(conflicts)} 个产品动作冲突，生成提示词时将做最小动作适配。", "product_kind": product_kind, "conflicts": conflicts}
+        return {"status": "blocked", "summary": f"发现 {len(blocking)} 个无法局部修正的产品动作冲突镜头。", "product_kind": product_kind, "conflicts": conflicts}
     if product_kind == "unknown":
         return {"status": "warning", "summary": "无法自动归类目标产品形态，请人工确认每个产品动作。", "product_kind": product_kind, "conflicts": []}
     return {"status": "compatible", "summary": "已检查产品形态与当前镜头动作，未发现明确冲突。", "product_kind": product_kind, "conflicts": []}

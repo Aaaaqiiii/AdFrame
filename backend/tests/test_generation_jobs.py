@@ -11,7 +11,7 @@ from app.db.models import Asset, Generation, PromptRevision, Shot, ShotEdit, Tim
 from app.db.session import SessionLocal
 from app.services.generation_jobs import execute_generation_job
 from app.services.media import VideoMetadata
-from app.services.seedance import GenerationResult, SubmissionUncertainError
+from app.services.seedance import GenerationResult, ProviderRequestError, SubmissionUncertainError, parse_generation_result
 
 
 class StreamingVideoResponse:
@@ -80,6 +80,82 @@ def test_uncertain_submission_is_never_automatically_retried(queued_generation) 
         assert generation.attempts == 1
 
 
+def test_provider_4xx_fails_without_retrying(queued_generation) -> None:
+    gateway = Mock()
+    gateway.submit.side_effect = ProviderRequestError("Seedance HTTP 400: invalid image")
+    with SessionLocal() as session:
+        generation = session.get(type(queued_generation), queued_generation.id)
+        execute_generation_job(session, generation, gateway, {"model": "seedance"})
+        assert generation.status == "failed"
+        assert generation.next_attempt_at is None
+        assert generation.attempts == 1
+
+
+def test_reference_video_duration_parse_failure_stops_reusing_the_same_url(queued_generation) -> None:
+    """供应商任务 1007 已明确失败，但同一公网 URL 不得自动重复提交。"""
+    gateway = Mock()
+    gateway.get_result.return_value = GenerationResult(
+        task_id="provider-task-1007",
+        status="failed",
+        error_message="Reference video duration could not be read; please check the file is a valid video and try again",
+    )
+    with SessionLocal() as session:
+        generation = session.get(type(queued_generation), queued_generation.id)
+        generation.external_task_id = "provider-task-1007"
+        generation.status = "processing"
+        session.commit()
+
+        execute_generation_job(session, generation, gateway, {})
+
+        assert generation.status == "failed"
+        assert generation.external_task_id == "provider-task-1007"
+        assert generation.attempts == 1
+        assert generation.next_attempt_at is None
+
+
+def test_generation_result_preserves_provider_error_code() -> None:
+    result = parse_generation_result({
+        "id": "provider-task-1007",
+        "status": "failed",
+        "error": {
+            "code": "1007",
+            "message": "Reference video duration could not be read",
+        },
+    })
+
+    assert getattr(result, "error_code", None) == "1007"
+
+
+def test_worker_poll_does_not_reupload_inputs(queued_generation, monkeypatch) -> None:
+    """供应商已有任务 ID 后只轮询，不再依赖或上传本地参考素材。"""
+    from app.worker import run_once
+
+    with SessionLocal() as session:
+        generation = session.get(type(queued_generation), queued_generation.id)
+        generation.external_task_id = "provider-task-existing"
+        generation.status = "processing"
+        generation.reference_asset_ids = "[]"
+        session.commit()
+
+    class PollOnlyGateway:
+        def submit(self, _payload):
+            raise AssertionError("existing provider task must not be submitted again")
+
+        def get_result(self, task_id):
+            assert task_id == "provider-task-existing"
+            return GenerationResult(task_id=task_id, status="processing")
+
+    monkeypatch.setattr("app.worker._generation_gateway", lambda settings, provider: (PollOnlyGateway(), "model"))
+    monkeypatch.setattr("app.worker.TempfilePublisher", lambda: (_ for _ in ()).throw(AssertionError("must not publish")))
+
+    assert run_once("generation") == 1
+
+    with SessionLocal() as session:
+        generation = session.get(type(queued_generation), queued_generation.id)
+        assert generation.status == "processing"
+        assert generation.external_task_id == "provider-task-existing"
+
+
 def test_worker_recovers_inputs_from_asset_ids_and_republishes_expired(client, tmp_path, monkeypatch) -> None:
     from sqlalchemy import select as sa_select
     from uuid import UUID as _UUID
@@ -122,7 +198,39 @@ def test_worker_recovers_inputs_from_asset_ids_and_republishes_expired(client, t
         assert len(calls) == 3
         snapshot = json.loads(generation.request_snapshot)
         assert snapshot["provider_request"]["ratio"] == "adaptive"
+        request_text = snapshot["provider_request"]["content"][0]["text"]
+        assert "图片1：目标产品参考图“product.png”" in request_text
+        assert "图片2：目标人物身份参考图" in request_text
+        assert "所有出现人物的镜头都必须使用图片2中的同一人物" in request_text
         assert "secret" not in (generation.request_snapshot or "")
+
+
+def test_reference_image_manifest_maps_person_to_actual_api_image_number(tmp_path) -> None:
+    from app.worker import build_reference_image_manifest, inject_reference_image_manifest
+    product = Asset(
+        project_id=__import__("uuid").uuid4(), kind="product_reference_image",
+        original_path=str(tmp_path / "product.png"), original_filename="front.png",
+        profile_json=json.dumps({"display_name": "正面"}),
+    )
+    person = Asset(
+        project_id=product.project_id, kind="person_reference_image",
+        original_path=str(tmp_path / "person.png"), original_filename="person.png",
+    )
+
+    manifest = build_reference_image_manifest([product, person], replace_person=True)
+
+    assert "图片1：目标产品参考图“正面”" in manifest
+    assert "图片2：目标人物身份参考图" in manifest
+    assert "所有出现人物的镜头都必须使用图片2中的同一人物" in manifest
+
+    auxiliary = build_reference_image_manifest([person], replace_person=False)
+    assert "辅助人物参考图" in auxiliary
+    assert "人物替换硬约束" not in auxiliary
+
+    prompt = "【最高优先级：用户改编要求】\n删除字幕。\n【参考范围】\n只参考格式。\n【全局执行】\n执行。"
+    injected = inject_reference_image_manifest(prompt, manifest)
+    assert injected.startswith("【最高优先级：用户改编要求】\n删除字幕。")
+    assert injected.index("【本次实际参考图片编号") < injected.index("【全局执行】")
 
 
 def test_worker_reuses_unexpired_url(client, tmp_path, monkeypatch) -> None:
@@ -395,8 +503,9 @@ def test_worker_publishes_segment_clip_and_matches_prompt(client, tmp_path, monk
         assert video_part.startswith("https://tempfile.org/seg/")
         # 快照不含签名查询串。
         snapshot = generation.request_snapshot or ""
-        assert "signature" not in snapshot
-        assert "abc" not in snapshot
+        snapshot_url = json.loads(snapshot)["provider_request"]["content"][1]["video_url"]["url"]
+        assert snapshot_url.endswith("?[redacted]")
+        assert "signature=" not in snapshot_url
 
 
 def test_worker_rebuilds_lost_segment_clip(client, tmp_path, monkeypatch) -> None:
@@ -543,6 +652,7 @@ def test_batch_worker_derives_relative_prompts_for_crossing_segments(client, tmp
     monkeypatch.setattr("app.worker._generation_gateway", lambda settings, provider: (FakeGateway(), "model"))
 
     run_once()
+    run_once()
 
     assert len(seen_payloads) == 2
     # worker 领行顺序不保证（按 id），用“片段 N/M”识别行分拣两段。
@@ -560,9 +670,11 @@ def test_batch_worker_derives_relative_prompts_for_crossing_segments(client, tmp
     # 段 B 的块头必须是相对时间；绝对 00:18 只允许出现在服务端识别行。
     block_headers = [line for line in texts["seg_b"].split("\n") if "–" in line and line[:1].isdigit()]
     assert "00:18.00–00:25.00" not in block_headers
-    # 两段正文逐字保持。
-    assert "镜头 10 保持正文" in texts["seg_a"]
-    assert "镜头 10 保持正文" in texts["seg_b"]
+    # 供应商请求只继承镜头形式，不把 keep 正文重新锁回原内容。
+    assert "镜头 10 保持正文" not in texts["seg_a"]
+    assert "镜头 10 保持正文" not in texts["seg_b"]
+    assert "镜头形式：参考视频1对应时间段" in texts["seg_a"]
+    assert "镜头形式：参考视频1对应时间段" in texts["seg_b"]
     # 视频 URL 各自第一个。
     assert all(payload["content"][1]["type"] == "video_url" for payload in seen_payloads)
 
@@ -586,6 +698,7 @@ def test_batch_worker_snapshot_envelope(client, tmp_path, monkeypatch) -> None:
         def get_result(self, task_id):
             return GenerationResult(task_id=task_id, status="processing")
     monkeypatch.setattr("app.worker._generation_gateway", lambda settings, provider: (FakeGateway(), "model"))
+    run_once()
     run_once()
     with SessionLocal() as session:
         gen_a = session.get(Generation, project.gen_a_id)
@@ -630,6 +743,7 @@ def test_batch_worker_selects_correct_provider_gateway(client, tmp_path, monkeyp
         return FakeGateway(), expected_model
     monkeypatch.setattr("app.worker._generation_gateway", fake_gateway)
     run_once()
+    run_once()
     assert seen_models == [provider, provider]
 
 
@@ -654,6 +768,7 @@ def test_batch_worker_corrupt_prompt_fails_not_retries(client, tmp_path, monkeyp
         def get_result(self, task_id):
             return GenerationResult(task_id=task_id, status="processing")
     monkeypatch.setattr("app.worker._generation_gateway", lambda settings, provider: (FakeGateway(), "m"))
+    run_once()
     run_once()
     with SessionLocal() as session:
         rows = list(session.scalars(select(Generation).where(Generation.project_id == project.project_id)))

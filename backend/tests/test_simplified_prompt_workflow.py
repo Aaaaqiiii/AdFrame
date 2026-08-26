@@ -10,7 +10,7 @@ from app.core.config import Settings
 from app.db.models import Asset, Job, Project, PromptRevision, Shot, ShotEdit, TimelineRevision, VideoAnalysis
 from app.db.session import SessionLocal
 from app.main import create_app
-from app.api.routes.analysis import request_shot_vision_analysis
+from app.api.routes.analysis import _job_status, request_shot_vision_analysis
 from app.services.vision_jobs import execute_vision_job
 from app.services.final_prompt import execute_final_prompt_job, execute_prompt_refinement_job
 from app.services.volcengine_vision import VisionTaskResult
@@ -25,8 +25,7 @@ class CompletedShotGateway:
 
     def get_result(self, task_id: str) -> VisionTaskResult:
         bundle = {
-            "doubao": {"action": "拿起瓶子"},
-            "gpt": {"action": "右手拿起瓶子"},
+            "qwen": {"action": "右手拿起瓶子"},
             "final": {
                 "people": "一名短发女性",
                 "action": "人物先拿起瓶子，随后转向镜头展示",
@@ -42,6 +41,10 @@ class CompletedShotGateway:
             },
         }
         return VisionTaskResult(task_id, "Completed", content=json.dumps(bundle, ensure_ascii=False))
+
+
+def test_retryable_job_status_is_not_hidden_as_ordinary_queueing() -> None:
+    assert _job_status("retryable") == "retryable"
 
 
 def test_batch_analysis_skips_successful_shots() -> None:
@@ -133,7 +136,7 @@ def test_dual_results_stay_in_backend_and_only_final_facts_reach_shot() -> None:
         analyses = session.scalars(select(VideoAnalysis).where(VideoAnalysis.shot_id == shot.id)).all()
         assert shot.action == "人物先拿起瓶子，随后转向镜头展示"
         assert shot.visual_style == "明亮护肤广告"
-        assert {item.provider for item in analyses} == {"doubao_full_shot", "gpt_keyframes"}
+        assert {item.provider for item in analyses} == {"qwen_full_shot"}
 
 
 def test_final_prompt_uses_only_confirmed_edit_and_can_be_saved_manually() -> None:
@@ -203,6 +206,47 @@ def test_final_prompt_uses_only_confirmed_edit_and_can_be_saved_manually() -> No
     )
     assert manual.status_code == 201
     assert manual.json()["status"] == "completed"
+
+    missing_audio_requirement = client.post(
+        f"/api/projects/{project['id']}/prompts",
+        json={"visual_direction": "完整复刻全部镜头", "use_ai": True, "prompt_mode": "standalone_video_recreation", "audio_mode": "custom"},
+    )
+    assert missing_audio_requirement.status_code == 422
+    assert "音频要求" in str(missing_audio_requirement.json()["detail"])
+
+    standalone = client.post(
+        f"/api/projects/{project['id']}/prompts",
+        json={"visual_direction": "完整复刻全部镜头", "use_ai": True, "prompt_mode": "standalone_video_recreation"},
+    )
+    assert standalone.status_code == 202
+    with SessionLocal() as session:
+        revision = session.scalar(select(PromptRevision).where(
+            PromptRevision.project_id == UUID(project["id"]),
+            PromptRevision.version == standalone.json()["version"],
+        ))
+        job = session.scalar(select(Job).where(
+            Job.project_id == UUID(project["id"]),
+            Job.provider_input_id == str(revision.id),
+        ))
+        assert revision.prompt_mode == "standalone_video_recreation"
+        assert revision.audio_mode == "none"
+        recreation_text = (
+            "全局一致性：人物和场景保持一致。\n\n00:00.00–00:03.20\n"
+            "画面：人工确认人物位于明亮室内。\n动作：人工确认动作完整发生。\n"
+            "镜头：中近景缓慢推近。\n光线：左前方柔光。\n声音：不生成新音频。\n禁止：不得新增文字。"
+        )
+        with patch("app.services.final_prompt._chat", return_value=recreation_text):
+            execute_final_prompt_job(session, job, Settings(comfly_api_key="test-key"))
+        session.refresh(revision)
+        assert revision.status == "completed"
+        assert "画面：" in revision.text and "镜头：" in revision.text
+        assert "保持：" not in revision.text
+    filtered = client.get(
+        f"/api/projects/{project['id']}/prompts?status=completed&prompt_mode=standalone_video_recreation"
+    )
+    assert filtered.status_code == 200
+    assert [item["version"] for item in filtered.json()] == [standalone.json()["version"]]
+    assert filtered.json()[0]["audio_mode"] == "none"
 
 
 def test_prompt_refinement_worker_uses_queued_source_snapshot() -> None:

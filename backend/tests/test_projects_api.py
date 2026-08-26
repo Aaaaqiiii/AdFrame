@@ -1,11 +1,12 @@
 from fastapi.testclient import TestClient
+from pathlib import Path
 import pytest
 from sqlalchemy import select
 from unittest.mock import patch
 from uuid import UUID, uuid4
 
 from app.core.config import Settings
-from app.db.models import Asset, Job, PromptRevision, Shot, ShotEdit, TimelineRevision
+from app.db.models import Asset, Job, Project, PromptRevision, Shot, ShotEdit, TimelineRevision
 from app.db.session import SessionLocal
 from app.main import create_app
 from app.services.media import VideoMetadata
@@ -98,6 +99,27 @@ def test_project_list_can_be_filtered_to_page_one() -> None:
     assert client.get("/api/projects?mode=invalid").status_code == 422
 
 
+def test_project_can_be_renamed_without_affecting_its_workflow() -> None:
+    client = TestClient(create_app())
+    project = client.post("/api/projects", json={"name": "旧名称"}).json()
+
+    response = client.patch(f"/api/projects/{project['id']}", json={"name": "  发膜广告八月版  "})
+
+    assert response.status_code == 200
+    assert response.json()["name"] == "发膜广告八月版"
+    assert client.get(f"/api/projects/{project['id']}").json()["name"] == "发膜广告八月版"
+
+
+def test_project_rename_rejects_blank_name() -> None:
+    client = TestClient(create_app())
+    project = client.post("/api/projects", json={"name": "保留名称"}).json()
+
+    response = client.patch(f"/api/projects/{project['id']}", json={"name": "   "})
+
+    assert response.status_code == 422
+    assert client.get(f"/api/projects/{project['id']}").json()["name"] == "保留名称"
+
+
 def test_upload_reference_video_creates_asset_and_analysis_job() -> None:
     client = TestClient(create_app())
     project = client.post("/api/projects", json={"name": "上传测试"}).json()
@@ -124,6 +146,94 @@ def test_project_details_restore_uploaded_video_name() -> None:
     assert response.json()["reference_video_url"].endswith(f"/api/projects/{project['id']}/reference-video/content")
 
 
+def test_delete_project_removes_database_rows_and_media_directory() -> None:
+    client = TestClient(create_app())
+    project = client.post("/api/projects", json={"name": "delete me"}).json()
+    assert _accepted_video_upload(client, project["id"], "delete.mp4").status_code == 202
+    with SessionLocal() as session:
+        asset = session.scalar(select(Asset).where(Asset.project_id == UUID(project["id"])))
+        project_dir = Path(asset.original_path).parent.parent
+        assert project_dir.is_dir()
+
+    response = client.delete(f"/api/projects/{project['id']}")
+
+    assert response.status_code == 200
+    assert response.json() == {"deleted": True, "media_deleted": True}
+    assert not project_dir.exists()
+    with SessionLocal() as session:
+        assert session.get(Project, UUID(project["id"])) is None
+        assert session.scalars(select(Asset).where(Asset.project_id == UUID(project["id"]))).all() == []
+        assert session.scalars(select(Job).where(Job.project_id == UUID(project["id"]))).all() == []
+
+
+def test_delete_project_rejects_active_jobs() -> None:
+    client = TestClient(create_app())
+    project = client.post("/api/projects", json={"name": "busy project"}).json()
+    with SessionLocal() as session:
+        session.add(Job(project_id=UUID(project["id"]), kind="final_prompt_generation", status="queued"))
+        session.commit()
+
+    response = client.delete(f"/api/projects/{project['id']}")
+
+    assert response.status_code == 409
+    with SessionLocal() as session:
+        assert session.get(Project, UUID(project["id"])) is not None
+
+
+def test_replacing_reference_video_supersedes_old_workflow_state() -> None:
+    client = TestClient(create_app())
+    project = _full_prompt_project(client)
+    queued_prompt = client.post(
+        f"/api/projects/{project['id']}/prompts",
+        json={"visual_direction": "保持原节奏", "use_ai": True},
+    )
+    assert queued_prompt.status_code == 202
+
+    replacement = _accepted_video_upload(client, project["id"], "replacement.mp4", b"replacement")
+
+    assert replacement.status_code == 202
+    details = client.get(f"/api/projects/{project['id']}").json()
+    assert details["reference_video_name"] == "replacement.mp4"
+    assert details["timeline"] is None
+    assert details["latest_prompt_version"] == 0
+    assert client.get(
+        f"/api/projects/{project['id']}/prompts?status=completed&current_timeline_only=true"
+    ).json() == []
+    with SessionLocal() as session:
+        latest_timeline = session.scalar(select(TimelineRevision).where(
+            TimelineRevision.project_id == UUID(project["id"]),
+        ).order_by(TimelineRevision.version.desc()))
+        old_prompt = session.scalar(select(PromptRevision).where(
+            PromptRevision.project_id == UUID(project["id"]),
+            PromptRevision.version == queued_prompt.json()["version"],
+        ))
+        assert latest_timeline.source == "reference_replaced"
+        assert old_prompt.status == "superseded"
+        current_videos = list(session.scalars(select(Asset).where(
+            Asset.project_id == UUID(project["id"]), Asset.kind == "reference_video",
+        )))
+        historical_videos = list(session.scalars(select(Asset).where(
+            Asset.project_id == UUID(project["id"]), Asset.kind == "reference_video_history",
+        )))
+        assert len(current_videos) == 1
+        assert len(historical_videos) == 1
+
+
+def test_replacing_reference_video_waits_for_leased_or_processing_jobs() -> None:
+    client = TestClient(create_app())
+    project = client.post("/api/projects", json={"name": "busy replacement"}).json()
+    assert _accepted_video_upload(client, project["id"], "original.mp4").status_code == 202
+    with SessionLocal() as session:
+        job = session.scalar(select(Job).where(Job.project_id == UUID(project["id"])))
+        job.status = "processing"
+        session.commit()
+
+    replacement = _accepted_video_upload(client, project["id"], "replacement.mp4")
+
+    assert replacement.status_code == 409
+    assert client.get(f"/api/projects/{project['id']}").json()["reference_video_name"] == "original.mp4"
+
+
 def test_uploaded_reference_video_can_be_streamed_for_preview() -> None:
     client = TestClient(create_app())
     project = client.post("/api/projects", json={"name": "视频预览"}).json()
@@ -134,6 +244,25 @@ def test_uploaded_reference_video_can_be_streamed_for_preview() -> None:
     assert response.status_code == 200
     assert response.content == b"video-bytes"
     assert response.headers["content-type"].startswith("video/mp4")
+
+
+def test_shot_edit_rejects_stale_if_match_version() -> None:
+    client = TestClient(create_app())
+    project = client.post("/api/projects", json={"name": "optimistic shot edit"}).json()
+    timeline = client.put(
+        f"/api/projects/{project['id']}/timeline",
+        json={"shots": [{"start_sec": 0, "end_sec": 2}]},
+    ).json()
+    url = f"/api/projects/{project['id']}/shots/{timeline['shots'][0]['id']}/edit"
+    first = client.put(url, headers={"If-Match": "0"}, json={"action": "第一次保存"})
+    assert first.status_code == 200
+    second = client.put(url, headers={"If-Match": str(first.json()["version"])}, json={"action": "第二次保存"})
+    assert second.status_code == 200
+
+    stale = client.put(url, headers={"If-Match": str(first.json()["version"])}, json={"action": "旧页面覆盖"})
+
+    assert stale.status_code == 409
+    assert stale.json()["detail"]["current_version"] == second.json()["version"]
 
 
 def test_upload_rejects_unsafe_or_unsupported_video_names() -> None:
@@ -163,6 +292,29 @@ def test_reference_image_upload_requires_consent_and_is_restored() -> None:
     assert without_consent.status_code == 422
     assert with_consent.status_code == 202
     assert client.get(f"/api/projects/{project['id']}").json()["person_reference_image_name"] == "person.jpg"
+
+
+def test_person_reference_image_and_profile_can_be_deleted() -> None:
+    client = TestClient(create_app())
+    project = client.post("/api/projects", json={"name": "delete person reference"}).json()
+    upload = client.post(
+        f"/api/projects/{project['id']}/reference-images/person?consent=true",
+        files={"file": ("person.jpg", b"image", "image/jpeg")},
+    )
+    assert upload.status_code == 202
+    with SessionLocal() as session:
+        asset = session.get(Asset, UUID(upload.json()["asset_id"]))
+        assert asset is not None
+        original_path = Path(asset.original_path)
+        assert original_path.is_file()
+
+    response = client.delete(f"/api/projects/{project['id']}/reference-images/person")
+
+    assert response.status_code == 200
+    assert response.json() == {"deleted": 1, "media_deleted": True}
+    assert not original_path.exists()
+    assert client.get(f"/api/projects/{project['id']}").json()["person_reference_image_name"] is None
+    assert client.get(f"/api/projects/{project['id']}/reference-profiles/person").json()["status"] == "missing"
 
 
 def test_product_reference_image_can_be_uploaded_and_is_restored() -> None:
@@ -267,7 +419,7 @@ def test_prompt_history_filters_to_completed_current_timeline() -> None:
     assert set(response.json()[0]) == {
         "id", "version", "text", "status", "source_timeline_revision_id",
         "prompt_mode", "generation_segment_id",
-        "replace_product", "replace_person", "created_at",
+        "replace_product", "replace_person", "visual_direction", "audio_mode", "audio_style", "created_at",
     }
     assert response.json()[0]["prompt_mode"] == "full_video_description"
 
@@ -593,7 +745,7 @@ def test_generation_api_queues_work_without_calling_provider() -> None:
     with SessionLocal() as session:
         generation = session.get(Generation, generation_id)
         assert generation is not None
-        assert (generation.ratio, generation.duration, generation.generate_audio) == ("adaptive", -1, True)
+        assert (generation.ratio, generation.duration, generation.generate_audio) == ("adaptive", -1, False)
 
 
 def test_generation_does_not_reject_full_video_over_30_when_segment_legal() -> None:
@@ -614,7 +766,7 @@ def test_generation_does_not_reject_full_video_over_30_when_segment_legal() -> N
     assert response.status_code == 202
 
 
-def test_generation_queues_person_asset_only_when_requested() -> None:
+def test_generation_always_queues_uploaded_person_asset() -> None:
     client = TestClient(create_app())
     project = _ready_generation_project(client, "image option")
     from app.db.models import Asset
@@ -631,7 +783,9 @@ def test_generation_queues_person_asset_only_when_requested() -> None:
     import json as _json
     with SessionLocal() as session:
         generation = session.get(Generation, UUID(response.json()["id"]))
-        assert _json.loads(generation.reference_asset_ids) == [str(session.scalar(select(Asset).where(Asset.project_id == UUID(project["id"]), Asset.kind == "reference_video")).id)]
+        asset_ids = _json.loads(generation.reference_asset_ids)
+        assert str(session.scalar(select(Asset).where(Asset.project_id == UUID(project["id"]), Asset.kind == "reference_video")).id) in asset_ids
+        assert str(session.scalar(select(Asset).where(Asset.project_id == UUID(project["id"]), Asset.kind == "person_reference_image")).id) in asset_ids
 
 
 def _segment_ready_project(client: TestClient, duration_sec: float = 32.0, mode: str = "preserve_product") -> dict:
@@ -991,40 +1145,153 @@ def _full_prompt_project(client: TestClient, mode: str = "preserve_product") -> 
             session.flush()
             session.add(ShotEdit(project_id=UUID(project["id"]), shot_id=shot.id, action="展示产品", confirmed=True))
         if mode == "replace_product":
+            product_structure = {
+                "view_label": "front", "display_name": "正面", "note": "注意瓶盖",
+                "product_name": "测试发膜", "product_category": "发膜", "package_form": "jar",
+                "selling_points": "轻薄；不黏腻",
+                "selling_point_cards": [
+                    {"id": "SP1", "claim": "轻薄", "source": "user", "type": "selling_point", "presentation": "visual"},
+                    {"id": "SP2", "claim": "不黏腻", "source": "user", "type": "selling_point", "presentation": "visual"},
+                ],
+                "product_visual_anchor": "低矮圆罐，浅色罐身与圆形罐盖",
+                "summary_confirmed": True,
+            }
             session.add(Asset(
                 project_id=UUID(project["id"]), kind="product_reference_image",
                 original_path="C:/p.png", original_filename="正面.png", content_type="image/png",
                 profile_text="核心卖点：轻薄、不黏腻",
-                profile_json=__import__("json").dumps({"view_label": "front", "display_name": "正面", "note": "注意瓶盖", "summary_confirmed": True}),
+                profile_json=__import__("json").dumps(product_structure, ensure_ascii=False),
                 analysis_status="succeeded",
             ))
         session.commit()
         revision_id = str(revision.id)
     return {
         "id": project["id"], "revision_id": revision_id, "mode": mode,
-        "product_profile": "核心卖点：轻薄、不黏腻" if mode == "replace_product" else "",
+        "product_profile": (
+            "产品名称：测试发膜；产品类别：发膜；主包装：罐装\n"
+            "视觉锚点：低矮圆罐，浅色罐身与圆形罐盖"
+        ) if mode == "replace_product" else "",
+        "selling_point_cards": [
+            {"id": "SP1", "claim": "轻薄", "source": "user", "type": "selling_point", "presentation": "visual"},
+            {"id": "SP2", "claim": "不黏腻", "source": "user", "type": "selling_point", "presentation": "visual"},
+        ] if mode == "replace_product" else [],
         "product_image_purposes": ["正面：锁定该角度结构（注意瓶盖）"] if mode == "replace_product" else [],
         "people_reference": None, "background_reference": None,
         "audio_mode": "keep_original", "audio_style": "",
     }
 
 
-def _full_prompt_text(project: dict) -> str:
+def _full_prompt_text(project: dict, user_direction: str = "") -> str:
     from app.services.final_prompt import build_full_prompt_prefix
     prefix = build_full_prompt_prefix(
         project_mode=project["mode"],
         product_profile=project["product_profile"],
         product_image_purposes=project["product_image_purposes"],
+        selling_point_cards=project.get("selling_point_cards", []),
         people_reference=project.get("people_reference"),
         background_reference=project.get("background_reference"),
         audio_mode=project.get("audio_mode", "keep_original"),
         audio_style=project.get("audio_style", ""),
+        user_direction=user_direction,
     )
     return (
         prefix + "\n"
         "00:00.00–00:04.00\n保持：人物身份、动作节奏、手部位置、背景、构图、镜头运动不变。\n修改：无。\n删除：无。\n禁止：不得新增文字或改变动作。\n\n"
         "00:04.00–00:09.50\n保持：镜头二保持正文。\n修改：无。\n删除：无。\n禁止：不得新增文字。"
     )
+
+
+def test_cancel_active_prompt_job_marks_job_and_revision_cancelled() -> None:
+    """缺少取消状态更新会让 worker 继续重试并覆盖未完成版本。"""
+    client = TestClient(create_app())
+    project = _full_prompt_project(client)
+    queued = client.post(
+        f"/api/projects/{project['id']}/prompts",
+        json={"visual_direction": "保持镜头结构", "use_ai": True},
+    )
+    assert queued.status_code == 202
+    with SessionLocal() as session:
+        revision = session.scalar(select(PromptRevision).where(
+            PromptRevision.project_id == UUID(project["id"]),
+            PromptRevision.version == queued.json()["version"],
+        ))
+        job = session.scalar(select(Job).where(Job.provider_input_id == str(revision.id)))
+        job.status = "retryable"
+        job.leased_by = "worker-1"
+        session.commit()
+        job_id = str(job.id)
+        revision_id = revision.id
+
+    response = client.post(f"/api/projects/{project['id']}/analysis/jobs/{job_id}/cancel")
+
+    assert response.status_code == 200
+    assert response.json()["status"] == "cancelled"
+    repeated = client.post(f"/api/projects/{project['id']}/analysis/jobs/{job_id}/cancel")
+    assert repeated.status_code == 200
+    assert repeated.json()["status"] == "cancelled"
+    with SessionLocal() as session:
+        job = session.get(Job, UUID(job_id))
+        revision = session.get(PromptRevision, revision_id)
+        assert job.status == "cancelled"
+        assert job.leased_by is None
+        assert revision.status == "cancelled"
+
+
+def test_cancel_prompt_job_rejects_completed_task() -> None:
+    """取消接口不能把历史成功任务倒退成已取消。"""
+    client = TestClient(create_app())
+    project = client.post("/api/projects", json={"name": "completed-prompt"}).json()
+    with SessionLocal() as session:
+        job = Job(
+            project_id=UUID(project["id"]), kind="final_prompt_generation",
+            status="completed", provider="comfly_gpt",
+        )
+        session.add(job)
+        session.commit()
+        job_id = str(job.id)
+
+    response = client.post(f"/api/projects/{project['id']}/analysis/jobs/{job_id}/cancel")
+
+    assert response.status_code == 409
+    with SessionLocal() as session:
+        assert session.get(Job, UUID(job_id)).status == "completed"
+
+
+def test_cancelled_prompt_job_discards_provider_result() -> None:
+    """取消发生在供应商请求期间时，迟到结果不得把任务重新改成完成。"""
+    client = TestClient(create_app())
+    project = _full_prompt_project(client)
+    queued = client.post(
+        f"/api/projects/{project['id']}/prompts",
+        json={"visual_direction": "保持镜头结构", "use_ai": True},
+    )
+    assert queued.status_code == 202
+    with SessionLocal() as session:
+        revision = session.scalar(select(PromptRevision).where(
+            PromptRevision.project_id == UUID(project["id"]),
+            PromptRevision.version == queued.json()["version"],
+        ))
+        job = session.scalar(select(Job).where(Job.provider_input_id == str(revision.id)))
+        job.status = revision.status = "processing"
+        session.commit()
+        job_id = str(job.id)
+        revision_id = revision.id
+        original_text = revision.text
+
+        def cancel_while_waiting(*_args, **_kwargs):
+            response = client.post(f"/api/projects/{project['id']}/analysis/jobs/{job_id}/cancel")
+            assert response.status_code == 200
+            return '{"blocks":[{"keep":"a","modify":"无","delete":"无","forbid":"无","selling_point_ids":[]},{"keep":"b","modify":"无","delete":"无","forbid":"无","selling_point_ids":[]}]}'
+
+        with patch("app.services.final_prompt._chat", side_effect=cancel_while_waiting):
+            execute_final_prompt_job(session, job, Settings(comfly_api_key="test-comfly-api-key"))
+
+    with SessionLocal() as session:
+        job = session.get(Job, UUID(job_id))
+        revision = session.get(PromptRevision, revision_id)
+        assert job.status == "cancelled"
+        assert revision.status == "cancelled"
+        assert revision.text == original_text
 
 
 def test_full_prompt_ai_creation_queues_full_reference_video_edit() -> None:
@@ -1053,9 +1320,9 @@ def test_full_prompt_ai_creation_queues_full_reference_video_edit() -> None:
         assert revision.prompt_mode == "full_reference_video_edit"
         assert revision.generation_segment_id is None
         # 排队时冻结确定性前缀（非空），Worker 完成后替换为完整提示词。
-        expected_prefix = _full_prompt_text(project).split("00:00.00–00:04.00")[0].rstrip()
+        expected_prefix = _full_prompt_text(project, "只修改产品，其他画面保持").split("00:00.00–00:04.00")[0].rstrip()
         assert revision.text == expected_prefix
-        assert revision.text.startswith("原参考视频是时间轴")
+        assert revision.text.startswith("【最高优先级：用户改编要求】\n只修改产品，其他画面保持")
 
 
 def test_full_prompt_manual_save_accepts_all_blocks_and_prefix() -> None:
@@ -1075,13 +1342,42 @@ def test_full_prompt_manual_save_accepts_all_blocks_and_prefix() -> None:
         ))
         assert revision.prompt_mode == "full_reference_video_edit"
         assert revision.generation_segment_id is None
-        assert revision.text == _full_prompt_text(project)
+        assert "完整移除原片全部包装外字幕" in revision.text
+        assert "禁止生成或复刻任何包装外文字" in revision.text
+
+
+def test_full_prompt_manual_save_accepts_body_longer_than_visual_direction_limit() -> None:
+    client = TestClient(create_app())
+    project = _full_prompt_project(client)
+    long_prompt = _full_prompt_text(project, "人工编辑完整提示词").replace("镜头二保持正文", "长提示词正文" * 1400)
+    assert len(long_prompt) > 8_000
+
+    response = client.post(
+        f"/api/projects/{project['id']}/prompts",
+        json={
+            "visual_direction": "人工编辑完整提示词",
+            "prompt_text": long_prompt,
+            "use_ai": False,
+        },
+    )
+
+    assert response.status_code == 201
+    assert "长提示词正文" * 1400 in response.json()["text"]
+    assert "完整移除原片全部包装外字幕" in response.json()["text"]
+    with SessionLocal() as session:
+        revision = session.scalar(select(PromptRevision).where(
+            PromptRevision.project_id == UUID(project["id"]),
+            PromptRevision.version == response.json()["version"],
+        ))
+        assert revision.prompt_mode == "full_reference_video_edit"
+        assert revision.generation_segment_id is None
+        assert revision.text == response.json()["text"]
 
 
 @pytest.mark.parametrize("mutate", [
     lambda text: text.replace("00:04.00–00:09.50", ""),  # 删掉整个第二块
     lambda text: text.replace("删除：无", ""),  # 删栏目
-    lambda text: text.replace("核心卖点：轻薄、不黏腻", "虚构卖点：不是真实的"),  # 篡改产品档案
+    lambda text: text.replace("视觉锚点：低矮圆罐，浅色罐身与圆形罐盖", "视觉锚点：虚构产品外观"),  # 篡改产品档案
     lambda text: text.replace("产品参考图用途", "参考资料"),  # 删用途规则
 ])
 def test_full_prompt_manual_save_rejects_incomplete(mutate) -> None:
@@ -1158,7 +1454,8 @@ def test_full_prompt_gpt_receives_frozen_prefix_context() -> None:
         assert "目标产品必须匹配已确认产品档案" in captured["user"]
         assert "产品参考图用途" in captured["user"]
         assert "正面" in captured["user"]
-        assert "原参考视频是时间轴" in captured["user"]
+        assert "【参考范围】" in captured["user"]
+        assert "【最高优先级：用户改编要求】\n只修改产品" in captured["user"]
 
 
 def test_full_prompt_queued_prefix_is_frozen_against_product_edits() -> None:
@@ -1271,7 +1568,7 @@ def test_full_prompt_ai_creation_rejects_unconfirmed_shot() -> None:
 
 def test_full_prompt_refinement_restores_exact_source_prefix() -> None:
     """完整提示词精修：GPT 改写前缀时，最终版本仍从源版本原样恢复前缀，且模式保持。"""
-    from app.services.final_prompt import execute_prompt_refinement_job
+    from app.services.final_prompt import execute_prompt_refinement_job, generation_prompt_contract_ready
     client = TestClient(create_app())
     project = _full_prompt_project(client)
     v1 = client.post(
@@ -1308,6 +1605,13 @@ def test_full_prompt_refinement_restores_exact_source_prefix() -> None:
         assert new_revision.status == "completed"
         assert new_revision.prompt_mode == "full_reference_video_edit"
         assert new_revision.generation_segment_id is None
+        source_revision = session.scalar(select(PromptRevision).where(
+            PromptRevision.project_id == UUID(project["id"]),
+            PromptRevision.version == v1.json()["version"],
+        ))
+        assert new_revision.visual_direction == source_revision.visual_direction
+        assert new_revision.operation_instruction == "增强光线"
+        assert generation_prompt_contract_ready(new_revision.text, new_revision.visual_direction)
         # 前缀从源版本原样恢复，GPT 假前缀被丢弃。
         assert new_revision.text.startswith(source_prefix)
         assert "GPT 改写的假前缀" not in new_revision.text
@@ -1379,9 +1683,11 @@ def test_optimize_selling_points_creates_new_version_and_job() -> None:
         assert new_revision.prompt_mode == "full_reference_video_edit"
         assert new_revision.generation_segment_id is None
         # 新版本 text 冻结源版本全文（快照）。
-        assert new_revision.text == _full_prompt_text(project)
+        assert new_revision.text == v1.json()["text"]
         assert job is not None
         assert job.status == "queued"
+    visible_jobs = client.get(f"/api/projects/{project['id']}/analysis/jobs").json()
+    assert any(item["kind"] == "prompt_selling_point_optimization" for item in visible_jobs)
     # 源版本保持不变。
     history = client.get(f"/api/projects/{project['id']}/prompts")
     versions = [item["version"] for item in history.json()]
@@ -1431,16 +1737,26 @@ def test_selling_point_optimization_worker_restores_prefix_and_keeps_blocks() ->
             Job.kind == "prompt_selling_point_optimization",
             Job.provider_input_id == str(new_revision.id),
         ))
-        blocks = (
-            "00:00.00–00:04.00\n保持：a\n修改：突出轻薄质感，光线柔和。\n删除：无。\n禁止：无。\n\n"
-            "00:04.00–00:09.50\n保持：b\n修改：无。\n删除：无。\n禁止：无。"
-        )
+        blocks = __import__("json").dumps({"blocks": [
+            {
+                "keep": "模型无权覆盖的保持栏", "modify": "突出轻薄质感，光线柔和。",
+                "delete": "模型无权覆盖的删除栏", "forbid": "模型无权覆盖的禁止栏",
+                "selling_point_ids": ["SP1"],
+            },
+            {
+                "keep": "模型无权覆盖的保持栏", "modify": "无。",
+                "delete": "模型无权覆盖的删除栏", "forbid": "模型无权覆盖的禁止栏",
+                "selling_point_ids": [],
+            },
+        ]}, ensure_ascii=False)
         with patch("app.services.final_prompt._chat", return_value=blocks):
             execute_selling_point_optimization_job(session, job, Settings(comfly_api_key="test-comfly-api-key"))
         session.refresh(new_revision)
         assert new_revision.status == "completed"
         assert new_revision.text.startswith(source_prefix)
         assert "突出轻薄质感" in new_revision.text
+        assert "保持：人物身份、动作节奏、手部位置、背景、构图、镜头运动不变。" in new_revision.text
+        assert "模型无权覆盖" not in new_revision.text
         assert "00:00.00–00:04.00" in new_revision.text
         assert "00:04.00–00:09.50" in new_revision.text
     # 源版本未被覆盖。
@@ -1449,7 +1765,7 @@ def test_selling_point_optimization_worker_restores_prefix_and_keeps_blocks() ->
             PromptRevision.project_id == UUID(project["id"]),
             PromptRevision.version == v1.json()["version"],
         ))
-        assert source.text == _full_prompt_text(project)
+        assert source.text == v1.json()["text"]
         assert source.status == "completed"
 
 
@@ -1476,13 +1792,13 @@ def test_selling_point_optimization_invalid_structure_fails_not_completed() -> N
             Job.kind == "prompt_selling_point_optimization",
             Job.provider_input_id == str(new_revision.id),
         ))
-        # 缺第二块。
-        broken = "00:00.00–00:04.00\n保持：a\n修改：无。\n删除：无。\n禁止：无。"
+        # 结构化返回缺第二块。
+        broken = '{"blocks":[{"keep":"a","modify":"无。","delete":"无。","forbid":"无。","selling_point_ids":[]}]}'
         with patch("app.services.final_prompt._chat", return_value=broken):
             try:
                 execute_selling_point_optimization_job(session, job, Settings(comfly_api_key="test-comfly-api-key"))
             except ValueError as error:
-                assert "不完整" in str(error)
+                assert "结构化镜头数据" in str(error)
             else:
                 assert False, "缺块卖点优化必须失败"
         session.refresh(new_revision)
@@ -1570,7 +1886,7 @@ def test_queued_optimization_binds_source_text_even_after_new_version() -> None:
             PromptRevision.project_id == UUID(project["id"]),
             PromptRevision.version == optimized.json()["version"],
         ))
-        assert queued_opt.text == _full_prompt_text(project)
+        assert queued_opt.text == v1.json()["text"]
         assert "（v2）" not in queued_opt.text
 
 

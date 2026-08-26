@@ -1,21 +1,7 @@
 import type { AnalysisJob, ProductCompatibility, TimelineShot } from '../api'
+import type { EditDraft } from '../shotDraft'
 import { effectiveShotAnalysisStatus } from '../workspaceDomain'
 import { StatusBadge } from './StatusBadge'
-
-export type EditDraft = {
-  people: string
-  action: string
-  product: string
-  productInteraction: string
-  background: string
-  camera: string
-  lighting: string
-  visualStyle: string
-  visibleText: string
-  keep: string
-  uncertainties: string
-  confirmed: boolean
-}
 
 type Props = {
   shots: TimelineShot[]
@@ -28,6 +14,7 @@ type Props = {
   onSelect: (id: string) => void
   onEdit: (draft: EditDraft) => void
   onSave: (confirmed?: boolean) => void
+  onDelete: (id: string) => void
   onRetry: (id: string) => void
   onAdoptAI: (id: string) => void
   onOpenPrompt: () => void
@@ -54,19 +41,21 @@ const formatTime = (seconds: number) => {
 
 export function ShotWorkspace(p: Props) {
   const shot = p.shots.find((item) => item.id === p.selectedId) || p.shots[0]
+  const shotIndex = shot ? p.shots.indexOf(shot) : -1
+  const nextShot = shotIndex >= 0 ? p.shots[shotIndex + 1] : undefined
   const job = p.jobs.find((item) => item.shot_id === shot?.id)
   const status = effectiveShotAnalysisStatus(shot?.analysis_status, job?.status || (shot?.action ? 'completed' : null))
   const confirmedCount = p.shots.filter((item) => item.edit?.confirmed).length
 
   return <section className="stage-content shot-stage">
-    <div className="stage-heading"><div><span className="eyebrow">分镜事实</span><h1>检查GPT综合后的最终内容</h1><p>豆包与GPT的中间结果保留在后台。你只需修改最终事实并确认。</p></div><span className="version-badge">已确认 {confirmedCount}/{p.shots.length}</span></div>
+    <div className="stage-heading"><div><span className="eyebrow">分镜事实</span><h1>检查Qwen生成的最终内容</h1><p>Qwen原始结果保留在后台。你只需修改最终事实并确认。</p></div><span className="version-badge">已确认 {confirmedCount}/{p.shots.length}</span></div>
     <div className="fact-card-workspace">
       <aside className="shot-browser"><header><strong>{p.shots.length} 个镜头</strong><small>最终事实状态</small></header>{p.shots.map((item, index) => {
         const itemJob = p.jobs.find((entry) => entry.shot_id === item.id)
         const itemStatus = item.edit?.confirmed ? 'completed' : effectiveShotAnalysisStatus(item.analysis_status, itemJob?.status)
-        return <button key={item.id} className={item.id === shot?.id ? 'active' : ''} onClick={() => p.onSelect(item.id)}><span>{String(index + 1).padStart(2, '0')}</span><div><strong>镜头 {index + 1}</strong><small>{formatTime(item.start_sec)}–{formatTime(item.end_sec)}</small></div><StatusBadge status={itemStatus} /></button>
+        return <button key={item.id} className={item.id === shot?.id ? 'active' : ''} onClick={() => p.onSelect(item.id)}><span>{String(index + 1).padStart(2, '0')}</span><div><strong>镜头 {index + 1}</strong><small>{formatTime(item.start_sec)}–{formatTime(item.end_sec)}</small></div><StatusBadge status={itemStatus} label={item.edit?.confirmed ? '已确认' : undefined} /></button>
       })}</aside>
-      {shot && <main className="final-fact-card"><header><div><span className="eyebrow">镜头 {p.shots.indexOf(shot) + 1}</span><h2>{formatTime(shot.start_sec)}–{formatTime(shot.end_sec)}</h2></div><StatusBadge status={p.edit.confirmed ? 'completed' : status} /></header>
+      {shot && <main className="final-fact-card"><header><div><span className="eyebrow">镜头 {p.shots.indexOf(shot) + 1}</span><h2>{formatTime(shot.start_sec)}–{formatTime(shot.end_sec)}</h2></div><div className="shot-header-actions"><StatusBadge status={p.edit.confirmed ? 'completed' : status} label={p.edit.confirmed ? '已确认' : undefined} /><button type="button" className="button danger compact" disabled={p.saving || p.shots.length < 2} onClick={() => p.onDelete(shot.id)}>删除本镜头</button></div></header>
         {shot.has_new_ai_summary && <div className="compatibility-banner"><strong>本镜头有新的AI总结</strong><span>当前人工版本未被覆盖。你可以查看并采用新总结。</span><button type="button" className="button secondary" onClick={() => p.onAdoptAI(shot.id)}>查看并采用</button></div>}
         {status === 'failed' ? <div className="shot-failure"><strong>本镜头理解失败</strong><p>{job?.error_message || shot.analysis_error}</p><button className="button secondary" onClick={() => p.onRetry(shot.id)}>重新理解本镜头</button></div> : <form onSubmit={(event) => event.preventDefault()}>
           <div className="final-fact-fields">{fields.map(([label, key, hint]) => <label key={key}><span>{label}<small>{hint}</small></span><textarea value={String(p.edit[key])} onChange={(event) => p.onEdit({ ...p.edit, [key]: event.target.value, confirmed: false })} /></label>)}</div>
@@ -75,6 +64,7 @@ export function ShotWorkspace(p: Props) {
             <button type="button" className="button secondary" disabled={p.saving} onClick={() => p.onRetry(shot.id)}>重新理解本镜头</button>
             <button type="button" className="button secondary" disabled={p.saving} onClick={() => p.onSave(false)}>保存修改</button>
             <button type="button" className={`button primary ${p.edit.confirmed ? 'confirmed' : ''}`} disabled={p.saving || p.edit.confirmed} onClick={() => p.onSave(true)}>{p.saving ? '确认中…' : p.edit.confirmed ? '✓ 已确认' : '确认本镜头'}</button>
+            <button type="button" className="button secondary" disabled={p.saving || !nextShot} onClick={() => nextShot && p.onSelect(nextShot.id)}>{nextShot ? '下一个镜头 →' : '已是最后一镜头'}</button>
           </div>
         </form>}
       </main>}

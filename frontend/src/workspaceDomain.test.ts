@@ -48,6 +48,7 @@ describe('analysis statuses', () => {
   it('presents every backend state in user language', () => {
     expect(analysisStatusLabel('queued')).toBe('排队中')
     expect(analysisStatusLabel('processing')).toBe('分析中')
+    expect(analysisStatusLabel('retryable')).toBe('等待重试')
     expect(analysisStatusLabel('completed')).toBe('分析成功')
     expect(analysisStatusLabel('failed')).toBe('分析失败')
   })

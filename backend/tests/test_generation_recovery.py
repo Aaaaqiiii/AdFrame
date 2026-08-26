@@ -27,7 +27,7 @@ def test_expired_generation_lease_is_claimed_after_worker_restart(processing_gen
         session.commit()
         generation = session.get(Generation, processing_generation.id)
         generation.leased_by = "dead-worker"
-        generation.leased_at = datetime.now(UTC) - timedelta(minutes=11)
+        generation.leased_at = datetime.now(UTC) - timedelta(minutes=21)
         generation.next_attempt_at = datetime.now(UTC) - timedelta(seconds=1)
         session.commit()
         claimed = _claim(

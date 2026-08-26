@@ -7,7 +7,7 @@ from sqlalchemy.orm import Session
 
 from app.api.routes.timeline import TimelineOutput, store_timeline_revision
 from app.core.config import Settings
-from app.db.models import Asset, Job, Project, Shot, ShotEvidence, TimelineRevision
+from app.db.models import Asset, Job, Project, PromptRevision, Shot, ShotEvidence, TimelineRevision
 from app.db.session import get_session
 from app.services.media import detect_candidate_cuts, extract_keyframes, probe_video
 from app.services.comfly_frame_vision import validate_frame_vision_configuration
@@ -15,6 +15,8 @@ from app.services.dual_shot_vision import validate_dual_vision_configuration
 from app.services.volcengine_vision import VisionConfigurationError
 
 router = APIRouter(prefix="/api/projects/{project_id}/analysis", tags=["analysis"])
+PROMPT_JOB_KINDS = {"final_prompt_generation", "prompt_refinement", "prompt_selling_point_optimization"}
+ACTIVE_JOB_STATUSES = {"queued", "uploaded", "running", "processing", "retryable"}
 
 
 @router.post("/start", response_model=TimelineOutput, status_code=status.HTTP_202_ACCEPTED)
@@ -130,7 +132,7 @@ def request_shot_vision_analysis(project_id: UUID, session: Session = Depends(ge
             shot_id=shot.id,
             kind="vision_shot_analysis",
             status="queued",
-            provider="doubao_gpt_synthesis",
+            provider="qwen_full_shot",
         )
         for shot in shots_to_queue
     ]
@@ -147,7 +149,7 @@ def request_shot_vision_analysis(project_id: UUID, session: Session = Depends(ge
 
 
 def _job_status(value: str) -> str:
-    return {"uploaded": "processing", "retryable": "queued"}.get(value, value)
+    return {"uploaded": "processing"}.get(value, value)
 
 
 @router.get("/jobs")
@@ -156,12 +158,35 @@ def list_analysis_jobs(project_id: UUID, session: Session = Depends(get_session)
         raise HTTPException(status_code=404, detail="项目不存在")
     jobs = session.scalars(select(Job).where(
         Job.project_id == project_id,
-        Job.kind.in_(["vision_analysis", "vision_shot_analysis", "reference_profile_analysis", "final_prompt_generation", "prompt_refinement"]),
+        Job.kind.in_(["vision_analysis", "vision_shot_analysis", "reference_profile_analysis", "final_prompt_generation", "prompt_refinement", "prompt_selling_point_optimization"]),
     ).order_by(Job.created_at.desc(), Job.id.desc())).all()
     return [{
         "job_id": str(job.id), "kind": job.kind, "shot_id": str(job.shot_id) if job.shot_id else None,
         "status": _job_status(job.status), "error": job.error_message, "attempts": job.attempts,
     } for job in jobs]
+
+
+@router.post("/jobs/{job_id}/cancel")
+def cancel_prompt_job(project_id: UUID, job_id: UUID, session: Session = Depends(get_session)) -> dict:
+    job = session.get(Job, job_id)
+    if job is None or job.project_id != project_id or job.kind not in PROMPT_JOB_KINDS:
+        raise HTTPException(status_code=404, detail="GPT 提示词任务不存在")
+    if job.status == "cancelled":
+        return {"job_id": str(job.id), "kind": job.kind, "status": job.status, "attempts": job.attempts}
+    if job.status not in ACTIVE_JOB_STATUSES:
+        raise HTTPException(status_code=409, detail="该 GPT 提示词任务已经结束，不能取消")
+    job.status, job.error_message = "cancelled", "用户取消"
+    job.next_attempt_at = None
+    job.leased_at = job.leased_by = None
+    if job.provider_input_id:
+        try:
+            revision = session.get(PromptRevision, UUID(job.provider_input_id))
+        except ValueError:
+            revision = None
+        if revision is not None and revision.project_id == project_id and revision.status not in {"completed", "failed"}:
+            revision.status, revision.error_message = "cancelled", "用户取消"
+    session.commit()
+    return {"job_id": str(job.id), "kind": job.kind, "status": job.status, "attempts": job.attempts}
 
 
 @router.post("/shots/{shot_id}/retry", status_code=status.HTTP_202_ACCEPTED)
@@ -180,7 +205,7 @@ def retry_shot_analysis(project_id: UUID, shot_id: UUID, session: Session = Depe
         return {"job_id": str(active.id), "shot_id": str(shot_id), "status": _job_status(active.status)}
     shot.analysis_status, shot.analysis_error = "queued", None
     # 新任务产生新的AI总结；已保存的人工版本不会在这里被覆盖。
-    job = Job(project_id=project_id, shot_id=shot_id, kind="vision_shot_analysis", status="queued", provider="doubao_gpt_synthesis")
+    job = Job(project_id=project_id, shot_id=shot_id, kind="vision_shot_analysis", status="queued", provider="qwen_full_shot")
     session.add(job)
     session.commit()
     return {"job_id": str(job.id), "shot_id": str(shot_id), "status": "queued"}

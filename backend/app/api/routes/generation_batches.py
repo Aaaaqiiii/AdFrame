@@ -8,10 +8,14 @@ from __future__ import annotations
 
 import hashlib
 import json
+import subprocess
 from dataclasses import dataclass
+from pathlib import Path
+from typing import Literal
 from uuid import UUID, uuid4
 
 from fastapi import APIRouter, Depends, HTTPException, status
+from fastapi.responses import FileResponse
 from pydantic import BaseModel, ConfigDict, Field
 from sqlalchemy import func, select
 from sqlalchemy.orm import Session
@@ -20,8 +24,10 @@ from app.core.config import Settings
 from app.db.models import Asset, Generation, GenerationSegment, Project, PromptRevision, Shot, ShotEdit, TimelineRevision
 from app.db.session import get_session
 from app.services.full_prompt import FullPromptValidationError, validate_full_prompt
-from app.services.product_rules import confirmed_target_product_assets
+from app.services.final_prompt import generation_prompt_contract_ready, normalize_full_prompt_contract, person_replacement_contract_ready
+from app.services.product_rules import confirmed_generation_product_assets
 from app.services.reference_profiles import load_structure
+from app.services.media import MediaToolUnavailableError, concat_videos_lossless
 from app.api.routes.generations import generation_response
 
 router = APIRouter(prefix="/api/projects/{project_id}/generation-batches", tags=["generation-batches"])
@@ -31,7 +37,9 @@ class CreateGenerationBatchRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
     provider: str = Field(pattern="^(volcengine|comfly)$")
     prompt_version: int = Field(ge=1)
+    ratio: Literal["adaptive", "16:9", "4:3", "1:1", "3:4", "9:16", "21:9"] = "adaptive"
     generate_audio: bool = False
+    # 兼容旧客户端；服务端始终根据提示词和已上传素材自动附加参考图。
     include_person_reference: bool = False
     include_background_reference: bool = False
 
@@ -67,17 +75,8 @@ def _current_shots(session: Session, revision: TimelineRevision) -> list[Shot]:
 
 
 def _confirmed_product_assets(session: Session, project_id: UUID) -> list[Asset]:
-    assets = list(session.scalars(select(Asset).where(Asset.project_id == project_id, Asset.kind == "product_reference_image").order_by(Asset.id)))
-    confirmed = []
-    for asset in assets:
-        if not asset.profile_text or not asset.profile_text.strip():
-            continue
-        if asset.analysis_status not in {"succeeded", "completed"}:
-            continue
-        if not load_structure(asset).get("summary_confirmed"):
-            continue
-        confirmed.append(asset)
-    return confirmed
+    project = session.get(Project, project_id)
+    return confirmed_generation_product_assets(session, project) if project else []
 
 
 def derive_batch_status(statuses: list[str]) -> str:
@@ -121,8 +120,6 @@ def _require_batch_inputs(
     prompt_version: int,
     provider: str,
     settings: Settings,
-    include_person_reference: bool,
-    include_background_reference: bool,
 ) -> BatchInputs:
     """只读 preflight：任何校验失败都抛 HTTPException，不写入任何行。"""
     project = session.get(Project, project_id)
@@ -134,10 +131,8 @@ def _require_batch_inputs(
     shots = _current_shots(session, timeline)
     if not shots:
         raise HTTPException(status_code=422, detail="当前时间轴没有镜头")
-    unconfirmed = [shot for shot in shots if not session.scalar(
-        select(ShotEdit).where(ShotEdit.project_id == project_id, ShotEdit.shot_id == shot.id, ShotEdit.confirmed.is_(True))
-    )]
-    if unconfirmed:
+    edits = [session.scalar(select(ShotEdit).where(ShotEdit.project_id == project_id, ShotEdit.shot_id == shot.id)) for shot in shots]
+    if any(edit is None or not edit.confirmed for edit in edits):
         raise HTTPException(status_code=422, detail="时间轴存在未确认镜头，请先确认全部镜头")
     prompt = session.scalar(select(PromptRevision).where(
         PromptRevision.project_id == project_id, PromptRevision.version == prompt_version,
@@ -146,14 +141,27 @@ def _require_batch_inputs(
         raise HTTPException(status_code=422, detail="请先生成或保存一份完整提示词")
     if prompt.prompt_mode != "full_reference_video_edit" or prompt.generation_segment_id is not None:
         raise HTTPException(status_code=422, detail="批次生成必须使用完整视频编辑提示词")
+    if prompt.replace_person and not person_replacement_contract_ready(prompt.text):
+        raise HTTPException(status_code=422, detail="当前人物替换提示词仍使用旧版冲突规则，请重新生成提示词后再提交视频")
+    if not generation_prompt_contract_ready(prompt.text, prompt.visual_direction):
+        raise HTTPException(status_code=422, detail="当前提示词仍使用旧版参考范围或文字清理规则，请重新生成提示词后再提交视频")
     if prompt.source_timeline_revision_id != timeline.id:
         raise HTTPException(status_code=422, detail="提示词来自旧时间轴，请重新生成提示词")
     # 完整提示词结构校验。
     shot_ranges = [(shot.start_sec, shot.end_sec) for shot in shots]
     try:
         validate_full_prompt(prompt.text, shot_ranges)
+        normalized = normalize_full_prompt_contract(
+            prompt.text,
+            shot_ranges,
+            [{"facts": {"people": edit.people}} for edit in edits if edit is not None],
+            project_mode=project.mode,
+            replace_person=prompt.replace_person,
+        )
     except FullPromptValidationError as exc:
         raise HTTPException(status_code=422, detail=f"完整提示词结构无效：{exc}") from exc
+    if normalized.strip() != prompt.text.strip():
+        raise HTTPException(status_code=422, detail="当前提示词缺少人物替换或画面文字硬约束，请重新保存后再提交视频")
     # 当前/最新不可变方案。
     latest_plan = session.scalar(
         select(func.max(GenerationSegment.plan_version)).where(
@@ -194,32 +202,37 @@ def _require_batch_inputs(
     ).order_by(Asset.id.desc()))
     if video is None:
         raise HTTPException(status_code=422, detail="请先上传参考视频")
-    reference_assets: list[Asset] = []
-    # 替换产品模式：必须包含全部已确认产品图。
+    current_reference_assets: list[Asset] = []
     if project.mode == "replace_product":
-        product_assets = _confirmed_product_assets(session, project_id)
-        if not product_assets:
+        current_reference_assets.extend(_confirmed_product_assets(session, project_id))
+        if not current_reference_assets:
             raise HTTPException(status_code=422, detail="请先确认目标产品档案")
-        reference_assets.extend(product_assets)
-    # 人物/背景参考。
     person_asset = session.scalar(select(Asset).where(
         Asset.project_id == project_id, Asset.kind == "person_reference_image",
     ).order_by(Asset.id.desc()))
     if prompt.replace_person:
         if person_asset is None or not person_asset.profile_user_edited:
-            raise HTTPException(status_code=422, detail="选择替换人物前，请先上传并确认人物图片档案")
-        if not include_person_reference:
-            raise HTTPException(status_code=422, detail="提示词已开启人物替换，必须包含人物参考图")
-        reference_assets.append(person_asset)
-    elif include_person_reference:
-        raise HTTPException(status_code=422, detail="提示词未开启人物替换，不能包含人物参考图")
-    if include_background_reference:
-        background = session.scalar(select(Asset).where(
-            Asset.project_id == project_id, Asset.kind == "background_reference_image",
-        ).order_by(Asset.id.desc()))
-        if background is None:
-            raise HTTPException(status_code=422, detail="请求包含背景参考图，但项目没有背景参考图素材")
-        reference_assets.append(background)
+            raise HTTPException(status_code=422, detail="选择替换人物前，请先确认人物文字档案或人物图片档案")
+    if person_asset is not None:
+        current_reference_assets.append(person_asset)
+    background = session.scalar(select(Asset).where(
+        Asset.project_id == project_id, Asset.kind == "background_reference_image",
+    ).order_by(Asset.id.desc()))
+    if background is not None:
+        current_reference_assets.append(background)
+    reference_assets = current_reference_assets
+    if prompt.reference_asset_ids:
+        try:
+            frozen_ids = [UUID(value) for value in json.loads(prompt.reference_asset_ids)]
+        except (TypeError, ValueError, json.JSONDecodeError) as exc:
+            raise HTTPException(status_code=422, detail="提示词参考素材快照损坏，请重新生成提示词") from exc
+        frozen_assets = [asset for asset_id in frozen_ids if (asset := session.get(Asset, asset_id)) is not None and asset.project_id == project_id]
+        if len(frozen_assets) != len(frozen_ids):
+            raise HTTPException(status_code=422, detail="提示词引用的参考素材已不存在，请重新生成提示词")
+        if {asset.id for asset in frozen_assets} != {asset.id for asset in current_reference_assets}:
+            raise HTTPException(status_code=422, detail="人物、产品或背景参考素材已更新，请重新生成或保存提示词后再提交视频")
+        reference_assets = frozen_assets
+    reference_assets = [asset for asset in reference_assets if (asset.original_path or "").strip()]
     # provider key。
     if not _provider_key_available(settings, provider):
         raise HTTPException(status_code=409, detail="供应商 API Key 未配置")
@@ -240,30 +253,16 @@ def create_generation_batch(
     session: Session = Depends(get_session),
 ) -> GenerationBatchResponse:
     settings = Settings()
+    # 锁内读取当前时间轴、提示词与方案，避免校验后到插入前被其他标签页换版。
+    session.execute(select(Project).where(Project.id == project_id).with_for_update())
     inputs = _require_batch_inputs(
         session, project_id=project_id, prompt_version=payload.prompt_version,
         provider=payload.provider, settings=settings,
-        include_person_reference=payload.include_person_reference,
-        include_background_reference=payload.include_background_reference,
     )
-    # 单事务插入：先锁项目行，锁内重新检查活动重复与版本分配，避免并发创建双批次。
-    session.execute(select(Project).where(Project.id == project_id).with_for_update())
-    active_statuses = ("queued", "processing", "retryable")
-    segment_ids = [segment.id for segment in inputs.segments]
-    active = session.scalar(select(Generation.id).where(
-        Generation.project_id == project_id,
-        Generation.generation_segment_id.in_(segment_ids),
-        Generation.status.in_(active_statuses),
-    ).limit(1))
-    if active is not None:
-        raise HTTPException(status_code=409, detail="相同输入和设置的活动生成任务已存在")
-    max_version = session.scalar(select(func.max(Generation.version)).where(Generation.project_id == project_id)) or 0
-    batch_id = uuid4()
-    batch_size = len(inputs.segments)
     asset_ids = [str(inputs.original_video_asset.id)] + [str(asset.id) for asset in inputs.reference_assets]
-    rows: list[Generation] = []
-    for index, segment in enumerate(inputs.segments):
-        version = max_version + index + 1
+    fingerprints: list[str] = []
+    generate_audio = inputs.prompt_revision.audio_mode in {"auto", "custom", "add_style"}
+    for segment in inputs.segments:
         fingerprint_payload = {
             "project_id": str(project_id),
             "timeline_revision_id": str(inputs.timeline_revision.id),
@@ -274,18 +273,45 @@ def create_generation_batch(
             "prompt_revision_id": str(inputs.prompt_revision.id),
             "prompt_version": payload.prompt_version,
             "provider": payload.provider,
-            "generate_audio": payload.generate_audio,
+            "ratio": payload.ratio,
+            "generate_audio": generate_audio,
             "asset_ids": asset_ids,
         }
-        fingerprint = hashlib.sha256(
+        fingerprints.append(hashlib.sha256(
             json.dumps(fingerprint_payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
-        ).hexdigest()
+        ).hexdigest())
+    # 平台可能已经接单但本地超时的任务也必须参与去重，否则再次提交可能重复计费。
+    active_statuses = ("queued", "processing", "retryable", "submission_uncertain")
+    active = session.scalar(select(Generation).where(
+        Generation.project_id == project_id,
+        Generation.submission_fingerprint.in_(fingerprints),
+        Generation.status.in_(active_statuses),
+    ).limit(1))
+    if active is not None:
+        if active.generation_batch_id is not None:
+            return get_generation_batch(project_id, active.generation_batch_id, session)
+        raise HTTPException(status_code=409, detail="相同输入和设置的活动生成任务已存在")
+    segment_ids = [segment.id for segment in inputs.segments]
+    conflicting = session.scalar(select(Generation).where(
+        Generation.project_id == project_id,
+        Generation.generation_segment_id.in_(segment_ids),
+        Generation.status.in_(active_statuses),
+    ).limit(1))
+    if conflicting is not None:
+        batch_id = str(conflicting.generation_batch_id or "")
+        raise HTTPException(status_code=409, detail=f"这些分段已有活动批次 {batch_id}；请先查看现有批次，避免重复计费")
+    max_version = session.scalar(select(func.max(Generation.version)).where(Generation.project_id == project_id)) or 0
+    batch_id = uuid4()
+    batch_size = len(inputs.segments)
+    rows: list[Generation] = []
+    for index, (segment, fingerprint) in enumerate(zip(inputs.segments, fingerprints, strict=True)):
+        version = max_version + index + 1
         rows.append(Generation(
             project_id=project_id, version=version, prompt_version=payload.prompt_version,
             generation_segment_id=segment.id, generation_batch_id=batch_id,
             batch_position=index + 1, batch_size=batch_size,
-            provider=payload.provider, ratio="adaptive", duration=-1,
-            generate_audio=payload.generate_audio, status="queued",
+            provider=payload.provider, ratio=payload.ratio, duration=-1,
+            generate_audio=generate_audio, status="queued",
             reference_asset_ids=json.dumps(asset_ids, ensure_ascii=False),
             submission_fingerprint=fingerprint,
         ))
@@ -351,4 +377,65 @@ def get_generation_batch(project_id: UUID, batch_id: UUID, session: Session = De
         prompt_version=first.prompt_version, batch_size=len(rows),
         status=derive_batch_status([row.status for row in rows]),
         generations=[generation_response(project_id, row) for row in rows],
+    )
+
+
+def _merged_generation_batch_path(
+    project_id: UUID,
+    batch_id: UUID,
+    session: Session,
+    *,
+    prepare: bool,
+) -> tuple[Path, Generation]:
+    if session.get(Project, project_id) is None:
+        raise HTTPException(status_code=404, detail="项目不存在")
+    rows = _batch_generation_rows(session, project_id, batch_id)
+    if not rows:
+        raise HTTPException(status_code=404, detail="批次不存在")
+    expected_positions = list(range(1, (rows[0].batch_size or len(rows)) + 1))
+    if [row.batch_position for row in rows] != expected_positions or any(row.status != "completed" for row in rows):
+        raise HTTPException(status_code=409, detail="全部片段完成后才能合并下载")
+    if any(not row.result_path for row in rows):
+        raise HTTPException(status_code=404, detail="部分生成片段文件不存在")
+
+    allowed_root = (Settings().media_root / str(project_id) / "generated").resolve()
+    sources = [Path(row.result_path).resolve() for row in rows if row.result_path]
+    if any((allowed_root not in path.parents and path != allowed_root) or not path.is_file() for path in sources):
+        raise HTTPException(status_code=404, detail="部分生成片段文件不可访问")
+    destination = allowed_root / "batches" / str(batch_id) / f"complete-v{rows[0].prompt_version}.mp4"
+    needs_merge = not destination.is_file() or destination.stat().st_mtime < max(path.stat().st_mtime for path in sources)
+    if needs_merge:
+        if not prepare:
+            raise HTTPException(status_code=409, detail="完整视频尚未准备，请重新点击合成下载")
+        try:
+            concat_videos_lossless(sources, destination)
+        except MediaToolUnavailableError as exc:
+            raise HTTPException(status_code=503, detail=str(exc)) from exc
+        except (ValueError, RuntimeError, subprocess.CalledProcessError) as exc:
+            raise HTTPException(status_code=422, detail=f"无损合并失败：{exc}") from exc
+    return destination, rows[0]
+
+
+@router.post("/{batch_id}/merged-content")
+def prepare_merged_generation_batch(
+    project_id: UUID,
+    batch_id: UUID,
+    session: Session = Depends(get_session),
+) -> dict[str, bool]:
+    _merged_generation_batch_path(project_id, batch_id, session, prepare=True)
+    return {"ready": True}
+
+
+@router.get("/{batch_id}/merged-content")
+def get_merged_generation_batch(
+    project_id: UUID,
+    batch_id: UUID,
+    session: Session = Depends(get_session),
+) -> FileResponse:
+    destination, first = _merged_generation_batch_path(project_id, batch_id, session, prepare=False)
+    return FileResponse(
+        destination,
+        media_type="video/mp4",
+        filename=f"complete-video-v{first.prompt_version}.mp4",
+        content_disposition_type="attachment",
     )

@@ -2,8 +2,11 @@ import { useCallback, useEffect, useRef, useState } from 'react'
 import './App.css'
 import {
   analyzeReferenceImage,
+  cancelPromptJob,
   createProject,
   createPrompt,
+  deleteReferenceImage,
+  deleteProject,
   getPreflight,
   getLatestShotAISummary,
   getProject,
@@ -11,10 +14,12 @@ import {
   listAnalysisJobs,
   listPromptRevisions,
   listProjects,
+  mergeTimelineShots,
   mediaUrl,
   referenceImageAssetUrl,
   referenceImageUrl,
   refinePrompt,
+  renameProject,
   requestShotVisionAnalysis,
   restoreAiTimeline,
   retryShotAnalysis,
@@ -29,6 +34,7 @@ import {
   uploadReferenceImage,
   uploadReferenceVideo,
 } from './api'
+import { ApiError } from './api'
 import type { AnalysisJob, AssetKind, ConnectionCheck, GenerationBatch, GenerationSegmentInput, GenerationSegmentPlan, Project, ProjectDetails, PromptRevisionSummary, SettingsSaveResult, Timeline, TimelineShot } from './api'
 import { autoPlanGenerationSegments, createGenerationBatch, getGenerationBatch, getGenerationSegments, listGenerationBatches, optimizePromptSellingPoints, resolveGeneration, retryGeneration, saveGenerationSegments } from './api'
 import { AppHeader } from './components/AppHeader'
@@ -39,49 +45,34 @@ import type { ProductImageUpload } from './components/ProductReferenceCard'
 import { ProjectDrawer, SettingsDialog } from './components/Overlays'
 import { PromptStage } from './components/PromptStage'
 import { ShotWorkspace } from './components/ShotWorkspace'
-import type { EditDraft } from './components/ShotWorkspace'
+import { draftFromShot } from './shotDraft'
+import type { EditDraft } from './shotDraft'
 import { GenerationSegmentsEditor } from './components/GenerationSegmentsEditor'
 import { GenerationStage } from './components/GenerationStage'
 import { TimelineEditor } from './components/TimelineEditor'
 import { WorkflowRail } from './components/WorkflowRail'
-import { inferProductProfile } from './productProfile'
-import { restoreProjectId, saveProjectId } from './projectSession'
+import { restoreProjectId, restoreWorkflowStage, saveProjectId, saveWorkflowStage } from './projectSession'
 import { shotIndexAtTime } from './timelineScrubbing'
 import { modeFromPath, modePath, preserveShotSelection, shouldRefreshProjectDuringPolling } from './workspaceDomain'
-import { choosePromptRevision, latestPromptJob, promptTaskFromJobs } from './promptWorkflow'
+import { choosePromptRevision, latestPromptJob, promptJobKind, promptRetryNotice, promptTaskFromJobs } from './promptWorkflow'
+import { chooseRestoredGenerationBatch } from './generationDomain'
 import { localId } from './runtime'
 import type { WorkflowStage } from './workspaceDomain'
 
 const MODE = modeFromPath(window.location.pathname)
+const DEFAULT_PROMPT_DIRECTION = '保持原视频的镜头时长、动作节奏、构图与运镜；未明确修改的事实保持不变。'
 const EMPTY_MATERIAL = (): MaterialState => ({ filename: '', previewUrl: '', images: [], status: 'pending', profile: '', error: '' })
 const EMPTY_EDIT: EditDraft = {
   people: '', action: '', product: '', productInteraction: '', background: '', camera: '',
   lighting: '', visualStyle: '', visibleText: '', uncertainties: '', keep: '', confirmed: false,
 }
-const terminal = (status?: string | null) => status === 'completed' || status === 'succeeded' || status === 'failed'
+const terminal = (status?: string | null) => status === 'completed' || status === 'succeeded' || status === 'failed' || status === 'cancelled'
 const success = (status?: string | null) => status === 'completed' || status === 'succeeded'
+const audioMode = (value?: string): 'none' | 'auto' | 'custom' => value === 'auto' ? 'auto' : value === 'custom' || value === 'add_style' ? 'custom' : 'none'
 
 function errorMessage(error: unknown) {
   if (error instanceof Error) return error.message
   return '请求失败，请稍后重试'
-}
-
-function draftFromShot(shot?: TimelineShot): EditDraft {
-  // 人工版本优先；首次进入时用 GPT 综合事实填充一份可编辑副本。
-  return {
-    people: shot?.edit?.people || shot?.people || '',
-    action: shot?.edit?.action || shot?.action || '',
-    product: shot?.edit?.product || shot?.product || '',
-    productInteraction: shot?.edit?.product_interaction || shot?.product_interaction || '',
-    background: shot?.edit?.background || shot?.background || '',
-    camera: shot?.edit?.camera || shot?.camera || '',
-    lighting: shot?.edit?.lighting || shot?.lighting || '',
-    visualStyle: shot?.edit?.visual_style || shot?.visual_style || '',
-    visibleText: shot?.edit?.visible_text || shot?.on_screen_text || '',
-    uncertainties: shot?.edit?.uncertainties || shot?.uncertainties || '',
-    keep: shot?.edit?.keep_unchanged.join('\n') || shot?.keep_unchanged || '',
-    confirmed: Boolean(shot?.edit?.confirmed),
-  }
 }
 
 function timelineRanges(shots: TimelineShot[]) {
@@ -89,16 +80,19 @@ function timelineRanges(shots: TimelineShot[]) {
 }
 
 function App() {
-  const [stage, setStage] = useState<WorkflowStage>('materials')
+  const restoredStage = useRef(restoreWorkflowStage(localStorage, MODE))
+  const [stage, setStage] = useState<WorkflowStage>(() => restoredStage.current || 'materials')
   const [projectId, setProjectId] = useState(() => restoreProjectId(localStorage, MODE) || '')
   const [projectName, setProjectName] = useState('')
   const [projects, setProjects] = useState<Project[]>([])
   const [projectDrawer, setProjectDrawer] = useState(false)
+  const [deletingProjectId, setDeletingProjectId] = useState<string | null>(null)
+  const [deletingAssetKind, setDeletingAssetKind] = useState<AssetKind | null>(null)
   const [settingsOpen, setSettingsOpen] = useState(false)
   const [notice, setNotice] = useState('上传参考视频后，系统会先理解完整内容，再让你校正镜头。')
   const [video, setVideo] = useState({ filename: '', previewUrl: '', uploading: false })
   const [materials, setMaterials] = useState<Record<AssetKind, MaterialState>>({ product: EMPTY_MATERIAL(), target_product: EMPTY_MATERIAL(), person: EMPTY_MATERIAL(), background: EMPTY_MATERIAL() })
-  const [productIdentity, setProductIdentity] = useState({ name: '', sellingPoints: '', confirmed: false })
+  const [productIdentity, setProductIdentity] = useState({ name: '', category: '', packageForm: '', sellingPoints: '', confirmed: false })
   const [timeline, setTimeline] = useState<Timeline | null>(null)
   const [aiRevisionId, setAiRevisionId] = useState('')
   const [timelineDirty, setTimelineDirty] = useState(false)
@@ -108,9 +102,7 @@ function App() {
   const [segmentBusy, setSegmentBusy] = useState(false)
   const [selectedSegmentId, setSelectedSegmentId] = useState<string | null>(null)
   const [selectedProvider, setSelectedProvider] = useState<'volcengine' | 'comfly'>('volcengine')
-  const [generateAudio, setGenerateAudio] = useState(false)
-  const [includePersonReference, setIncludePersonReference] = useState(false)
-  const [includeBackgroundReference, setIncludeBackgroundReference] = useState(false)
+  const [generationRatio, setGenerationRatio] = useState<'adaptive' | '16:9' | '4:3' | '1:1' | '3:4' | '9:16' | '21:9'>('adaptive')
   const [optimizeBusy, setOptimizeBusy] = useState(false)
   const [generationBusy, setGenerationBusy] = useState(false)
   const [selectedBatch, setSelectedBatch] = useState<GenerationBatch | null>(null)
@@ -126,11 +118,16 @@ function App() {
   const [shotSaving, setShotSaving] = useState(false)
   const [shotEdit, setShotEdit] = useState<EditDraft>({ ...EMPTY_EDIT })
   const [promptText, setPromptText] = useState('')
-  const [promptDirection, setPromptDirection] = useState('保持原视频的镜头时长、动作节奏、构图、运镜与原BGM。')
+  const [promptDirty, setPromptDirty] = useState(false)
+  const [promptDirection, setPromptDirection] = useState(DEFAULT_PROMPT_DIRECTION)
   const [promptRefinement, setPromptRefinement] = useState('')
   const [replacePerson, setReplacePerson] = useState(false)
   const [promptTask, setPromptTask] = useState<'generate' | 'refine' | 'optimize' | null>(null)
+  const [cancellingPromptTask, setCancellingPromptTask] = useState(false)
   const [promptVersion, setPromptVersion] = useState(0)
+  const [promptMode, setPromptMode] = useState<'full_reference_video_edit' | 'standalone_video_recreation'>('full_reference_video_edit')
+  const [recreationAudioMode, setRecreationAudioMode] = useState<'none' | 'auto' | 'custom'>('none')
+  const [recreationAudioRequirement, setRecreationAudioRequirement] = useState('')
   const [promptVersions, setPromptVersions] = useState<PromptRevisionSummary[]>([])
   const [preflight, setPreflight] = useState<Record<string, { ready: boolean; model: string; endpoint: string }> | null>(null)
   const [connectionChecks, setConnectionChecks] = useState<Record<string, ConnectionCheck>>({})
@@ -140,8 +137,6 @@ function App() {
 
   const shots = timeline?.shots || []
   const selectedShot = shots.find((shot) => shot.id === selectedShotId)
-  const promptProduct = materials.product
-  const productProfile = promptProduct.profile.trim() || inferProductProfile(shots.map((shot) => ({ productInteraction: shot.product_interaction, observations: shot.observations })))
   const allShotJobsDone = shots.length > 0 && shots.every((shot) => success(shot.analysis_status) || success(jobs.find((job) => job.shot_id === shot.id)?.status))
 
   const setTimelineState = useCallback((value: Timeline, confirmed = false) => {
@@ -155,12 +150,22 @@ function App() {
     setGenerationPlan(null)
   }, [])
 
-  const restorePromptVersions = useCallback(async (id: string, preferredVersion?: number, preferLatest = false) => {
+  const restorePromptVersions = useCallback(async (id: string, preferredVersion?: number, preferLatest = false, currentTimelineRevisionId?: string) => {
     const versions = await listPromptRevisions(id)
     setPromptVersions(versions)
-    const selected = choosePromptRevision(versions, preferLatest ? undefined : preferredVersion)
+    const currentVersions = currentTimelineRevisionId
+      ? versions.filter((item) => item.source_timeline_revision_id === currentTimelineRevisionId)
+      : versions
+    const selected = choosePromptRevision(currentVersions, preferLatest ? undefined : preferredVersion)
+    if (selected?.prompt_mode === 'full_reference_video_edit' || selected?.prompt_mode === 'standalone_video_recreation') setPromptMode(selected.prompt_mode)
+    if (selected) {
+      setReplacePerson(selected.replace_person)
+      setRecreationAudioMode(audioMode(selected.audio_mode))
+      setRecreationAudioRequirement(selected.audio_style || '')
+    }
     setPromptVersion(selected?.version ?? 0)
     setPromptText(selected?.text ?? '')
+    setPromptDirty(false)
     return selected
   }, [])
 
@@ -172,12 +177,12 @@ function App() {
     setProjectName(project.name)
     setVideo({ filename: project.reference_video_name || '', previewUrl: project.reference_video_url ? mediaUrl(project.reference_video_url) : '', uploading: false })
     setMaterials((current) => ({
-      product: { ...current.product, filename: project.product_reference_image_name || '', previewUrl: project.product_reference_image_name ? referenceImageUrl(project.id, 'product') : '', images: (project.product_reference_images || []).map((item) => ({ id: item.id, filename: item.filename, previewUrl: referenceImageAssetUrl(item.image_url), viewLabel: item.view_label || 'other', displayName: item.display_name || '', note: item.note || '' })), status: project.product_analysis_status || 'pending', profile: project.product_profile || '', error: project.product_analysis_error || '' },
-      target_product: { ...current.target_product, filename: project.target_product_reference_image_name || '', previewUrl: project.target_product_reference_image_name ? referenceImageUrl(project.id, 'target_product') : '', images: (project.target_product_reference_images || []).map((item) => ({ id: item.id, filename: item.filename, previewUrl: referenceImageAssetUrl(item.image_url), viewLabel: item.view_label || 'other', displayName: item.display_name || '', note: item.note || '' })), status: project.target_product_analysis_status || 'pending', profile: project.target_product_profile || '', error: project.target_product_analysis_error || '' },
+      product: { ...current.product, filename: project.product_reference_image_name || '', previewUrl: project.product_reference_image_name ? referenceImageUrl(project.id, 'product') : '', images: (project.product_reference_images || []).map((item) => ({ id: item.id, filename: item.filename, previewUrl: referenceImageAssetUrl(item.image_url), viewLabel: item.view_label || 'other', displayName: item.display_name || '', note: item.note || '', status: item.status })), status: project.product_analysis_status || 'pending', profile: project.product_profile || '', error: project.product_analysis_error || '' },
+      target_product: { ...current.target_product, filename: project.target_product_reference_image_name || '', previewUrl: project.target_product_reference_image_name ? referenceImageUrl(project.id, 'target_product') : '', images: (project.target_product_reference_images || []).map((item) => ({ id: item.id, filename: item.filename, previewUrl: referenceImageAssetUrl(item.image_url), viewLabel: item.view_label || 'other', displayName: item.display_name || '', note: item.note || '', status: item.status })), status: project.target_product_analysis_status || 'pending', profile: project.target_product_profile || '', error: project.target_product_analysis_error || '' },
       person: { ...current.person, filename: project.person_reference_image_name || '', previewUrl: project.person_reference_image_name ? referenceImageUrl(project.id, 'person') : '', images: project.person_reference_image_name ? [{ filename: project.person_reference_image_name, previewUrl: referenceImageUrl(project.id, 'person'), viewLabel: 'other', displayName: '', note: '' }] : [], status: project.person_analysis_status || 'pending', profile: project.person_profile || '', error: project.person_analysis_error || '' },
       background: { ...current.background, filename: project.background_reference_image_name || '', previewUrl: project.background_reference_image_name ? referenceImageUrl(project.id, 'background') : '', images: project.background_reference_image_name ? [{ filename: project.background_reference_image_name, previewUrl: referenceImageUrl(project.id, 'background'), viewLabel: 'other', displayName: '', note: '' }] : [] },
     }))
-    setProductIdentity({ name: project.product_name || '', sellingPoints: project.product_selling_points || '', confirmed: Boolean(project.product_profile_confirmed) })
+    setProductIdentity({ name: project.product_name || '', category: project.product_category || '', packageForm: project.product_package_form || '', sellingPoints: project.product_selling_points || '', confirmed: Boolean(project.product_profile_confirmed) })
     if (project.prompt_visual_direction) setPromptDirection(project.prompt_visual_direction)
     setReplacePerson(Boolean(project.prompt_replace_person))
     if (project.timeline) {
@@ -201,12 +206,37 @@ function App() {
       setGenerationPlan(null)
       setSelectedSegmentId(null)
     }
-    await restorePromptVersions(project.id, undefined, true)
+    const restoredPrompt = project.timeline
+      ? await restorePromptVersions(project.id, undefined, true, project.timeline.revision_id)
+      : undefined
+    if (!project.timeline) {
+      setPromptVersions([])
+      setPromptVersion(0)
+      setPromptText('')
+    }
     // restore 顺序最后：批次列表，选最新批次。
-    try {
-      const batches = await listGenerationBatches(project.id)
-      setSelectedBatch(batches[0] ?? null)
-    } catch { /* 无批次或批次接口错误时保留空状态 */ }
+    let restoredBatch: GenerationBatch | null = null
+    if (restoredPrompt) {
+      try {
+        const batches = await listGenerationBatches(project.id)
+        restoredBatch = chooseRestoredGenerationBatch(batches, restoredPrompt.version)
+      } catch { /* 无批次或批次接口错误时保留空状态 */ }
+    }
+    setSelectedBatch(restoredBatch)
+    if (!restoredStage.current) {
+      const restoredShots = project.timeline?.shots || []
+      const resume: WorkflowStage = restoredBatch
+        ? 'generation'
+        : restoredPrompt || (restoredShots.length > 0 && restoredShots.every((shot) => shot.edit?.confirmed))
+          ? 'prompt'
+          : restoredShots.some((shot) => success(shot.analysis_status))
+            ? 'shots'
+            : project.timeline
+              ? 'timeline'
+              : 'materials'
+      restoredStage.current = resume
+      setStage(resume)
+    }
     return project
   }, [restorePromptVersions])
 
@@ -219,6 +249,10 @@ function App() {
       setNotice(`无法恢复项目：${errorMessage(error)}`)
     })
   }, [projectId, restoreProject])
+
+  useEffect(() => {
+    if (restoredStage.current) saveWorkflowStage(localStorage, stage, MODE)
+  }, [stage])
 
   const refreshJobs = useCallback(async () => {
     if (!projectId) return []
@@ -241,8 +275,8 @@ function App() {
         const current = await refreshJobs()
         const global = current.find((job) => job.kind === 'vision_analysis')
         const effectivePromptTask = promptTask ?? promptTaskFromJobs(current)
-        const promptJobKind = effectivePromptTask === 'generate' ? 'final_prompt_generation' : 'prompt_refinement'
-        const promptJob = effectivePromptTask ? current.find((job) => job.kind === promptJobKind) : undefined
+        const expectedPromptJobKind = effectivePromptTask ? promptJobKind(effectivePromptTask) : undefined
+        const promptJob = expectedPromptJobKind ? current.find((job) => job.kind === expectedPromptJobKind) : undefined
         if (shouldRefreshProjectDuringPolling({
           globalStatus: global?.status,
           timelineSource: timeline?.source,
@@ -257,9 +291,9 @@ function App() {
           await restoreProject(projectId)
           setPromptTask(null)
           if (success(promptJob.status) && promptJob.kind === 'prompt_refinement') setPromptRefinement('')
-          setNotice(success(promptJob.status) ? 'GPT 提示词新版本已生成并恢复到编辑框。' : `GPT 提示词任务失败：${promptJob.error_message || '未知错误'}`)
+          setNotice(success(promptJob.status) ? 'GPT 提示词新版本已生成并恢复到编辑框。' : promptJob.status === 'cancelled' ? 'GPT 提示词任务已取消。' : `GPT 提示词任务失败：${promptJob.error_message || '未知错误'}`)
         } else if (effectivePromptTask && promptJob && (promptJob.attempts || 0) > 0) {
-          setNotice(`GPT 正在补全缺失镜头，已自动重试 ${promptJob.attempts} 次…`)
+          setNotice(promptRetryNotice(promptJob))
         }
         for (const kind of ['product', 'target_product', 'person', 'background'] as AssetKind[]) {
           if (materials[kind].filename && !terminal(materials[kind].status)) {
@@ -267,9 +301,18 @@ function App() {
             setMaterials((old) => ({ ...old, [kind]: { ...old[kind], status: profile.status, profile: profile.profile || '', error: profile.error || '' } }))
             if (kind === 'product') setProductIdentity((current) => ({
               name: String(profile.structure?.product_name || current.name),
+              category: String(profile.structure?.product_category || current.category),
+              packageForm: String(profile.structure?.package_form || current.packageForm),
               sellingPoints: String(profile.structure?.selling_points || current.sellingPoints),
               confirmed: Boolean(profile.structure?.summary_confirmed),
             }))
+            if (kind === 'product' && terminal(profile.status)) {
+              const project = await getProject(projectId)
+              setMaterials((old) => ({ ...old, product: {
+                ...old.product,
+                images: (project.product_reference_images || []).map((item) => ({ id: item.id, filename: item.filename, previewUrl: referenceImageAssetUrl(item.image_url), viewLabel: item.view_label || 'other', displayName: item.display_name || '', note: item.note || '', status: item.status })),
+              } }))
+            }
           }
         }
       } catch { /* A short service interruption is surfaced by the next explicit action. */ }
@@ -313,25 +356,81 @@ function App() {
     return created.id
   }
 
+  function resetWorkflowState() {
+    setVideo({ filename: '', previewUrl: '', uploading: false })
+    setMaterials({ product: EMPTY_MATERIAL(), target_product: EMPTY_MATERIAL(), person: EMPTY_MATERIAL(), background: EMPTY_MATERIAL() })
+    setProductIdentity({ name: '', category: '', packageForm: '', sellingPoints: '', confirmed: false })
+    setTimeline(null)
+    setAiRevisionId('')
+    setTimelineDirty(false)
+    setTimelineConfirmed(false)
+    setGenerationPlan(null)
+    setSelectedSegmentId(null)
+    setSelectedBatch(null)
+    setSelectedIds([])
+    setSelectedBoundary(null)
+    setPlayhead(0)
+    setJobs([])
+    setGlobalStatus('pending')
+    setSelectedShotId('')
+    setShotEdit({ ...EMPTY_EDIT })
+    setPromptText('')
+    setPromptDirty(false)
+    setPromptDirection(DEFAULT_PROMPT_DIRECTION)
+    setPromptRefinement('')
+    setReplacePerson(false)
+    setPromptTask(null)
+    setPromptVersion(0)
+    setPromptMode('full_reference_video_edit')
+    setRecreationAudioMode('none')
+    setRecreationAudioRequirement('')
+    setPromptVersions([])
+    setSelectedProvider('volcengine')
+    setGenerationRatio('adaptive')
+    setStage('materials')
+  }
+
   async function newProject() {
     const created = await createProject(`参考广告 ${new Date().toLocaleString('zh-CN', { hour12: false })}`, MODE)
     saveProjectId(localStorage, created.id, MODE)
     setProjectId(created.id)
     setProjectName(created.name)
-    setVideo({ filename: '', previewUrl: '', uploading: false })
-    setMaterials({ product: EMPTY_MATERIAL(), target_product: EMPTY_MATERIAL(), person: EMPTY_MATERIAL(), background: EMPTY_MATERIAL() })
-    setProductIdentity({ name: '', sellingPoints: '', confirmed: false })
-    setTimeline(null)
-    setAiRevisionId('')
-    setJobs([])
-    setGlobalStatus('pending')
-    setTimelineConfirmed(false)
-    setPromptText('')
-    setPromptRefinement('')
-    setPromptVersion(0)
-    setPromptVersions([])
-    setStage('materials')
+    resetWorkflowState()
     setNotice('新项目已创建，请上传参考视频。')
+  }
+
+  async function removeProject(id: string, name: string) {
+    if (!window.confirm(`确定永久删除项目“${name}”吗？项目记录和本地素材都会删除，无法恢复。`)) return
+    setDeletingProjectId(id)
+    try {
+      const result = await deleteProject(id)
+      setProjects((current) => current.filter((project) => project.id !== id))
+      if (id === projectId) {
+        saveProjectId(localStorage, '', MODE)
+        setProjectId('')
+        setProjectName('')
+        restoredStage.current = 'materials'
+        resetWorkflowState()
+        setProjectDrawer(false)
+      }
+      setNotice(result.media_deleted ? '项目及其本地素材已删除。' : '项目已删除，但隔离区中的部分素材仍需手动清理。')
+    } catch (error) {
+      setNotice(`删除项目失败：${errorMessage(error)}`)
+    } finally {
+      setDeletingProjectId(null)
+    }
+  }
+
+  async function renameSavedProject(id: string, name: string) {
+    try {
+      const updated = await renameProject(id, name)
+      setProjects((current) => current.map((project) => project.id === id ? { ...project, name: updated.name } : project))
+      if (id === projectId) setProjectName(updated.name)
+      setNotice(`项目已重命名为“${updated.name}”。`)
+    } catch (error) {
+      setNotice(`项目重命名失败：${errorMessage(error)}`)
+      throw error
+    }
   }
 
   async function uploadVideo(file: File) {
@@ -349,9 +448,19 @@ function App() {
       await uploadReferenceVideo(id, file)
       setVideo({ filename: file.name, previewUrl: URL.createObjectURL(file), uploading: false })
       setTimeline(null)
+      setAiRevisionId('')
       setJobs([])
       setGlobalStatus('pending')
       setTimelineConfirmed(false)
+      setGenerationPlan(null)
+      setSelectedSegmentId(null)
+      setPromptText('')
+      setPromptDirty(false)
+      setPromptRefinement('')
+      setPromptVersion(0)
+      setPromptVersions([])
+      setPromptTask(null)
+      setSelectedBatch(null)
       setNotice('参考视频已保存。下一步将先提取候选切点，再理解完整视频内容。')
     } catch (error) {
       setVideo((old) => ({ ...old, uploading: false }))
@@ -364,29 +473,40 @@ function App() {
       const id = await ensureProject()
       const result = await uploadReferenceImage(id, kind, file, kind === 'person')
       const previewUrl = URL.createObjectURL(file)
-      const image = { id: result.asset_id, filename: file.name, previewUrl, viewLabel: 'other', displayName: '', note: '' }
+      const image = { id: result.asset_id, filename: file.name, previewUrl, viewLabel: 'other', displayName: '', note: '', status: result.analysis_status || result.status || 'queued' }
       setMaterials((old) => ({ ...old, [kind]: { filename: file.name, previewUrl, images: append ? [...old[kind].images, image] : [image], status: result.analysis_status || result.status || 'queued', profile: '', error: '' } }))
+      if (kind === 'person' || kind === 'background') setPromptDirty(true)
       setNotice(`${kind === 'product' ? '原产品' : kind === 'target_product' ? '目标产品' : kind === 'person' ? '人物' : '背景'}图片已上传，AI 正在生成可编辑文字档案。`)
       return true
     } catch (error) { setNotice(`图片上传失败：${errorMessage(error)}`); return false }
   }
 
-  async function uploadProducts(items: ProductImageUpload[], productName: string, sellingPoints: string) {
+  async function uploadProducts(items: ProductImageUpload[], productName: string, productCategory: string, packageForm: string, sellingPoints: string) {
     if (!productName) { setNotice('请先填写产品名称。'); return false }
+    if (!productCategory) { setNotice('请先填写产品类别。'); return false }
+    if (!packageForm) { setNotice('请先选择主包装形态。'); return false }
     let id = ''
     try { id = await ensureProject() }
     catch (error) { setNotice(`无法创建产品项目：${errorMessage(error)}`); return false }
     let uploaded = 0
     for (const item of items) {
       try {
-        const result = await uploadReferenceImage(id, 'product', item.file, false, { view_label: item.viewLabel, display_name: item.displayName.trim(), note: item.note, product_name: productName, selling_points: sellingPoints })
+        const result = await uploadReferenceImage(id, 'product', item.file, false, { view_label: item.viewLabel, display_name: item.displayName.trim(), note: item.note, product_name: productName, product_category: productCategory, package_form: packageForm, selling_points: sellingPoints })
         const previewUrl = URL.createObjectURL(item.file)
-        setMaterials((old) => ({ ...old, product: { ...old.product, filename: item.file.name, previewUrl, images: [...old.product.images, { id: result.asset_id, filename: item.file.name, previewUrl, viewLabel: item.viewLabel, displayName: item.displayName.trim(), note: item.note }], status: result.analysis_status || result.status || 'queued', profile: '', error: '' } }))
+        setMaterials((old) => ({ ...old, product: { ...old.product, filename: item.file.name, previewUrl, images: [...old.product.images, { id: result.asset_id, filename: item.file.name, previewUrl, viewLabel: item.viewLabel, displayName: item.displayName.trim(), note: item.note, status: result.analysis_status || result.status || 'queued' }], status: 'queued', profile: '', error: '' } }))
         uploaded += 1
       } catch (error) { setNotice(`产品图“${item.file.name}”上传失败：${errorMessage(error)}`) }
     }
     if (uploaded) {
-      setProductIdentity({ name: productName, sellingPoints, confirmed: false })
+      setProductIdentity({ name: productName, category: productCategory, packageForm, sellingPoints, confirmed: false })
+      setPromptDirty(true)
+      try {
+        const profile = await getReferenceProfile(id, 'product')
+        setMaterials((old) => ({ ...old, product: { ...old.product, status: profile.status, profile: profile.profile || '', error: profile.error || '' } }))
+      } catch {
+        // Uploads already succeeded; keep polling their queued state if this
+        // one aggregate refresh is interrupted.
+      }
       setNotice(`已上传 ${uploaded} 张目标产品图，AI 正在根据角度和备注生成产品事实。`)
     }
     return uploaded === items.length
@@ -406,7 +526,7 @@ function App() {
     if (!projectId) return
     try {
       const result = await analyzeReferenceImage(projectId, kind)
-      setMaterials((old) => ({ ...old, [kind]: { ...old[kind], status: result.status, error: '' } }))
+      setMaterials((old) => ({ ...old, [kind]: { ...old[kind], status: result.status, error: '', images: old[kind].images.map((image) => success(image.status) ? image : { ...image, status: result.status }) } }))
       setNotice('已重新提交图片理解任务。')
     } catch (error) { setNotice(`重试失败：${errorMessage(error)}`) }
   }
@@ -417,21 +537,25 @@ function App() {
       const id = projectId || await ensureProject()
       const result = await updateReferenceProfile(id, kind, materials[kind].profile.trim())
       setMaterials((old) => ({ ...old, [kind]: { ...old[kind], status: result.status, profile: result.profile || '', error: '' } }))
+      if (kind === 'person' || kind === 'background') setPromptDirty(true)
       setNotice('人工校对后的文字档案已保存。')
     } catch (error) { setNotice(`保存档案失败：${errorMessage(error)}`) }
   }
 
   async function saveProductProfile(confirmed: boolean) {
-    if (!materials.product.profile.trim() || !productIdentity.name.trim()) return
+    if (!materials.product.profile.trim() || !productIdentity.name.trim() || !productIdentity.category.trim() || !productIdentity.packageForm) return
     try {
       const id = projectId || await ensureProject()
       const result = await updateReferenceProfile(id, 'product', materials.product.profile.trim(), {
         product_name: productIdentity.name.trim(),
+        product_category: productIdentity.category.trim(),
+        package_form: productIdentity.packageForm,
         selling_points: productIdentity.sellingPoints.trim(),
         summary_confirmed: confirmed,
       })
-      setMaterials((old) => ({ ...old, product: { ...old.product, status: result.status, profile: result.profile || '', error: '' } }))
+      setMaterials((old) => ({ ...old, product: { ...old.product, status: result.status, profile: result.profile || '', error: result.error || '' } }))
       setProductIdentity((current) => ({ ...current, confirmed }))
+      setPromptDirty(true)
       setNotice(confirmed ? '目标产品档案已确认，后续提示词将只使用这份产品事实。' : '产品事实的人工修改已保存。')
     } catch (error) { setNotice(`保存产品档案失败：${errorMessage(error)}`) }
   }
@@ -442,7 +566,7 @@ function App() {
       setNotice('正在用 FFmpeg 提取精确候选切点和证据帧…')
       const candidates = await startAnalysis(projectId)
       setTimelineState({ ...candidates, source: 'ffmpeg_candidates' })
-      // 用户先确认分镜边界；确认前不启动豆包或 GPT 理解。
+      // 用户先确认分镜边界；确认前不启动Qwen理解。
       setGlobalStatus('completed')
       setStage('timeline')
       setNotice('本地候选分镜已建立，请人工确认或调整边界。确认后才会开始逐镜理解。')
@@ -454,6 +578,33 @@ function App() {
 
   function selectTimelineShot(id: string, multi: boolean) {
     setSelectedIds((current) => multi ? (current.includes(id) ? current.filter((item) => item !== id) : [...current, id].slice(-2)) : [id])
+  }
+
+  async function removeReferenceImage(kind: 'person' | 'background') {
+    const label = kind === 'person' ? '人物' : '背景'
+    if (!window.confirm(`删除${label}参考图后，关联的 AI 文字档案也会清空。是否继续？`)) return
+    setDeletingAssetKind(kind)
+    try {
+      if (projectId) await deleteReferenceImage(projectId, kind)
+      const previewUrl = materials[kind].previewUrl
+      if (previewUrl.startsWith('blob:')) URL.revokeObjectURL(previewUrl)
+      setMaterials((old) => ({ ...old, [kind]: EMPTY_MATERIAL() }))
+      if (kind === 'person') setReplacePerson(false)
+      setPromptDirty(true)
+      setNotice(`${label}参考图和文字档案已删除。请重新保存或生成提示词。`)
+    } catch (error) {
+      setNotice(`删除${label}参考图失败：${errorMessage(error)}`)
+    } finally {
+      setDeletingAssetKind(null)
+    }
+  }
+
+  function selectFactShot(id: string) {
+    setSelectedShotId(id)
+    const shot = shots.find((item) => item.id === id)
+    if (!shot) return
+    setPlayhead(shot.start_sec)
+    if (videoRef.current) videoRef.current.currentTime = shot.start_sec
   }
 
   function moveTimelineBoundary(index: number, requested: number) {
@@ -563,12 +714,13 @@ function App() {
   async function optimizeSellingPoints() {
     if (!projectId || !promptVersion) return
     setOptimizeBusy(true)
+    setPromptTask('optimize')
     try {
       await optimizePromptSellingPoints(projectId, promptVersion)
       setNotice('卖点优化任务已进入后台，完成后会生成新的提示词版本。')
       await refreshJobs()
       await restorePromptVersions(projectId, promptVersion)
-    } catch (error) { setNotice(`卖点优化失败：${errorMessage(error)}`) }
+    } catch (error) { setPromptTask(null); setNotice(`卖点优化失败：${errorMessage(error)}`) }
     finally { setOptimizeBusy(false) }
   }
 
@@ -579,14 +731,24 @@ function App() {
       const batch = await createGenerationBatch(projectId, {
         provider: selectedProvider,
         prompt_version: promptVersion,
-        generate_audio: generateAudio,
-        include_person_reference: includePersonReference,
-        include_background_reference: includeBackgroundReference,
+        ratio: generationRatio,
+        generate_audio: recreationAudioMode !== 'none',
       })
       setSelectedBatch(batch)
       setStage('generation')
       setNotice(`已创建 ${batch.batch_size} 个生成任务（${batch.provider}）。`)
-    } catch (error) { setNotice(`创建批次失败：${errorMessage(error)}`) }
+    } catch (error) {
+      if (error instanceof ApiError && error.status === 409) {
+        const existing = (await listGenerationBatches(projectId)).find((batch) => batch.status === 'queued' || batch.status === 'processing' || batch.status === 'uncertain')
+        if (existing) {
+          setSelectedBatch(existing)
+          setStage('generation')
+          setNotice('已打开正在执行的批次；未重复创建任务。')
+          return
+        }
+      }
+      setNotice(`创建批次失败：${errorMessage(error)}`)
+    }
     finally { setGenerationBusy(false) }
   }
 
@@ -650,12 +812,44 @@ function App() {
         uncertainties: shotEdit.uncertainties,
         keep_unchanged: shotEdit.keep.split('\n').map((item) => item.trim()).filter(Boolean),
         confirmed,
-      })
+      }, selectedShot?.edit?.version ?? 0)
       setTimeline((current) => current ? { ...current, shots: current.shots.map((shot) => shot.id === savingShotId ? { ...shot, edit: saved } : shot) } : current)
       setShotEdit((current) => ({ ...current, confirmed }))
       setNotice(confirmed ? '当前镜头事实已确认。' : '当前镜头修改已保存。')
     } catch (error) { setNotice(`保存镜头失败：${errorMessage(error)}`) }
     finally { setShotSaving(false) }
+  }
+
+  async function deleteCurrentShot(shotId: string) {
+    if (!projectId || !timeline || timeline.shots.length < 2) return
+    const index = timeline.shots.findIndex((shot) => shot.id === shotId)
+    if (index < 0) return
+    const adjacentIndex = index === 0 ? 1 : index - 1
+    const adjacent = timeline.shots[adjacentIndex]
+    const shot = timeline.shots[index]
+    const duration = Math.max(0, shot.end_sec - shot.start_sec).toFixed(2)
+    const message = `删除镜头 ${index + 1} 后，这 ${duration} 秒画面会并入镜头 ${adjacentIndex + 1}，合并后的镜头将重新理解。其他已确认镜头不受影响。是否继续？`
+    if (!window.confirm(message)) return
+
+    setShotSaving(true)
+    try {
+      const merged = await mergeTimelineShots(projectId, timeline.revision_id, [shot.id, adjacent.id])
+      await restoreProject(projectId)
+      setSelectedShotId(merged.affected_shot_ids?.[0] || merged.shots[Math.min(index, merged.shots.length - 1)]?.id || '')
+      try {
+        const queued = await requestShotVisionAnalysis(projectId)
+        await refreshJobs()
+        setNotice(queued.queued_shots
+          ? `镜头 ${index + 1} 已删除并合入相邻镜头，合并后的镜头正在重新理解。`
+          : `镜头 ${index + 1} 已删除并合入相邻镜头。`)
+      } catch (error) {
+        setNotice(`镜头 ${index + 1} 已删除，但重新理解任务提交失败：${errorMessage(error)}`)
+      }
+    } catch (error) {
+      setNotice(`删除镜头失败：${errorMessage(error)}`)
+    } finally {
+      setShotSaving(false)
+    }
   }
 
   async function adoptLatestAI(shotId: string) {
@@ -674,25 +868,53 @@ function App() {
     } catch (error) { setNotice(`读取新AI总结失败：${errorMessage(error)}`) }
   }
 
+  function selectPromptMode(value: 'full_reference_video_edit' | 'standalone_video_recreation') {
+    setPromptMode(value)
+    const selected = promptVersions.find((item) => item.prompt_mode === value)
+    setPromptVersion(selected?.version ?? 0)
+    setPromptText(selected?.text ?? '')
+    setPromptDirection(selected?.visual_direction || DEFAULT_PROMPT_DIRECTION)
+    if (selected) setReplacePerson(selected.replace_person)
+    setRecreationAudioMode(audioMode(selected?.audio_mode))
+    setRecreationAudioRequirement(selected?.audio_style || '')
+    setPromptDirty(false)
+  }
+
+  function selectPromptVersion(version: number) {
+    const selected = choosePromptRevision(promptVersions, version)
+    setPromptVersion(selected?.version ?? 0)
+    setPromptText(selected?.text ?? '')
+    setPromptDirection(selected?.visual_direction || DEFAULT_PROMPT_DIRECTION)
+    if (selected) setReplacePerson(selected.replace_person)
+    setRecreationAudioMode(audioMode(selected?.audio_mode))
+    setRecreationAudioRequirement(selected?.audio_style || '')
+    setPromptDirty(false)
+  }
+
   async function savePrompt(useAi = false) {
     if (!projectId) return 0
     if (!useAi && !promptText.trim()) { setNotice('当前没有可保存的提示词。'); return 0 }
     setPromptTask(useAi ? 'generate' : null)
     try {
       const saved = await createPrompt(projectId, {
-        product_profile: productProfile,
-        visual_direction: useAi ? promptDirection : promptText,
-        audio_mode: 'keep_original',
-        audio_style: '',
+        visual_direction: promptDirection,
+        prompt_text: useAi ? undefined : promptText,
+        audio_mode: recreationAudioMode,
+        audio_style: recreationAudioMode === 'custom' ? recreationAudioRequirement.trim() : '',
         replace_product: MODE === 'replace_product',
         replace_person: replacePerson,
         use_ai: useAi,
+        prompt_mode: promptMode,
       })
-      setPromptVersion(saved.version)
-      if (saved.text) setPromptText(saved.text)
+      if (!useAi) {
+        setPromptVersion(saved.version)
+        if (saved.text) setPromptText(saved.text)
+        setPromptDirty(false)
+      }
       setPromptTask(useAi && (saved.status === 'queued' || saved.status === 'processing') ? 'generate' : null)
       if (!useAi) await restorePromptVersions(projectId, saved.version)
-      setNotice(useAi ? `GPT 提示词任务 v${saved.version} 已进入后台，完成后页面会自动显示。` : `人工提示词已保存为 v${saved.version}。`)
+      const adaptationNotice = saved.adaptation_count ? ` 检测到 ${saved.adaptation_count} 个产品交互冲突，AI只会对这些镜头做最小动作适配。` : ''
+      setNotice(useAi ? `GPT 提示词任务 v${saved.version} 已进入后台，完成后页面会自动显示。${adaptationNotice}` : `人工提示词已保存为 v${saved.version}。`)
       return saved.version
     } catch (error) { setPromptTask(null); setNotice(`${useAi ? '生成' : '保存'}提示词失败：${errorMessage(error)}`); return 0 }
   }
@@ -705,6 +927,33 @@ function App() {
       setPromptVersion(saved.version)
       setNotice(`GPT-5.6 修改任务 v${saved.version} 已进入后台，当前提示词版本会继续保留。`)
     } catch (error) { setPromptTask(null); setNotice(`修改提示词失败：${errorMessage(error)}`) }
+  }
+
+  async function cancelCurrentPromptTask() {
+    if (!projectId) return
+    const active = latestPromptJob(jobs)
+    if (!active || !['queued', 'uploaded', 'running', 'processing', 'retryable'].includes(active.status)) return
+    setCancellingPromptTask(true)
+    try {
+      await cancelPromptJob(projectId, active.job_id)
+      setPromptTask(null)
+      await refreshJobs()
+      setNotice('GPT 提示词任务已取消；供应商若稍后返回结果，系统也不会写入。')
+    } catch (error) {
+      setNotice(`取消 GPT 提示词任务失败：${errorMessage(error)}`)
+    } finally {
+      setCancellingPromptTask(false)
+    }
+  }
+
+  async function copyCurrentPrompt() {
+    if (!promptText.trim()) return
+    try {
+      await navigator.clipboard.writeText(promptText)
+      setNotice('独立复刻提示词已复制到剪贴板。')
+    } catch {
+      setNotice('复制失败，请在提示词编辑框中全选后手动复制。')
+    }
   }
 
   async function openHistory() {
@@ -735,30 +984,31 @@ function App() {
   if (timelineConfirmed) unlocked.push('analysis')
   if (allShotJobsDone) unlocked.push('shots')
   if (shots.length && shots.every((shot) => shot.edit?.confirmed)) unlocked.push('prompt')
-  const pageTwoProductReady = success(materials.product.status) && Boolean(materials.product.profile.trim()) && productIdentity.confirmed
+  if (selectedBatch) unlocked.push('generation')
+  const pageTwoProductReady = success(materials.product.status) && Boolean(materials.product.profile.trim()) && Boolean(productIdentity.name.trim()) && Boolean(productIdentity.category.trim()) && Boolean(productIdentity.packageForm) && productIdentity.confirmed
   const materialsReady = Boolean(video.filename && !video.uploading && (MODE === 'preserve_product' || pageTwoProductReady))
-  const materialsBlockingReason = !video.filename ? '请先上传参考视频。' : !productIdentity.name.trim() ? '请填写产品名称。' : !materials.product.images.length ? '请上传目标产品图片。' : !materials.product.profile.trim() ? '请等待产品事实生成。' : !productIdentity.confirmed ? '请检查并确认产品事实。' : ''
+  const materialsBlockingReason = !video.filename ? '请先上传参考视频。' : !productIdentity.name.trim() ? '请填写产品名称。' : !productIdentity.category.trim() ? '请填写产品类别。' : !productIdentity.packageForm ? '请选择主包装形态。' : !materials.product.images.length ? '请上传目标产品图片。' : !materials.product.profile.trim() ? '请等待产品事实生成。' : !productIdentity.confirmed ? '请检查并确认产品事实。' : ''
 
   return <main className="workflow-app">
     <AppHeader mode={MODE} projectName={projectName} onNewProject={() => void newProject()} onOpenHistory={() => void openHistory()} onOpenSettings={() => setSettingsOpen(true)} />
     <div className="workflow-shell">
       <WorkflowRail active={stage} unlocked={unlocked} onSelect={setStage} />
       <div className="stage-host">
-        {stage === 'materials' && <MaterialsStage mode={MODE} video={video} materials={materials} productIdentity={productIdentity} onVideo={(file) => void uploadVideo(file)} onImage={(kind, file) => void uploadImage(kind, file)} onProductImages={uploadProducts} onProductImageRename={renameProductImage} onProductName={(name) => setProductIdentity((current) => ({ ...current, name, confirmed: false }))} onProductSellingPoints={(sellingPoints) => setProductIdentity((current) => ({ ...current, sellingPoints, confirmed: false }))} onProductProfileSave={(confirmed) => void saveProductProfile(confirmed)} onRetry={(kind) => void retryProfile(kind)} onProfile={(kind, profile) => { setMaterials((old) => ({ ...old, [kind]: { ...old[kind], profile } })); if (kind === 'product') setProductIdentity((current) => ({ ...current, confirmed: false })) }} onSaveProfile={(kind) => void saveProfile(kind)} onContinue={() => void startGlobalFlow()} ready={materialsReady} blockingReason={materialsBlockingReason} />}
+        {stage === 'materials' && <MaterialsStage mode={MODE} video={video} materials={materials} productIdentity={productIdentity} onVideo={(file) => void uploadVideo(file)} onImage={(kind, file) => void uploadImage(kind, file)} onProductImages={uploadProducts} onProductImageRename={renameProductImage} onProductName={(name) => setProductIdentity((current) => ({ ...current, name, confirmed: false }))} onProductCategory={(category) => setProductIdentity((current) => ({ ...current, category, confirmed: false }))} onProductPackageForm={(packageForm) => setProductIdentity((current) => ({ ...current, packageForm, confirmed: false }))} onProductSellingPoints={(sellingPoints) => setProductIdentity((current) => ({ ...current, sellingPoints, confirmed: false }))} onProductProfileSave={(confirmed) => void saveProductProfile(confirmed)} onRetry={(kind) => void retryProfile(kind)} deletingKind={deletingAssetKind} onDelete={(kind) => void removeReferenceImage(kind)} onProfile={(kind, profile) => { setMaterials((old) => ({ ...old, [kind]: { ...old[kind], profile } })); if (kind === 'product') setProductIdentity((current) => ({ ...current, confirmed: false })) }} onSaveProfile={(kind) => void saveProfile(kind)} onContinue={() => void startGlobalFlow()} ready={materialsReady} blockingReason={materialsBlockingReason} />}
         {stage === 'analysis' && <AnalysisStage shots={shots} jobs={jobs} onOpenShots={() => { if (!projectId) return; void restoreProject(projectId).then(() => setStage('shots')).catch((error) => setNotice(`读取分镜事实失败：${errorMessage(error)}`)) }} />}
         {stage === 'timeline' && timeline && <TimelineEditor videoUrl={video.previewUrl} videoRatio={videoRatio} videoRef={videoRef} shots={shots} selectedIds={selectedIds} selectedBoundary={selectedBoundary} playhead={playhead} fps={fps} dirty={timelineDirty} saving={timelineSaving} canContinue={timelineConfirmed} onMetadata={(width, height) => { setVideoRatio(`${width} / ${height}`); const element = videoRef.current; if (element && Number.isFinite(element.duration) && element.duration > 0) setFps(25) }} onPlayhead={seekTimeline} onSelectShot={selectTimelineShot} onSelectBoundary={setSelectedBoundary} onMoveBoundary={moveTimelineBoundary} onSplit={splitAtPlayhead} onMerge={mergeSelected} onRestore={() => void restoreAi()} onSave={() => void saveHumanTimeline()} onContinue={() => void beginShotAnalysis()} />}
         {stage === 'segments' && timeline && generationPlan && <GenerationSegmentsEditor projectId={projectId} planVersion={generationPlan.plan_version} timelineRevisionId={generationPlan.timeline_revision_id} segments={generationPlan.segments} shots={timeline.shots} durationSec={videoRef.current?.duration || shots[shots.length - 1]?.end_sec || 0} maxSegmentSeconds={generationPlan.max_segment_seconds} recommendedMinSeconds={generationPlan.recommended_min_seconds} busy={segmentBusy} selectedSegmentId={selectedSegmentId} onSelectSegment={setSelectedSegmentId} onAutoPlan={() => void autoPlanSegments()} onSave={(inputs) => void saveSegmentPlan(inputs)} onRestoreAuto={() => { if (!timelineConfirmed) return; void autoPlanSegments() }} />}
         {stage === 'generation' && <GenerationStage batch={selectedBatch} retryingGenerationId={retryingGenerationId} onRetry={retryPosition} onResolve={resolvePosition} onRefresh={() => refreshBatch()} onBackToPrompt={() => setStage('prompt')} />}
-        {stage === 'shots' && <ShotWorkspace shots={shots} selectedId={selectedShotId} jobs={jobs} edit={shotEdit} saving={shotSaving} mode={MODE} compatibility={null} onSelect={setSelectedShotId} onEdit={setShotEdit} onSave={(confirmed) => void saveCurrentShot(confirmed)} onAdoptAI={(id) => void adoptLatestAI(id)} onRetry={(id) => {
+        {stage === 'shots' && <ShotWorkspace shots={shots} selectedId={selectedShotId} jobs={jobs} edit={shotEdit} saving={shotSaving} mode={MODE} compatibility={null} onSelect={selectFactShot} onEdit={setShotEdit} onSave={(confirmed) => void saveCurrentShot(confirmed)} onDelete={(id) => void deleteCurrentShot(id)} onAdoptAI={(id) => void adoptLatestAI(id)} onRetry={(id) => {
           // 重跑只产生新的 AI 总结，人工保存版本始终保留。
           if (!window.confirm('重新理解将产生一个新的 AI 总结版本，当前人工版本会继续保留。是否继续？')) return
           void retryShotAnalysis(projectId, id).then(refreshJobs).catch((error) => setNotice(`重试失败：${errorMessage(error)}`))
         }} onOpenPrompt={() => setStage('prompt')} />}
-        {stage === 'prompt' && <PromptStage mode={MODE} prompt={promptText} direction={promptDirection} refinement={promptRefinement} promptVersion={promptVersion} versions={promptVersions} selectedVersion={promptVersion} taskStatus={latestPromptJob(jobs)} personReady={success(materials.person.status) && Boolean(materials.person.profile.trim())} replacePerson={replacePerson} busy={promptTask} blockingReason={!timelineConfirmed ? '人工时间轴尚未确认。' : !allShotJobsDone ? '逐镜理解尚未全部完成。' : !shots.every((shot) => shot.edit?.confirmed) ? '请先确认每个镜头的最终事实。' : ''} onPrompt={setPromptText} onDirection={setPromptDirection} onRefinement={setPromptRefinement} onReplacePerson={setReplacePerson} onSelectVersion={(version) => { const selected = choosePromptRevision(promptVersions, version); setPromptVersion(selected?.version ?? 0); setPromptText(selected?.text ?? '') }} onSave={() => void savePrompt(false)} onGenerate={() => void savePrompt(true)} onRefine={() => void refineCurrentPrompt()} person={materials.person} onPerson={(file) => void uploadImage('person', file)} onPersonRetry={() => void retryProfile('person')} onPersonProfile={(profile) => setMaterials((old) => ({ ...old, person: { ...old.person, profile } }))} onPersonProfileSave={() => void saveProfile('person')} generationPlan={generationPlan} selectedPromptRevision={choosePromptRevision(promptVersions, promptVersion) ?? null} selectedProvider={selectedProvider} generateAudio={generateAudio} includePersonReference={includePersonReference} includeBackgroundReference={includeBackgroundReference} optimizeBusy={optimizeBusy} generationBusy={generationBusy} onOptimizeSellingPoints={() => void optimizeSellingPoints()} onProviderChange={setSelectedProvider} onGenerateAudioChange={setGenerateAudio} onIncludePersonReferenceChange={setIncludePersonReference} onIncludeBackgroundReferenceChange={setIncludeBackgroundReference} onCreateBatch={() => void createBatch()} />}
+        {stage === 'prompt' && <PromptStage mode={MODE} promptMode={promptMode} onPromptMode={selectPromptMode} recreationAudioMode={recreationAudioMode} recreationAudioRequirement={recreationAudioRequirement} prompt={promptText} promptDirty={promptDirty} direction={promptDirection} refinement={promptRefinement} promptVersion={promptVersion} versions={promptVersions} selectedVersion={promptVersion} currentTimelineRevisionId={timeline?.revision_id} taskStatus={latestPromptJob(jobs)} personReady={success(materials.person.status) && Boolean(materials.person.profile.trim())} replacePerson={replacePerson} backgroundReady={Boolean(materials.background.filename)} busy={promptTask} blockingReason={!timelineConfirmed ? '人工时间轴尚未确认。' : !allShotJobsDone ? '逐镜理解尚未全部完成。' : !shots.every((shot) => shot.edit?.confirmed) ? '请先确认每个镜头的最终事实。' : ''} onPrompt={(value) => { setPromptText(value); setPromptDirty(true) }} onDirection={(value) => { setPromptDirection(value); setPromptDirty(true) }} onRecreationAudioMode={(value) => { setRecreationAudioMode(value); setPromptDirty(true) }} onRecreationAudioRequirement={(value) => { setRecreationAudioRequirement(value); setPromptDirty(true) }} onCopyPrompt={() => void copyCurrentPrompt()} onRefinement={setPromptRefinement} onReplacePerson={(value) => { setReplacePerson(value); setPromptDirty(true) }} onSelectVersion={selectPromptVersion} onSave={() => void savePrompt(false)} onGenerate={() => void savePrompt(true)} onRefine={() => void refineCurrentPrompt()} onCancelPromptTask={() => void cancelCurrentPromptTask()} cancellingPromptTask={cancellingPromptTask} person={materials.person} onPerson={(file) => void uploadImage('person', file)} onPersonRetry={() => void retryProfile('person')} onPersonProfile={(profile) => { setMaterials((old) => ({ ...old, person: { ...old.person, profile } })); setPromptDirty(true) }} onPersonProfileSave={() => void saveProfile('person')} personDeleting={deletingAssetKind === 'person'} onPersonDelete={() => void removeReferenceImage('person')} generationPlan={generationPlan} selectedPromptRevision={choosePromptRevision(promptVersions, promptVersion) ?? null} selectedProvider={selectedProvider} generationRatio={generationRatio} optimizeBusy={optimizeBusy} generationBusy={generationBusy} segmentBusy={segmentBusy} onOptimizeSellingPoints={() => void optimizeSellingPoints()} onProviderChange={setSelectedProvider} onGenerationRatioChange={setGenerationRatio} onAutoPlanSegments={() => void autoPlanSegments()} onCreateBatch={() => void createBatch()} />}
       </div>
     </div>
     <div className="global-notice" role="status"><i />{notice}</div>
-      <ProjectDrawer open={projectDrawer} projects={projects} onClose={() => setProjectDrawer(false)} onOpen={(id) => { setProjectDrawer(false); void restoreProject(id).then((project: ProjectDetails) => setNotice(`已打开项目“${project.name}”。`)).catch((error) => setNotice(errorMessage(error))) }} />
+    <ProjectDrawer open={projectDrawer} projects={projects} deletingId={deletingProjectId} onClose={() => setProjectDrawer(false)} onOpen={(id) => { setProjectDrawer(false); void restoreProject(id).then((project: ProjectDetails) => setNotice(`已打开项目“${project.name}”。`)).catch((error) => setNotice(errorMessage(error))) }} onRename={renameSavedProject} onDelete={(id, name) => void removeProject(id, name)} />
     <SettingsDialog open={settingsOpen} preflight={preflight} checks={connectionChecks} volcengineKey={volcengineKey} comflyKey={comflyKey} onClose={() => setSettingsOpen(false)} onPreflight={() => void getPreflight().then((value) => { setPreflight(value); setNotice('服务配置状态已刷新。') }).catch((error) => setNotice(errorMessage(error)))} onTest={(service) => void testConnection(service)} onVolcengineKey={setVolcengineKey} onComflyKey={setComflyKey} onSaveVolcengine={() => void saveVolcengineApiKey(volcengineKey.trim()).then((result) => finishSettingsSave(result, () => setVolcengineKey(''))).catch((error) => setNotice(errorMessage(error)))} onSaveComfly={() => void saveComflyApiKey(comflyKey.trim()).then((result) => finishSettingsSave(result, () => setComflyKey(''))).catch((error) => setNotice(errorMessage(error)))} />
   </main>
 }

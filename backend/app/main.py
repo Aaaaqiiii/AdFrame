@@ -81,12 +81,12 @@ def create_app() -> FastAPI:
                 "endpoint": current.comfly_vision_base_url + "/v1/chat/completions",
             },
             "storyboard_vision": {
-                # 逐镜链路必须同时具备豆包完整片段理解和 GPT 关键帧理解。
-                "ready": bool(current.volcengine_api_key and current.comfly_api_key),
-                "model": f"{current.volcengine_vision_model} + {current.comfly_vision_model}",
-                "endpoint": "火山方舟 + Comfly GPT",
+                # 逐镜事实只由Qwen完整视频理解；GPT不参与这条链路。
+                "ready": bool(current.comfly_api_key),
+                "model": current.comfly_qwen_vision_model,
+                "endpoint": current.comfly_vision_base_url + "/v1/chat/completions",
             },
-            "temporary_publisher": {"ready": True, "model": "tempfile.org 24h", "endpoint": "https://tempfile.org/api/upload/local"},
+            "temporary_publisher": {"ready": True, "model": "Litterbox / tempfile.org 24h", "endpoint": "https://litterbox.catbox.moe"},
         }
 
     @app.put("/api/local-settings")

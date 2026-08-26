@@ -1,5 +1,10 @@
 import type { BatchStatus, GenerationBatch, GenerationSummary, PromptRevisionSummary } from './api'
 
+/** 优先恢复当前提示词的批次；若提示词已换版，仍回退到最新历史批次，避免下载页永久失联。 */
+export function chooseRestoredGenerationBatch(batches: GenerationBatch[], promptVersion?: number): GenerationBatch | null {
+  return batches.find((batch) => batch.prompt_version === promptVersion) ?? batches[0] ?? null
+}
+
 /** 每个位置取最新 Generation.version（retry 后旧版本被新版本替代），并按位置 1..N 排序。 */
 export function latestGenerationPerPosition(batch: GenerationBatch): GenerationSummary[] {
   const latest = new Map<number, GenerationSummary>()
@@ -37,6 +42,13 @@ export function generationStatusLabel(status: string): string {
     completed: '已完成', failed: '失败', submission_uncertain: '提交状态不确定',
   }
   return labels[status] || '未知状态'
+}
+
+/** 区分本地素材发布与供应商生成，避免两个阶段都只显示“生成中”。 */
+export function generationPhaseLabel(generation: GenerationSummary): string {
+  if (generation.status === 'processing' && !generation.external_task_id) return '正在上传参考素材…'
+  if (generation.status === 'retryable' && !generation.external_task_id) return '参考素材上传失败，等待自动重试'
+  return generationStatusLabel(generation.status)
 }
 
 /** 仅 submission_uncertain 需要人工解析（而非 retry）。 */

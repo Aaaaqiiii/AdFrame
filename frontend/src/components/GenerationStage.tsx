@@ -1,7 +1,7 @@
 import { useState } from 'react'
 import type { GenerationBatch, GenerationSummary } from '../api'
-import { generationContentUrl, generationDownloadUrl } from '../api'
-import { batchStatusLabel, canResolveUncertain, canRetryGeneration, generationStatusLabel, latestGenerationPerPosition } from '../generationDomain'
+import { generationBatchMergedDownloadUrl, generationContentUrl, generationDownloadUrl, prepareGenerationBatchMergedDownload } from '../api'
+import { batchStatusLabel, canResolveUncertain, canRetryGeneration, generationPhaseLabel, latestGenerationPerPosition } from '../generationDomain'
 
 type Props = {
   batch: GenerationBatch | null
@@ -25,7 +25,7 @@ function ResultCard(p: {
   return <div className="generation-result-card">
     <div className="generation-result-head">
       <strong>片段 {generation.batch_position ?? '?'}</strong>
-      <span className={`status-badge ${status === 'completed' ? 'success' : status === 'failed' ? 'danger' : status === 'submission_uncertain' ? 'warn' : ''}`}>{generationStatusLabel(status)}</span>
+      <span className={`status-badge ${status === 'completed' ? 'success' : status === 'failed' ? 'danger' : status === 'submission_uncertain' ? 'warn' : ''}`}>{generationPhaseLabel(generation)}</span>
     </div>
     {generation.error_message && <div className="generation-result-error">{generation.error_message}</div>}
     {status === 'completed' && generation.local_video_url && (
@@ -50,12 +50,34 @@ function ResultCard(p: {
 
 export function GenerationStage(p: Props) {
   const batch = p.batch
+  const [mergeBusy, setMergeBusy] = useState(false)
+  const [mergeError, setMergeError] = useState('')
+
+  async function downloadMergedVideo() {
+    if (!batch || mergeBusy) return
+    setMergeBusy(true)
+    setMergeError('')
+    try {
+      await prepareGenerationBatchMergedDownload(batch.project_id, batch.generation_batch_id)
+      const link = document.createElement('a')
+      link.href = generationBatchMergedDownloadUrl(batch.project_id, batch.generation_batch_id)
+      link.download = `complete-video-v${batch.prompt_version}.mp4`
+      document.body.appendChild(link)
+      link.click()
+      link.remove()
+    } catch (error) {
+      setMergeError(error instanceof Error ? error.message : '完整视频下载失败')
+    } finally {
+      setMergeBusy(false)
+    }
+  }
+
   return <section className="stage-content generation-stage">
     <div className="stage-heading">
       <div>
         <span className="eyebrow">第七步</span>
         <h1>生成与结果</h1>
-        <p>按批次提交生成，每段独立播放与下载。结果不会自动拼接。</p>
+        <p>每段可以独立播放与下载；全部完成后可无损合并为一个完整视频。</p>
       </div>
       <div className="generation-stage-actions">
         {batch && <span className="version-badge">{batchStatusLabel(batch.status)}</span>}
@@ -70,7 +92,9 @@ export function GenerationStage(p: Props) {
         <span>提示词版本 v{batch.prompt_version}</span>
         <span>共 {batch.batch_size} 段</span>
         <span>状态：{batchStatusLabel(batch.status)}</span>
+        {batch.status === 'complete' && <button type="button" className="button primary" disabled={mergeBusy} onClick={() => void downloadMergedVideo()}>{mergeBusy ? '正在无损合并…' : '无损合并并下载完整视频'}</button>}
       </div>
+      {mergeError && <div className="generation-result-error generation-merge-error">{mergeError}</div>}
       <div className="generation-results">
         {latestGenerationPerPosition(batch).map((generation) => (
           <ResultCard
@@ -79,7 +103,7 @@ export function GenerationStage(p: Props) {
             projectId={batch.project_id}
             retrying={p.retryingGenerationId === generation.id}
             onRetry={() => void p.onRetry(generation.id)}
-            onResolve={(resolution) => void p.onResolve(generation.id, resolution)}
+            onResolve={(resolution, externalTaskId) => void p.onResolve(generation.id, resolution, externalTaskId)}
           />
         ))}
       </div>

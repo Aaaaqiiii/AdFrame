@@ -44,6 +44,7 @@ class TimelineOutput(BaseModel):
 
 
 def _next_version(session: Session, project_id: UUID) -> int:
+    session.execute(select(Project).where(Project.id == project_id).with_for_update())
     current = session.scalar(
         select(func.max(TimelineRevision.version)).where(TimelineRevision.project_id == project_id)
     )

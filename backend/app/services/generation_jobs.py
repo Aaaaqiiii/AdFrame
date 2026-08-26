@@ -7,10 +7,14 @@ from sqlalchemy.orm import Session
 from app.core.config import Settings
 from app.db.models import Generation
 from app.services.media import probe_video
-from app.services.seedance import GenerationGateway, GenerationResult, SubmissionUncertainError, sanitize_provider_summary
+from app.services.seedance import GenerationGateway, GenerationResult, ProviderRequestError, SubmissionUncertainError, sanitize_provider_summary
 from app.services.worker_state import MAX_ATTEMPTS, retry_at
 
 MAX_GENERATED_VIDEO_BYTES = 1024 * 1024 * 1024
+
+
+def _reference_video_temporarily_unreadable(result: GenerationResult) -> bool:
+    return result.error_code == "1007" or "reference video duration could not be read" in (result.error_message or "").lower()
 
 
 def _download_result(source_url: str, destination: Path, require_audio: bool = False) -> None:
@@ -75,8 +79,20 @@ def execute_generation_job(session: Session, generation: Generation, gateway: Ge
             # 供应商说完成但没给 URL：保持可重试，绝不标 completed。
             generation.status = "retryable"
             generation.next_attempt_at = retry_at(datetime.now(UTC), generation.attempts)
+        elif result.status == "failed" and _reference_video_temporarily_unreadable(result):
+            # 同一公网 URL 已被供应商判定不可读，自动重复提交只会制造重试风暴。
+            # 保持 failed，等待人工重试入口清理旧 URL 后重新发布。
+            generation.attempts += 1
+            generation.status = "failed"
+            generation.next_attempt_at = None
         else:
             generation.status = result.status
+        session.commit()
+    except ProviderRequestError as exc:
+        generation.attempts += 1
+        generation.status = "failed"
+        generation.error_message = str(exc)
+        generation.next_attempt_at = None
         session.commit()
     except Exception as exc:
         generation.attempts += 1

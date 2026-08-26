@@ -2,7 +2,7 @@ from sqlalchemy.orm import Session
 
 from sqlalchemy import func, select
 
-from app.db.models import Asset, Shot, ShotEvidence, TimelineRevision, VideoAnalysis
+from app.db.models import Asset, Project, Shot, ShotEvidence, TimelineRevision, VideoAnalysis
 from app.services.vision import AnalysisResult, align_vision_to_candidate_boundaries
 
 
@@ -30,6 +30,7 @@ def persist_vision_result(
     for previous, current in zip(facts.shots, facts.shots[1:]):
         if previous.end_sec <= previous.start_sec or abs(previous.end_sec - current.start_sec) > 0.001:
             raise ValueError("Vision timeline contains a gap, overlap, or invalid shot")
+    session.execute(select(Project).where(Project.id == project_id).with_for_update())
     version = (session.scalar(select(func.max(TimelineRevision.version)).where(TimelineRevision.project_id == project_id)) or 0) + 1
     candidate_revision = session.scalar(
         select(TimelineRevision)

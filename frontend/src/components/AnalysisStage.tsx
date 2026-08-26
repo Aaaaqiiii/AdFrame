@@ -19,7 +19,7 @@ export function AnalysisStage({ shots, jobs, onOpenShots }: Props) {
   const allComplete = shots.length > 0 && completed === shots.length
 
   return <section className="stage-content analysis-stage">
-    <div className="stage-heading"><div><span className="eyebrow">第三步</span><h1>逐镜理解已确认的时间轴</h1><p>每个镜头依次经过豆包完整片段理解、GPT关键帧理解和GPT综合。</p></div><StatusBadge status={allComplete ? 'completed' : failed ? 'failed' : 'processing'} /></div>
+    <div className="stage-heading"><div><span className="eyebrow">第三步</span><h1>逐镜理解已确认的时间轴</h1><p>Qwen直接读取完整镜头并生成分镜事实；过短镜头会无损循环后分析，不改变时间轴。</p></div><StatusBadge status={allComplete ? 'completed' : failed ? 'failed' : 'processing'} /></div>
     <div className="analysis-pipeline">
       {shots.map((shot, index) => {
         const job = shotJobs.find((item) => item.shot_id === shot.id)
@@ -28,6 +28,6 @@ export function AnalysisStage({ shots, jobs, onOpenShots }: Props) {
       })}
     </div>
     {failed > 0 && <div className="analysis-error"><div><strong>{failed} 个镜头理解失败</strong><p>进入下一步后，可以对失败镜头单独重新理解。</p></div></div>}
-    <div className={`analysis-callout ${allComplete ? 'success' : ''}`}><div><span className="eyebrow">理解进度</span><h2>{completed}/{shots.length} 个镜头已完成</h2><p>{allComplete ? '现在可以检查GPT综合后的最终分镜事实。' : '后台正在处理，你可以停留在此页面等待。'}</p></div><button className="button primary large" disabled={!allComplete && !failed} onClick={onOpenShots}>检查分镜事实</button></div>
+    <div className={`analysis-callout ${allComplete ? 'success' : ''}`}><div><span className="eyebrow">理解进度</span><h2>{completed}/{shots.length} 个镜头已完成</h2><p>{allComplete ? '现在可以检查Qwen生成的最终分镜事实。' : '后台正在处理，你可以停留在此页面等待。'}</p></div><button className="button primary large" disabled={!allComplete && !failed} onClick={onOpenShots}>检查分镜事实</button></div>
   </section>
 }

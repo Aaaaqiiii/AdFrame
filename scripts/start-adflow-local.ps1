@@ -2,7 +2,9 @@ param(
     [int]$ApiPort = 8011,
     [int]$WebPort = 5174,
     [string]$BindHost = '127.0.0.1',
-    [string]$ApiPublicHost = 'localhost'
+    [string]$ApiPublicHost = 'localhost',
+    [ValidateRange(1, 4)][int]$AiWorkers = 3,
+    [ValidateRange(1, 4)][int]$GenerationWorkers = 2
 )
 $ErrorActionPreference = 'Stop'
 $root = Split-Path -Parent $PSScriptRoot
@@ -31,7 +33,12 @@ foreach ($port in @($ApiPort, $WebPort)) {
 }
 
 Start-Process powershell -WindowStyle Hidden -ArgumentList '-NoProfile', '-Command', "`$env:CORS_ORIGIN_REGEX='http://(localhost|127\.0\.0\.1|[a-zA-Z0-9.-]+):\d+'; Set-Location '$root\backend'; python -m uvicorn app.main:app --host $BindHost --port $ApiPort"
-Start-Process powershell -WindowStyle Hidden -ArgumentList '-NoProfile', '-Command', "Set-Location '$root\backend'; python -m app.worker"
+foreach ($aiWorkerSlot in 1..$AiWorkers) {
+    Start-Process powershell -WindowStyle Hidden -ArgumentList '-NoProfile', '-Command', "Set-Location '$root\backend'; python -m app.worker --queue ai --slot $aiWorkerSlot"
+}
+foreach ($generationWorkerSlot in 1..$GenerationWorkers) {
+    Start-Process powershell -WindowStyle Hidden -ArgumentList '-NoProfile', '-Command', "Set-Location '$root\backend'; python -m app.worker --queue generation --slot $generationWorkerSlot"
+}
 Start-Process powershell -WindowStyle Hidden -ArgumentList '-NoProfile', '-Command', "`$env:VITE_API_BASE_URL='http://$ApiPublicHost`:$ApiPort'; Set-Location '$root\frontend'; npm.cmd run dev -- --host $BindHost --port $WebPort"
 
 Write-Host "AdFlow is starting. Open http://localhost:$WebPort"

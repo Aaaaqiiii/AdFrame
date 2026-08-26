@@ -15,6 +15,21 @@ def test_submit_timeout_is_classified_as_uncertain() -> None:
         gateway.submit({"model": "seedance"})
 
 
+def test_submit_preserves_provider_error_body() -> None:
+    response = requests.Response()
+    response.status_code = 400
+    response.reason = "Bad Request"
+    response._content = b'{"error":{"code":"InvalidParameter","message":"duration is invalid"}}'
+
+    class Http:
+        def post(self, *_args, **_kwargs):
+            return response
+
+    gateway = JsonTaskGateway("https://provider", "secret", http=Http())
+    with pytest.raises(RuntimeError, match="InvalidParameter.*duration is invalid"):
+        gateway.submit({"model": "seedance"})
+
+
 def test_sanitize_provider_summary_redacts_secrets() -> None:
     summary = sanitize_provider_summary({"model": "seedance", "Authorization": "Bearer secret-key", "api_key": "sk-123456"})
     assert "secret-key" not in summary

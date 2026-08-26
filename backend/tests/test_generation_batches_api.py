@@ -69,7 +69,7 @@ def _batch_project(client: TestClient, tmp_path, duration_sec=50.0, mode="preser
             f"/api/projects/{project_id}/prompts",
             json={"visual_direction": full_text, "use_ai": False},
         )
-        assert prompt.status_code == 201
+        assert prompt.status_code == 201, prompt.text
         prompt_version = prompt.json()["version"]
     else:
         # 未确认镜头时无法通过 API 创建 prompt；直接数据库直插有效 full 提示词，
@@ -91,6 +91,7 @@ def _batch_project(client: TestClient, tmp_path, duration_sec=50.0, mode="preser
         payload={
             "provider": "volcengine",
             "prompt_version": prompt.json()["version"],
+            "ratio": "9:16",
             "generate_audio": False,
             "include_person_reference": False,
             "include_background_reference": False,
@@ -126,6 +127,7 @@ def test_batch_creation_creates_two_rows_in_one_batch(client, tmp_path) -> None:
         assert [row.batch_position for row in rows] == [1, 2]
         assert all(row.batch_size == 2 for row in rows)
         assert all(row.provider == "volcengine" for row in rows)
+        assert all(row.ratio == "9:16" for row in rows)
         assert all(row.prompt_version == project.prompt_version for row in rows)
         # reference_asset_ids[0] 是原视频。
         assert json.loads(rows[0].reference_asset_ids)[0] == str(project.video_id)
@@ -142,6 +144,110 @@ def test_batch_creation_no_provider_call_during_http(client, tmp_path, monkeypat
     with patch.object(JsonTaskGateway, "submit", side_effect=AssertionError("provider called")):
         response = client.post(project.batch_url, json=project.payload)
     assert response.status_code == 201
+
+
+def test_uploaded_person_and_background_are_always_attached_without_toggles(client, tmp_path) -> None:
+    project = _batch_project(client, tmp_path)
+    person_path = tmp_path / "person.png"
+    background_path = tmp_path / "background.png"
+    person_path.write_bytes(b"person")
+    background_path.write_bytes(b"background")
+    with SessionLocal() as session:
+        person = Asset(
+            project_id=UUID(project.project_id), kind="person_reference_image",
+            original_path=str(person_path), original_filename="person.png", content_type="image/png",
+        )
+        background = Asset(
+            project_id=UUID(project.project_id), kind="background_reference_image",
+            original_path=str(background_path), original_filename="background.png", content_type="image/png",
+        )
+        session.add_all([person, background])
+        session.commit()
+        person_id, background_id = str(person.id), str(background.id)
+
+    stale = client.post(project.batch_url, json={
+        "provider": "volcengine", "prompt_version": project.prompt_version,
+        "ratio": "9:16", "generate_audio": False,
+    })
+    assert stale.status_code == 422
+    assert "参考素材已更新" in str(stale.json()["detail"])
+
+    with SessionLocal() as session:
+        prompt = session.scalar(select(PromptRevision).where(
+            PromptRevision.project_id == UUID(project.project_id),
+            PromptRevision.version == project.prompt_version,
+        ))
+        prompt.reference_asset_ids = json.dumps([person_id, background_id])
+        session.commit()
+
+    response = client.post(project.batch_url, json={
+        "provider": "volcengine", "prompt_version": project.prompt_version,
+        "ratio": "9:16", "generate_audio": False,
+    })
+
+    assert response.status_code == 201
+    with SessionLocal() as session:
+        row = session.scalar(select(Generation).where(Generation.project_id == UUID(project.project_id)))
+        asset_ids = json.loads(row.reference_asset_ids)
+    assert person_id in asset_ids
+    assert background_id in asset_ids
+
+
+def test_text_only_person_profile_is_not_attached_as_an_image(client, tmp_path) -> None:
+    project = _batch_project(client, tmp_path)
+    with SessionLocal() as session:
+        person = Asset(
+            project_id=UUID(project.project_id), kind="person_reference_image",
+            original_path="", original_filename=None, profile_text="25岁左右女性，黑色齐肩直发",
+            profile_user_edited=True, analysis_status="succeeded",
+        )
+        session.add(person)
+        session.flush()
+        prompt = session.scalar(select(PromptRevision).where(
+            PromptRevision.project_id == UUID(project.project_id),
+            PromptRevision.version == project.prompt_version,
+        ))
+        prompt.replace_person = True
+        prompt.reference_asset_ids = json.dumps([str(person.id)])
+        prompt.text = prompt.text.replace(
+            "【全局执行】",
+            "目标人物参考图是人物脸部、身份和整体外观的最高优先级。\n【全局执行】",
+            1,
+        )
+        session.commit()
+        person_id = str(person.id)
+
+    response = client.post(project.batch_url, json=project.payload)
+
+    assert response.status_code == 201
+    with SessionLocal() as session:
+        rows = list(session.scalars(select(Generation).where(
+            Generation.project_id == UUID(project.project_id),
+        )))
+    assert rows
+    assert all(person_id not in json.loads(row.reference_asset_ids) for row in rows)
+
+
+def test_batch_audio_is_derived_from_saved_prompt_version(client, tmp_path) -> None:
+    project = _batch_project(client, tmp_path)
+    with SessionLocal() as session:
+        prompt = session.scalar(select(PromptRevision).where(
+            PromptRevision.project_id == UUID(project.project_id),
+            PromptRevision.version == project.prompt_version,
+        ))
+        prompt.audio_mode = "custom"
+        prompt.audio_style = "轻音乐，不要旁白"
+        session.commit()
+
+    response = client.post(project.batch_url, json={
+        "provider": "volcengine", "prompt_version": project.prompt_version,
+        "ratio": "9:16", "generate_audio": False,
+    })
+
+    assert response.status_code == 201
+    with SessionLocal() as session:
+        rows = session.scalars(select(Generation).where(Generation.project_id == UUID(project.project_id))).all()
+        assert rows and all(row.generate_audio for row in rows)
 
 
 def test_batch_creation_rejects_missing_project(client, tmp_path) -> None:
@@ -187,13 +293,35 @@ def test_batch_creation_rejects_historical_prompt_mode(client, tmp_path) -> None
     assert _generation_count(client, project.project_id) == 0
 
 
-def test_batch_creation_rejects_duplicate_active(client, tmp_path) -> None:
-    """重复活动批次 → 409；全部 terminal 后允许新批次。"""
+def test_batch_creation_rejects_old_conflicting_person_replacement_prompt(client, tmp_path) -> None:
+    project = _batch_project(client, tmp_path)
+    with SessionLocal() as session:
+        prompt = session.scalar(select(PromptRevision).where(
+            PromptRevision.project_id == UUID(project.project_id),
+            PromptRevision.version == project.prompt_version,
+        ))
+        prompt.replace_person = True
+        session.commit()
+
+    response = client.post(project.batch_url, json={
+        **project.payload,
+        "include_person_reference": True,
+    })
+
+    assert response.status_code == 422
+    assert "旧版冲突规则" in response.json()["detail"]
+    assert _generation_count(client, project.project_id) == 0
+
+
+def test_batch_creation_reuses_duplicate_active(client, tmp_path) -> None:
+    """重复活动批次幂等返回原批次；全部 terminal 后允许新批次。"""
     project = _batch_project(client, tmp_path)
     first = client.post(project.batch_url, json=project.payload)
     assert first.status_code == 201
     duplicate = client.post(project.batch_url, json=project.payload)
-    assert duplicate.status_code == 409
+    assert duplicate.status_code == 201
+    assert duplicate.json()["generation_batch_id"] == first.json()["generation_batch_id"]
+    assert _generation_count(client, project.project_id) == 2
     # 全部 terminal 后允许。
     with SessionLocal() as session:
         rows = list(session.scalars(__import__("sqlalchemy").select(Generation).where(Generation.project_id == UUID(project.project_id))))
@@ -202,6 +330,37 @@ def test_batch_creation_rejects_duplicate_active(client, tmp_path) -> None:
         session.commit()
     retry_batch = client.post(project.batch_url, json=project.payload)
     assert retry_batch.status_code == 201
+
+
+def test_batch_creation_reuses_submission_uncertain_batch(client, tmp_path) -> None:
+    """提交结果不确定时仍视为活动批次，绝不能再次向供应商提交。"""
+    project = _batch_project(client, tmp_path)
+    first = client.post(project.batch_url, json=project.payload)
+    assert first.status_code == 201
+    with SessionLocal() as session:
+        rows = list(session.scalars(select(Generation).where(
+            Generation.project_id == UUID(project.project_id),
+        )))
+        for row in rows:
+            row.status = "submission_uncertain"
+        session.commit()
+
+    duplicate = client.post(project.batch_url, json=project.payload)
+
+    assert duplicate.status_code == 201
+    assert duplicate.json()["generation_batch_id"] == first.json()["generation_batch_id"]
+    assert _generation_count(client, project.project_id) == 2
+
+
+def test_batch_creation_blocks_different_settings_while_first_batch_is_active(client, tmp_path) -> None:
+    project = _batch_project(client, tmp_path)
+    first = client.post(project.batch_url, json=project.payload)
+    second = client.post(project.batch_url, json={**project.payload, "ratio": "16:9"})
+
+    assert first.status_code == 201
+    assert second.status_code == 409
+    assert first.json()["generation_batch_id"] in second.json()["detail"]
+    assert _generation_count(client, project.project_id) == 2
 
 
 def test_batch_creation_rejects_missing_provider_key(client, tmp_path, monkeypatch) -> None:
@@ -362,3 +521,41 @@ def test_batch_content_download_filename_has_position(client, tmp_path) -> None:
     assert response.status_code == 200
     assert "attachment" in response.headers.get("content-disposition", "")
     assert "segment-2.mp4" in response.headers.get("content-disposition", "")
+
+
+def test_complete_batch_can_merge_and_download_without_provider_call(client, tmp_path, monkeypatch) -> None:
+    project = _batch_project(client, tmp_path)
+    created = client.post(project.batch_url, json=project.payload)
+    assert created.status_code == 201
+    batch_id = created.json()["generation_batch_id"]
+    from app.core.config import Settings
+    result_dir = Settings().media_root / project.project_id / "generated"
+    result_dir.mkdir(parents=True, exist_ok=True)
+    with SessionLocal() as session:
+        rows = list(session.scalars(select(Generation).where(
+            Generation.project_id == UUID(project.project_id),
+        ).order_by(Generation.batch_position)))
+        for row in rows:
+            source = result_dir / f"v{row.version}.mp4"
+            source.write_bytes(f"segment-{row.batch_position}".encode())
+            row.result_path = str(source)
+            row.status = "completed"
+        session.commit()
+
+    calls = []
+    def fake_concat(sources, destination):
+        calls.append(list(sources))
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        destination.write_bytes(b"merged-without-reencoding")
+        return destination
+    monkeypatch.setattr("app.api.routes.generation_batches.concat_videos_lossless", fake_concat)
+
+    prepared = client.post(f"{project.batch_url}/{batch_id}/merged-content")
+    response = client.get(f"{project.batch_url}/{batch_id}/merged-content")
+
+    assert prepared.status_code == 200
+    assert response.status_code == 200
+    assert response.content == b"merged-without-reencoding"
+    assert "attachment" in response.headers.get("content-disposition", "")
+    assert "complete-video" in response.headers.get("content-disposition", "")
+    assert len(calls) == 1 and len(calls[0]) == 2

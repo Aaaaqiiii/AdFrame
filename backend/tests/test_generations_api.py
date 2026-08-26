@@ -5,7 +5,7 @@ from uuid import UUID
 import pytest
 from sqlalchemy import select
 
-from app.db.models import Asset, Generation, PromptRevision, Shot, ShotEdit, TimelineRevision
+from app.db.models import Asset, Generation, GenerationSegment, PromptRevision, Shot, ShotEdit, TimelineRevision
 from app.db.session import SessionLocal
 from app.services.tempfile_publisher import TempfilePublisher
 
@@ -480,3 +480,37 @@ def test_retry_preserves_batch_identity(client, tmp_path) -> None:
     assert payload["generation_batch_id"] == str(batch_id)
     assert payload["batch_position"] == 1
     assert payload["batch_size"] == 2
+    with SessionLocal() as session:
+        retried = session.scalar(select(Generation).where(Generation.id == UUID(payload["id"])))
+        assert retried.ratio == "9:16"
+
+
+def test_retry_after_reference_video_1007_discards_the_unreadable_public_url(client, tmp_path) -> None:
+    from tests.test_generation_batches_api import _batch_project
+
+    project = _batch_project(client, tmp_path)
+    created = client.post(project.batch_url, json=project.payload)
+    generation_id = UUID(created.json()["generations"][0]["id"])
+    with SessionLocal() as session:
+        generation = session.get(Generation, generation_id)
+        generation.status = "failed"
+        generation.error_message = "Reference video duration could not be read"
+        segment = session.get(GenerationSegment, generation.generation_segment_id)
+        segment.public_url = "https://litter.catbox.moe/unreadable.mp4"
+        segment.public_url_expires_at = "2099-01-01T00:00:00+00:00"
+        video = session.get(Asset, UUID(json.loads(generation.reference_asset_ids)[0]))
+        video.public_url = "https://litter.catbox.moe/unreadable-full.mp4"
+        video.public_url_expires_at = "2099-01-01T00:00:00+00:00"
+        session.commit()
+
+    response = client.post(f"/api/projects/{project.project_id}/generations/{generation_id}/retry")
+
+    assert response.status_code == 202
+    with SessionLocal() as session:
+        generation = session.get(Generation, generation_id)
+        segment = session.get(GenerationSegment, generation.generation_segment_id)
+        video = session.get(Asset, UUID(json.loads(generation.reference_asset_ids)[0]))
+        assert segment.public_url is None
+        assert segment.public_url_expires_at is None
+        assert video.public_url is None
+        assert video.public_url_expires_at is None

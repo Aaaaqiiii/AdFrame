@@ -101,6 +101,8 @@ class PromptRevision(Base):
     generation_segment_id: Mapped[UUID | None] = mapped_column(ForeignKey("generation_segments.id"), nullable=True)
     text: Mapped[str] = mapped_column(Text)
     visual_direction: Mapped[str] = mapped_column(Text, default="")
+    operation_instruction: Mapped[str] = mapped_column(Text, default="")
+    reference_asset_ids: Mapped[str | None] = mapped_column(Text, nullable=True)
     audio_mode: Mapped[str] = mapped_column(String(30), default="keep_original")
     audio_style: Mapped[str] = mapped_column(String(500), default="")
     replace_product: Mapped[bool] = mapped_column(default=False)

@@ -14,7 +14,7 @@ const plan = (overrides: Partial<GenerationSegmentPlan> = {}): GenerationSegment
 const prompt = (overrides: Partial<PromptRevisionSummary> = {}): PromptRevisionSummary => ({
   id: 'p1', version: 3, text: 'full prompt', status: 'completed',
   prompt_mode: 'full_reference_video_edit', generation_segment_id: null,
-  source_timeline_revision_id: null, replace_product: false, replace_person: false, created_at: 'x',
+  source_timeline_revision_id: 't1', replace_product: false, replace_person: false, created_at: 'x',
   ...overrides,
 })
 
@@ -26,6 +26,7 @@ describe('batch submit', () => {
     expect(canCreateBatch(plan(), prompt({ status: 'queued' }), false)).not.toBeNull()
     expect(canCreateBatch(plan(), prompt({ prompt_mode: 'reference_video_edit' }), false)).not.toBeNull()
     expect(canCreateBatch(plan(), prompt({ text: '' }), false)).not.toBeNull()
+    expect(canCreateBatch(plan(), prompt({ source_timeline_revision_id: 'old' }), false)).toBe('当前提示词来自旧时间轴，请重新生成提示词')
     expect(canCreateBatch(plan(), prompt(), true)).not.toBeNull()
   })
 

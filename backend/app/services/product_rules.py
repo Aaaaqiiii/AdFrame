@@ -1,3 +1,4 @@
+import json
 import re
 
 from sqlalchemy import select
@@ -18,6 +19,22 @@ def confirmed_target_product_assets(session: Session, project: Project) -> list[
     if project.mode != "replace_product":
         return []
     return product_assets_for_project(session, project)
+
+
+def confirmed_generation_product_assets(session: Session, project: Project) -> list[Asset]:
+    assets = [
+        asset for asset in confirmed_target_product_assets(session, project)
+        if asset.profile_text and asset.profile_text.strip() and asset.analysis_status in {"succeeded", "completed"}
+    ]
+    def is_confirmed(asset: Asset) -> bool:
+        try:
+            return bool(json.loads(asset.profile_json or "{}").get("summary_confirmed"))
+        except (json.JSONDecodeError, AttributeError):
+            return False
+
+    if not any(is_confirmed(asset) for asset in assets):
+        return []
+    return assets
 
 
 def contains_product_replacement(text: str) -> bool:

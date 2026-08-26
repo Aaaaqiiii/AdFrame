@@ -10,22 +10,27 @@ from uuid import UUID
 from datetime import UTC, datetime, timedelta
 
 from sqlalchemy import or_, select
+from requests.exceptions import ReadTimeout
 
 from app.core.config import Settings
 from app.db.models import Asset, Generation, GenerationSegment, Job, PromptRevision, Shot
 from app.db.migrations import require_database_at_head
 from app.db.session import SessionLocal
 from app.services.generation_jobs import execute_generation_job
-from app.services.full_prompt import derive_segment_prompt, validate_full_prompt
-from app.services.media import ensure_segment_clip
+from app.services.full_prompt import FullPromptValidationError, derive_segment_prompt, validate_full_prompt
+from PIL import UnidentifiedImageError
+
+from app.services.media import ensure_image_within_dimensions, ensure_segment_clip
 from app.services.seedance import JsonTaskGateway, build_seedance_request
 from app.services.tempfile_publisher import TempfilePublisher
 from app.services.comfly_frame_vision import ComflyFrameVisionGateway
 from app.services.dual_shot_vision import DualShotVisionGateway
 from app.services.vision_jobs import execute_vision_job
-from app.services.reference_profiles import execute_profile_job
+from app.services.reference_profiles import execute_profile_job, load_structure
 from app.services.final_prompt import execute_final_prompt_job, execute_prompt_refinement_job, execute_selling_point_optimization_job
 from app.services.worker_state import MAX_ATTEMPTS, next_poll_at, retry_at
+
+LEASE_TIMEOUT = timedelta(minutes=20)
 
 
 def redact_request_urls(payload: dict) -> dict:
@@ -62,8 +67,51 @@ def _resolve_asset_inputs(session, project_id: UUID, asset_ids: list[str]) -> li
     return resolved
 
 
+def build_reference_image_manifest(image_assets: list[Asset], *, replace_person: bool = False) -> str:
+    """按实际 API content 顺序给通用 reference_image 建立不可歧义的语义编号。"""
+    if not image_assets:
+        return ""
+    lines = ["【本次实际参考图片编号（严格对应 API 输入顺序）】"]
+    person_number: int | None = None
+    for number, asset in enumerate(image_assets, start=1):
+        if asset.kind in {"product_reference_image", "target_product_reference_image"}:
+            structure = load_structure(asset)
+            name = str(structure.get("display_name") or structure.get("view_label") or asset.original_filename or "未命名产品图").strip()
+            lines.append(f"图片{number}：目标产品参考图“{name}”，用于锁定该角度的包装结构、外形、材质、颜色和可见标签位置。")
+        elif asset.kind == "person_reference_image":
+            person_number = number
+            lines.append(
+                f"图片{number}：目标人物身份参考图，用于锁定同一人物的脸部、身份、发型和整体外观。"
+                if replace_person
+                else f"图片{number}：辅助人物参考图；不得据此替换或改变视频1中原人物的身份。"
+            )
+        elif asset.kind == "background_reference_image":
+            lines.append(f"图片{number}：目标背景参考图，用于锁定空间、陈设、光线和氛围。")
+        else:
+            lines.append(f"图片{number}：辅助参考图。")
+    if person_number is not None and replace_person:
+        lines.append(
+            f"人物替换硬约束：所有出现人物的镜头都必须使用图片{person_number}中的同一人物；"
+            "原参考视频人物只提供人数、位置、姿态、动作和表情强度，不得继承其脸部、身份或整体外观。"
+        )
+    return "\n".join(lines)
+
+
+def inject_reference_image_manifest(prompt_text: str, manifest: str) -> str:
+    """Keep user direction first while placing actual API image numbering nearby."""
+    if not manifest:
+        return prompt_text
+    marker = "【全局执行】"
+    if marker in prompt_text:
+        return prompt_text.replace(marker, f"{manifest}\n\n{marker}", 1)
+    return f"{prompt_text.rstrip()}\n\n{manifest}"
+
+
 def _publish_if_expired(session, asset: Asset, settings: Settings) -> str:
     """Republish an expired or missing temporary URL; otherwise reuse the stored one."""
+    # 多个生成槽会复用同一组产品/人物图。锁住素材行，确保临时服务只收到一次上传，
+    # 后来的槽等待首个上传完成后直接复用 URL。
+    asset = session.scalar(select(Asset).where(Asset.id == asset.id).with_for_update()) or asset
     expires_at = None
     if asset.public_url_expires_at:
         try:
@@ -96,6 +144,32 @@ def _publish_segment_if_expired(session, segment: GenerationSegment) -> str:
     return segment.public_url
 
 
+def _publish_seedance_image(session, asset: Asset, settings: Settings) -> str:
+    asset = session.scalar(select(Asset).where(Asset.id == asset.id).with_for_update()) or asset
+    expires_at = None
+    if asset.public_url_expires_at:
+        try:
+            expires_at = datetime.fromisoformat(asset.public_url_expires_at)
+        except ValueError:
+            expires_at = None
+    if asset.public_url and (expires_at is None or expires_at > datetime.now(UTC)):
+        return asset.public_url
+    source = Path(asset.original_path)
+    destination = settings.media_root / str(asset.project_id) / "seedance-references" / f"{asset.id}.png"
+    try:
+        prepared = ensure_image_within_dimensions(source, destination)
+    except (UnidentifiedImageError, OSError, ValueError):
+        # 兼容早期测试/遗留的不可探测素材；供应商仍会返回明确的格式错误。
+        return _publish_if_expired(session, asset, settings)
+    published = TempfilePublisher().publish(
+        prepared,
+        asset.content_type or "application/octet-stream" if prepared == source else "image/png",
+    )
+    asset.public_url, asset.public_url_expires_at = published.url, published.expires_at.isoformat()
+    session.commit()
+    return asset.public_url
+
+
 def _generation_gateway(settings: Settings, provider: str):
     if provider == "volcengine":
         return JsonTaskGateway(settings.volcengine_seedance_base_url, settings.volcengine_api_key, settings.volcengine_seedance_task_path), settings.volcengine_seedance_model
@@ -110,8 +184,14 @@ def _mark_retryable(record: Job | Generation, exc: Exception) -> None:
         record.status = "failed"
         record.error_message = "火山 VOD 已连接，但当前账号尚未开通 Aideo 视频理解服务。请先在火山视频点播控制台开通智能应用 Aideo Agent。"
         return
+    if isinstance(exc, FullPromptValidationError):
+        record.status, record.error_message = "failed", raw
+        return
     record.error_message = raw
-    if record.attempts >= MAX_ATTEMPTS:
+    max_attempts = 2 if isinstance(record, Job) and record.kind in {
+        "final_prompt_generation", "prompt_refinement", "prompt_selling_point_optimization",
+    } and isinstance(exc, ReadTimeout) else MAX_ATTEMPTS
+    if record.attempts >= max_attempts:
         record.status = "failed"
     else:
         record.status = "retryable"
@@ -126,20 +206,21 @@ def _claim(
     now: datetime,
     *,
     statuses: tuple[str, ...],
+    limit: int = 5,
 ):
     predicates = [
         model.status.in_(statuses),
         or_(model.next_attempt_at.is_(None), model.next_attempt_at <= now),
-        or_(model.leased_at.is_(None), model.leased_at <= now - timedelta(minutes=10)),
+        or_(model.leased_at.is_(None), model.leased_at <= now - LEASE_TIMEOUT),
     ]
     if kinds:
         predicates.append(model.kind.in_(kinds))
     records = session.scalars(
         select(model)
         .where(*predicates)
-        .order_by(model.id)
+        .order_by(model.created_at, *([model.batch_position] if model is Generation else []), model.id)
         .with_for_update(skip_locked=True)
-        .limit(5)
+        .limit(limit)
     ).all()
     for record in records:
         record.leased_at = now
@@ -157,15 +238,30 @@ def _release(record: Job | Generation, now: datetime) -> None:
         record.next_attempt_at = next_poll_at(record.created_at or now, now, record.status)
 
 
-def run_once() -> int:
+def _refresh_lease(session, record: Job | Generation) -> None:
+    record.leased_at = datetime.now(UTC)
+    session.commit()
+
+
+def run_once(queue: str = "all") -> int:
+    if queue not in {"all", "ai", "generation"}:
+        raise ValueError(f"Unknown worker queue: {queue}")
     settings = Settings()
     processed = 0
     now = datetime.now(UTC)
     worker_id = f"{socket.gethostname()}:{__import__('os').getpid()}"
     with SessionLocal() as session:
-        vision_jobs = _claim(session, Job, ["vision_analysis", "vision_shot_analysis", "reference_profile_analysis", "final_prompt_generation", "prompt_refinement", "prompt_selling_point_optimization"], worker_id, now, statuses=("queued", "uploaded", "processing", "retryable"))
+        # 多个 AI worker 各领一个任务；不能提前租住 5 个再串行执行，否则其他 worker 无事可做。
+        vision_jobs = [] if queue == "generation" else _claim(session, Job, ["vision_analysis", "vision_shot_analysis", "reference_profile_analysis", "final_prompt_generation", "prompt_refinement", "prompt_selling_point_optimization"], worker_id, now, statuses=("queued", "uploaded", "processing", "retryable"), limit=1)
         for job in vision_jobs:
             try:
+                if job.kind in {"final_prompt_generation", "prompt_refinement", "prompt_selling_point_optimization"}:
+                    job.status = "processing"
+                    if job.provider_input_id:
+                        revision = session.get(PromptRevision, UUID(job.provider_input_id))
+                        if revision:
+                            revision.status = "processing"
+                    session.commit()
                 if job.kind == "reference_profile_analysis":
                     execute_profile_job(session, job, settings)
                 elif job.kind == "final_prompt_generation":
@@ -179,7 +275,19 @@ def run_once() -> int:
                     gateway = DualShotVisionGateway(settings) if job.kind == "vision_shot_analysis" else ComflyFrameVisionGateway(settings)
                     execute_vision_job(session, job, gateway)
             except Exception as exc:
+                # A cancellation can arrive while the worker is blocked on the provider request.
+                session.refresh(job)
+                if job.status == "cancelled":
+                    _release(job, now)
+                    session.commit()
+                    processed += 1
+                    continue
                 _mark_retryable(job, exc)
+                if job.kind == "reference_profile_analysis" and job.provider_input_id:
+                    asset = session.get(Asset, UUID(job.provider_input_id))
+                    if asset:
+                        asset.analysis_status = job.status
+                        asset.analysis_error = f"参考图片理解失败：{job.error_message}"
                 if job.kind in {"final_prompt_generation", "prompt_refinement", "prompt_selling_point_optimization"} and job.provider_input_id:
                     revision = session.get(PromptRevision, UUID(job.provider_input_id))
                     if revision:
@@ -187,10 +295,26 @@ def run_once() -> int:
             _release(job, now)
             session.commit()
             processed += 1
-        generations = _claim(session, Generation, None, worker_id, now, statuses=("queued", "processing", "retryable"))
+        # 每个生成槽只领取一行；否则一次租住整个批次后仍会串行上传，
+        # 任一临时文件服务超时都会让兄弟片段看似排队、实际无法被其他槽处理。
+        generations = [] if queue == "ai" else _claim(
+            session, Generation, None, worker_id, now,
+            statuses=("queued", "processing", "retryable"), limit=1,
+        )
         for generation in generations:
             try:
+                # 发布参考素材也属于实际执行阶段。先持久化状态，前端才能区分“尚未领取”和“正在上传”。
+                generation.status = "processing"
+                generation.error_message = None
+                session.commit()
                 gateway, model = _generation_gateway(settings, generation.provider)
+                if generation.external_task_id:
+                    # 供应商已接单后只轮询结果；不要再次解析提示词、锁素材或上传参考文件。
+                    execute_generation_job(session, generation, gateway, {})
+                    _release(generation, now)
+                    session.commit()
+                    processed += 1
+                    continue
                 prompt = session.scalar(select(PromptRevision).where(PromptRevision.project_id == generation.project_id, PromptRevision.version == generation.prompt_version))
                 if prompt is None or not (prompt.text or "").strip():
                     generation.status, generation.error_message = "failed", "Prompt revision is no longer available"
@@ -236,12 +360,21 @@ def run_once() -> int:
                         ensure_segment_clip(Path(video_asset.original_path), destination, segment.source_start_sec, segment.source_end_sec, Settings().effective_segment_limit_seconds)
                         segment.clip_path = str(destination)
                         session.commit()
+                        _refresh_lease(session, generation)
                         video_url = _publish_segment_if_expired(session, segment)
                     else:
+                        _refresh_lease(session, generation)
                         video_url = _publish_if_expired(session, video_asset, settings)
                 else:
+                    _refresh_lease(session, generation)
                     video_url = _publish_if_expired(session, video_asset, settings)
-                image_urls = [_publish_if_expired(session, asset, settings) for asset in assets[1:]]
+                image_assets = assets[1:]
+                reference_manifest = build_reference_image_manifest(image_assets, replace_person=prompt.replace_person)
+                request_text = inject_reference_image_manifest(request_text, reference_manifest)
+                image_urls = []
+                for asset in image_assets:
+                    _refresh_lease(session, generation)
+                    image_urls.append(_publish_seedance_image(session, asset, settings))
                 payload = build_seedance_request(
                     model,
                     request_text,
@@ -266,6 +399,7 @@ def run_once() -> int:
                 }
                 generation.request_snapshot = json.dumps(snapshot, ensure_ascii=False, sort_keys=True)
                 session.commit()
+                _refresh_lease(session, generation)
                 execute_generation_job(session, generation, gateway, payload)
             except Exception as exc:
                 _mark_retryable(generation, exc)
@@ -275,10 +409,31 @@ def run_once() -> int:
     return processed
 
 
+def _worker_lock_name(queue: str, slot: int) -> str:
+    if slot < 1:
+        raise ValueError("Worker slot must be at least 1")
+    if queue == "all" and slot != 1:
+        raise ValueError("Additional worker slots require an explicit ai or generation queue")
+    if queue == "all":
+        return ".adflow-worker.lock"
+    suffix = "" if slot == 1 else f"-{slot}"
+    return f".adflow-{queue}-worker{suffix}.lock"
+
+
 def main() -> None:
+    import argparse
+    parser = argparse.ArgumentParser(description="Run an AdFlow background worker")
+    parser.add_argument("--queue", choices=("all", "ai", "generation"), default="all")
+    parser.add_argument("--slot", type=int, default=1, help="Unique local worker slot for ai or generation queue")
+    args = parser.parse_args()
+    queue, slot = args.queue, args.slot
+    try:
+        lock_name = _worker_lock_name(queue, slot)
+    except ValueError as exc:
+        parser.error(str(exc))
     require_database_at_head()
     settings = Settings()
-    lock_path = settings.media_root / ".adflow-worker.lock"
+    lock_path = settings.media_root / lock_name
     lock_path.parent.mkdir(parents=True, exist_ok=True)
     lock_file = lock_path.open("a+b")
     try:
@@ -286,10 +441,10 @@ def main() -> None:
         lock_file.seek(0)
         msvcrt.locking(lock_file.fileno(), msvcrt.LK_NBLCK, 1)
     except OSError:
-        print("Another AdFlow worker is already running; this duplicate worker will exit.")
+        print(f"Another AdFlow {queue} worker is already running in slot {slot}; this duplicate worker will exit.")
         return
     while True:
-        run_once()
+        run_once(queue)
         time.sleep(settings.worker_poll_seconds)
 
 

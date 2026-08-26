@@ -7,7 +7,7 @@ from alembic.script import ScriptDirectory
 def test_alembic_has_one_head_at_generation_batches() -> None:
     config = Config(str(Path(__file__).parents[1] / "alembic.ini"))
     script = ScriptDirectory.from_config(config)
-    assert script.get_heads() == ["0006_generation_batches"]
+    assert script.get_heads() == ["0007_prompt_input_snapshots"]
 
 
 def test_application_does_not_create_production_schema(monkeypatch) -> None:

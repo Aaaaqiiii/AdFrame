@@ -12,3 +12,7 @@ backend/*.egg-info/
 .worktrees/
 backend/tests/.adflow-test.sqlite3
 backend/tests/.test-media/
+.codex-review/
+.venv/
+backend/.venv/
+*.log

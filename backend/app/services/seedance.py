@@ -12,6 +12,19 @@ class SubmissionUncertainError(RuntimeError):
     """Provider submission outcome is unknown; never automatically resubmit."""
 
 
+class ProviderRequestError(RuntimeError):
+    """Provider deterministically rejected the request; retrying unchanged input is pointless."""
+
+
+def _raise_provider_error(response: requests.Response) -> None:
+    try:
+        response.raise_for_status()
+    except requests.HTTPError as exc:
+        detail = sanitize_provider_summary(response.text.strip())
+        error = ProviderRequestError if 400 <= response.status_code < 500 else RuntimeError
+        raise error(f"Seedance HTTP {response.status_code}: {detail or response.reason}") from exc
+
+
 def sanitize_provider_summary(value: object) -> str:
     text = json.dumps(value, ensure_ascii=False, default=str)
     # 完整吞掉授权头的值（含 "Bearer ..."），其余 key 值只保留首段脱敏。
@@ -26,6 +39,7 @@ class GenerationResult:
     status: str
     video_url: str | None = None
     error_message: str | None = None
+    error_code: str | None = None
 
 
 class GenerationGateway(Protocol):
@@ -72,7 +86,14 @@ def parse_generation_result(payload: dict[str, Any]) -> GenerationResult:
         *([item.get("video_url") or item.get("url") for item in result.get("content", []) if isinstance(item, dict)] if isinstance(result.get("content"), list) else []),
     )
     error = _dict(result.get("error"))
-    return GenerationResult(task_id, status, video_url, error.get("message") or result.get("error_message"))
+    error_code = error.get("code") or result.get("error_code")
+    return GenerationResult(
+        task_id,
+        status,
+        video_url,
+        error.get("message") or result.get("error_message"),
+        str(error_code) if error_code is not None else None,
+    )
 
 
 class JsonTaskGateway:
@@ -88,7 +109,7 @@ class JsonTaskGateway:
             response = self._http.post(f"{self._base_url}{self._task_path}", headers={"Authorization": f"Bearer {self._api_key}"}, json=payload, timeout=(10, 60))
         except (requests.Timeout, requests.ConnectionError) as exc:
             raise SubmissionUncertainError(f"供应商提交结果不明确：{exc}") from exc
-        response.raise_for_status()
+        _raise_provider_error(response)
         body = response.json()
         task_id = _first_string(body.get("id"), body.get("task_id"), _dict(body.get("data")).get("id"), _dict(body.get("data")).get("task_id"))
         if not task_id:
@@ -97,5 +118,5 @@ class JsonTaskGateway:
 
     def get_result(self, task_id: str) -> GenerationResult:
         response = self._http.get(f"{self._base_url}{self._task_path}/{task_id}", headers={"Authorization": f"Bearer {self._api_key}"}, timeout=(10, 30))
-        response.raise_for_status()
+        _raise_provider_error(response)
         return parse_generation_result(response.json())

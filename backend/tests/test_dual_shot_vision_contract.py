@@ -1,16 +1,20 @@
 from unittest.mock import Mock
 
-from app.services.dual_shot_vision import _json_object, _raise_provider_error, _responses_text
+import pytest
+
+from app.core.config import Settings
+from app.services.dual_shot_vision import _json_object, _raise_provider_error, validate_dual_vision_configuration
+from app.services.volcengine_vision import VisionConfigurationError
 
 
 def test_json_parser_accepts_fenced_or_prefixed_json() -> None:
     assert _json_object("说明：```json\n{\"action\":\"拿起产品\"}\n```")["action"] == "拿起产品"
 
 
-def test_volcengine_responses_text_contract() -> None:
-    response = Mock()
-    response.json.return_value = {"output": [{"type": "message", "content": [{"type": "output_text", "text": "{\"people\":\"一人\"}"}]}]}
-    assert _responses_text(response) == '{"people":"一人"}'
+def test_qwen_shot_vision_only_requires_comfly_key() -> None:
+    validate_dual_vision_configuration(Settings(_env_file=None, comfly_api_key="configured"))
+    with pytest.raises(VisionConfigurationError, match="Comfly API Key"):
+        validate_dual_vision_configuration(Settings(_env_file=None, comfly_api_key=""))
 
 
 def test_provider_error_keeps_api_message() -> None:

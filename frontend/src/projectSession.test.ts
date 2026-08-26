@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest'
 
-import { restoreProjectId, saveProjectId } from './projectSession'
+import { restoreProjectId, restoreWorkflowStage, saveProjectId, saveWorkflowStage } from './projectSession'
 
 function memoryStorage() {
   const values = new Map<string, string>()
@@ -16,5 +16,13 @@ describe('project session', () => {
     saveProjectId(storage, 'project-123')
 
     expect(restoreProjectId(storage)).toBe('project-123')
+  })
+
+  it('restores the active workflow step after a page refresh', () => {
+    const storage = memoryStorage()
+    saveWorkflowStage(storage, 'prompt', 'replace_product')
+
+    expect(restoreWorkflowStage(storage, 'replace_product')).toBe('prompt')
+    expect(restoreWorkflowStage(storage, 'preserve_product')).toBeNull()
   })
 })

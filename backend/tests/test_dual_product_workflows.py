@@ -113,33 +113,131 @@ def test_page_two_requires_target_product_before_prompt_or_generation() -> None:
     assert "替换产品" in str(response.json()["detail"])
 
 
-def test_page_two_rejects_incompatible_actions_with_chinese_shot_details() -> None:
+def test_full_edit_allows_minimal_adaptation_for_repairable_product_actions() -> None:
     client = _client()
     project = _project(client, "replace_product")
     _upload_product(client, project["id"])
     original = client.put(
         f"/api/projects/{project['id']}/product-profile",
-        json={"profile": "牙膏外壳状软管产品，旋盖开口，通过挤压软管挤出内容物"},
+        json={
+            "profile": "牙膏外壳状软管产品，旋盖开口，通过挤压软管挤出内容物",
+            "structure": {"summary_confirmed": True},
+        },
     )
+    assert original.status_code == 200
     timeline = client.put(
         f"/api/projects/{project['id']}/timeline",
         json={"shots": [{"start_sec": 0, "end_sec": 2}, {"start_sec": 2, "end_sec": 4}]},
     ).json()
-    with SessionLocal() as session:
-        shot = session.get(Shot, UUID(timeline["shots"][0]["id"]))
-        shot.product_interaction = "拿起产品并直接喝下内容物"
-        session.commit()
+    client.put(
+        f"/api/projects/{project['id']}/shots/{timeline['shots'][0]['id']}/edit",
+        json={"action": "人物拿起产品", "product_interaction": "拿起产品并直接喝下内容物", "confirmed": True},
+    )
+    client.put(
+        f"/api/projects/{project['id']}/shots/{timeline['shots'][1]['id']}/edit",
+        json={"action": "产品静置展示", "product_interaction": "无直接交互", "confirmed": True},
+    )
 
     response = client.post(
         f"/api/projects/{project['id']}/prompts",
         json={"product_profile": "牙膏外壳状软管产品", "visual_direction": "保持原节奏"},
     )
 
+    assert response.status_code == 202
+    assert response.json()["adaptation_count"] == 1
+    conflict = response.json()["adaptation_conflicts"][0]
+    assert conflict["shot_id"] == timeline["shots"][0]["id"]
+    assert conflict["severity"] == "adaptable"
+    assert "软管" in conflict["reason"]
+    with SessionLocal() as session:
+        revision = session.scalar(select(PromptRevision).where(
+            PromptRevision.project_id == UUID(project["id"]),
+            PromptRevision.version == response.json()["version"],
+        ))
+        job = session.scalar(select(Job).where(Job.provider_input_id == str(revision.id)))
+        model_text = __import__("json").dumps({"blocks": [
+            {"keep": "保持第一镜头构图。", "modify": "旋开管盖并轻压管身。", "delete": "无。", "forbid": "不得改变节奏。", "selling_point_ids": []},
+            {"keep": "保持第二镜头构图。", "modify": "无。", "delete": "无。", "forbid": "不得改变节奏。", "selling_point_ids": []},
+        ]}, ensure_ascii=False)
+        with patch("app.services.final_prompt._chat", return_value=model_text) as chat:
+            execute_final_prompt_job(session, job, Settings(comfly_api_key="test-key"))
+        request_text = chat.call_args.args[1][1]["content"]
+        assert "轻压管身" in request_text
+        assert "未列出的镜头不得改动作" in request_text
+        session.refresh(revision)
+        assert revision.status == "completed"
+
+
+def test_standalone_recreation_adapts_only_repairable_product_actions() -> None:
+    client = _client()
+    project = _project(client, "replace_product")
+    _upload_product(client, project["id"])
+    profile = "牙膏外壳状软管产品，旋盖开口，通过挤压软管挤出内容物"
+    client.put(
+        f"/api/projects/{project['id']}/product-profile",
+        json={"profile": profile, "structure": {"summary_confirmed": True}},
+    )
+    timeline = client.put(
+        f"/api/projects/{project['id']}/timeline",
+        json={"shots": [{"start_sec": 0, "end_sec": 3}]},
+    ).json()
+    client.put(
+        f"/api/projects/{project['id']}/shots/{timeline['shots'][0]['id']}/edit",
+        json={"action": "人物拿起产品", "product": "盒装饮品", "product_interaction": "插入吸管并饮用", "confirmed": True},
+    )
+
+    response = client.post(
+        f"/api/projects/{project['id']}/prompts",
+        json={"visual_direction": "完整复刻", "use_ai": True, "prompt_mode": "standalone_video_recreation", "audio_mode": "auto"},
+    )
+
+    assert response.status_code == 202
+    assert response.json()["adaptation_count"] == 1
+    assert response.json()["adaptation_conflicts"][0]["severity"] == "adaptable"
+    with SessionLocal() as session:
+        revision = session.scalar(select(PromptRevision).where(
+            PromptRevision.project_id == UUID(project["id"]),
+            PromptRevision.version == response.json()["version"],
+        ))
+        job = session.scalar(select(Job).where(Job.provider_input_id == str(revision.id)))
+        model_text = (
+            "全局一致性：人物、软管产品和场景跨镜头一致。\n\n00:00.00–00:03.00\n"
+            "画面：人物手持目标软管产品。\n动作：人物旋开管盖并挤出少量内容物。\n"
+            "镜头：固定中景。\n光线：柔和侧光。\n声音：环境音和开盖声，不含对白。\n禁止：不得改变包装。"
+        )
+        with patch("app.services.final_prompt._chat", return_value=model_text) as chat:
+            execute_final_prompt_job(session, job, Settings(comfly_api_key="test-key"))
+        request_text = chat.call_args.args[1][1]["content"]
+        assert "轻压管身" in request_text
+        assert "不得新增对白" in request_text
+        session.refresh(revision)
+        assert revision.status == "completed"
+
+
+def test_standalone_recreation_blocks_fundamentally_incompatible_actions() -> None:
+    client = _client()
+    project = _project(client, "replace_product")
+    _upload_product(client, project["id"])
+    client.put(
+        f"/api/projects/{project['id']}/product-profile",
+        json={"profile": "罐装膏霜产品", "structure": {"summary_confirmed": True}},
+    )
+    timeline = client.put(
+        f"/api/projects/{project['id']}/timeline",
+        json={"shots": [{"start_sec": 0, "end_sec": 3}]},
+    ).json()
+    client.put(
+        f"/api/projects/{project['id']}/shots/{timeline['shots'][0]['id']}/edit",
+        json={"product_interaction": "人物穿上产品并系鞋带", "confirmed": True},
+    )
+
+    response = client.post(
+        f"/api/projects/{project['id']}/prompts",
+        json={"visual_direction": "完整复刻", "use_ai": True, "prompt_mode": "standalone_video_recreation", "audio_mode": "none"},
+    )
+
     assert response.status_code == 422
-    detail = response.json()["detail"]
-    assert detail["message"] == "目标产品形态与部分原镜头动作不兼容，请先修正这些镜头"
-    assert timeline["shots"][0]["id"] in detail["shot_ids"]
-    assert "软管" in detail["conflicts"][0]["reason"]
+    assert "根本不兼容" in str(response.json()["detail"])
 
 
 def test_page_two_applies_target_product_to_every_product_shot() -> None:
@@ -177,7 +275,7 @@ def test_page_two_applies_target_product_to_every_product_shot() -> None:
     assert response.status_code == 202
     assert response.json()["status"] == "queued"
     # AI 入队返回冻结的确定性前缀（非空），Worker 完成后再替换为完整提示词。
-    assert response.json()["text"].startswith("原参考视频是时间轴")
+    assert response.json()["text"].startswith("【最高优先级：用户改编要求】\n背景改为厨房")
     with SessionLocal() as session:
         revision = session.scalar(select(PromptRevision).where(
             PromptRevision.project_id == UUID(project["id"]),
@@ -230,9 +328,14 @@ def test_product_compatibility_can_be_checked_before_prompt_save() -> None:
         session.commit()
 
     compatibility = client.get(f"/api/projects/{project['id']}/product-compatibility").json()
-    assert compatibility["status"] == "blocked"
+    assert compatibility["status"] == "warning"
     assert compatibility["conflicts"][0]["shot_id"] == timeline["shots"][0]["id"]
     assert compatibility["conflicts"][0]["suggestion"]
+    standalone = client.get(
+        f"/api/projects/{project['id']}/product-compatibility?prompt_mode=standalone_video_recreation"
+    ).json()
+    assert standalone["status"] == "warning"
+    assert "最小动作适配" in standalone["summary"]
 
 
 def test_preserve_product_mode_rejects_replacement_during_prompt_creation() -> None:
@@ -286,7 +389,7 @@ def test_replace_mode_forces_replacement_when_client_sends_false() -> None:
 
     from app.services.final_prompt import build_full_prompt_prefix
     prefix = build_full_prompt_prefix(
-        project_mode="replace_product", product_profile="已确认盒装产品",
+        project_mode="replace_product", product_profile="已确认产品事实：已确认盒装产品",
         product_image_purposes=["other：锁定该角度结构"], people_reference=None,
         background_reference=None, audio_mode="keep_original", audio_style="",
     )
@@ -387,7 +490,7 @@ def test_final_prompt_worker_rejects_replacement_output_in_preserve_mode() -> No
                 assert "保留产品模式" in str(error)
             else:
                 assert False, "preserve-mode worker must reject replacement output"
-        assert revision.text.startswith("原参考视频是时间轴")
+        assert revision.text.startswith("【最高优先级：用户改编要求】\n保持节奏")
         assert revision.status == "queued"
         assert job.status == "queued"
 
@@ -478,7 +581,7 @@ def test_run_once_discards_unsafe_final_prompt_before_retry_commit() -> None:
         assert revision is not None
         assert job is not None
         # 拒绝后保持排队时冻结的确定性前缀，绝不标记 completed。
-        assert revision.text.startswith("原参考视频是时间轴")
+        assert revision.text.startswith("【最高优先级：用户改编要求】\n保持节奏")
         assert revision.status != "completed"
         assert revision.status in {"retryable", "failed"}
         assert job.status == revision.status

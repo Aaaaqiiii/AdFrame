@@ -8,6 +8,7 @@ export function canCreateBatch(
 ): string | null {
   if (!plan || plan.plan_version <= 0 || !plan.segments.length) return '请先保存分段方案'
   if (!prompt || prompt.status !== 'completed' || prompt.prompt_mode !== 'full_reference_video_edit' || !prompt.text?.trim()) return '请先生成或选择一份完整提示词'
+  if (prompt.source_timeline_revision_id !== plan.timeline_revision_id) return '当前提示词来自旧时间轴，请重新生成提示词'
   if (generationBusy) return '已有生成任务进行中'
   return null
 }
