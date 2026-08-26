@@ -129,7 +129,6 @@ def concat_videos_lossless(sources: list[Path], destination: Path) -> Path:
             temporary_output.stat().st_size > 0
             and merged.width == first.width
             and merged.height == first.height
-            and abs(merged.fps - first.fps) <= 0.01
             and merged.video_codec == first.video_codec
             and merged.pixel_format == first.pixel_format
             and merged.has_audio == first.has_audio

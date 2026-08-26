@@ -5,7 +5,7 @@ from unittest.mock import patch
 import pytest
 from PIL import Image
 
-from app.services.media import MediaToolUnavailableError, _run, clip_video, concat_videos_lossless, detect_candidate_cuts, ensure_image_within_dimensions, ensure_segment_clip, probe_video, validate_reference_duration
+from app.services.media import MediaToolUnavailableError, VideoMetadata, _run, clip_video, concat_videos_lossless, detect_candidate_cuts, ensure_image_within_dimensions, ensure_segment_clip, probe_video, validate_reference_duration
 
 
 def test_missing_media_tool_has_actionable_error(monkeypatch) -> None:
@@ -145,6 +145,24 @@ def test_lossless_concat_preserves_stream_and_duration(tmp_path: Path) -> None:
         first.width, first.height, first.video_codec, first.pixel_format,
     )
     assert 1.8 < result.duration_sec < 2.2
+
+
+def test_lossless_concat_accepts_container_average_fps_drift(tmp_path: Path, monkeypatch) -> None:
+    clips = [tmp_path / f"clip-{index}.mp4" for index in range(1, 4)]
+    for clip in clips:
+        clip.write_bytes(b"source")
+    source_metadata = VideoMetadata(20, 720, 1280, 24, True, "h264", "yuv420p", "aac", 32000, "stereo")
+    merged_metadata = VideoMetadata(60, 720, 1280, 23.987, True, "h264", "yuv420p", "aac", 32000, "stereo")
+
+    monkeypatch.setattr("app.services.media.probe_video", lambda path: source_metadata if path in clips else merged_metadata)
+
+    def stream_copy(command: list[str]) -> subprocess.CompletedProcess[str]:
+        Path(command[-1]).write_bytes(b"merged")
+        return subprocess.CompletedProcess(command, 0, "", "")
+
+    monkeypatch.setattr("app.services.media._run", stream_copy)
+
+    assert concat_videos_lossless(clips, tmp_path / "merged.mp4").is_file()
 
 
 @pytest.mark.media_tools
